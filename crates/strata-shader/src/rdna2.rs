@@ -1,8 +1,8 @@
 //! Clean-room RDNA2 (GFX10.3 / Xbox Series X|S) instruction decoder & IR.
 //!
-//! Covers the core encodings needed to decode console compute/graphics shaders
-//! into Strata's SSA IR: SOP2, SOP1, SOPK, SOPC, SOPP, VOP2, VOP1, VOPC,
-//! SMEM, FLAT/GLOBAL, and `image_bvh64_intersect_ray`.
+//! Decodes scalar (SOPP, SOPC, SOP1, SOPK, SOP2, SMEM), vector (VOP1, VOPC,
+//! VOP2, VOP3), shared-memory (DS/LDS), buffer (MUBUF, MTBUF, FLAT/GLOBAL),
+//! image/ray-tracing (MIMG), and graphics export (EXP) encodings.
 
 use thiserror::Error;
 
@@ -24,6 +24,7 @@ pub enum Operand {
     ExecLo,
     ExecHi,
     M0,
+    Scc,
     InlineInt(i32),
     InlineFloat(u32), // IEEE-754 bits
     Literal(u32),
@@ -50,6 +51,7 @@ impl Operand {
             246 => Self::InlineFloat(4.0f32.to_bits()),
             247 => Self::InlineFloat((-4.0f32).to_bits()),
             248 => Self::InlineFloat(std::f32::consts::FRAC_1_PI.to_bits()),
+            253 => Self::Scc,
             255 => Self::Literal(literal.unwrap_or(0)),
             256..=511 => Self::Vgpr((code - 256) as u8),
             _ => Self::InlineInt(0),
@@ -59,57 +61,126 @@ impl Operand {
     pub fn is_vgpr(self) -> bool {
         matches!(self, Self::Vgpr(_))
     }
+
+    pub fn is_mask_reg(self) -> bool {
+        matches!(self, Self::VccLo | Self::VccHi | Self::ExecLo | Self::ExecHi)
+    }
+}
+
+/// Comparison predicate for SOPC / VOPC instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// Scalar/vector comparison operand type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CmpType {
+    F32,
+    U32,
+    I32,
+}
+
+/// VOP3 source modifiers (negate, absolute value, output clamp).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Vop3Mods {
+    pub abs: u8,
+    pub neg: u8,
+    pub clamp: bool,
+    pub omod: u8,
 }
 
 /// Decoded RDNA2 instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inst {
-    /// `s_add_u32 sdst, ssrc0, ssrc1`
+    // --- Scalar ALU (SOP2 / SOP1 / SOPK / SOPC) ---
     SAddU32 { dst: u8, src0: Operand, src1: Operand },
-    /// `s_and_b64 sdst[0:1], ssrc0, ssrc1` (often EXEC/VCC mask manipulation)
+    SSubU32 { dst: u8, src0: Operand, src1: Operand },
+    SMulI32 { dst: u8, src0: Operand, src1: Operand },
+    SAndB32 { dst: u8, src0: Operand, src1: Operand },
+    SOrB32 { dst: u8, src0: Operand, src1: Operand },
+    SXorB32 { dst: u8, src0: Operand, src1: Operand },
+    SLshlB32 { dst: u8, src0: Operand, shift: Operand },
+    SLshrB32 { dst: u8, src0: Operand, shift: Operand },
     SAndB64 { dst: u8, src0: Operand, src1: Operand },
-    /// `s_and_saveexec_b64 sdst[0:1], ssrc0`
-    SAndSaveExecB64 { dst: u8, src0: Operand },
-    /// `s_mov_b32 sdst, ssrc0`
+    SOrB64 { dst: u8, src0: Operand, src1: Operand },
+    SXorB64 { dst: u8, src0: Operand, src1: Operand },
+    SAndN2B64 { dst: u8, src0: Operand, src1: Operand },
+    SOrN2B64 { dst: u8, src0: Operand, src1: Operand },
     SMovB32 { dst: u8, src0: Operand },
-    /// `s_load_dwordx4 sdst[0:3], sbase[0:1], offset`
-    SLoadDword { dst: u8, count: u8, sbase: u8, offset: i32 },
-    /// `s_branch rel16`
-    SBranch { target_dw: usize },
-    /// `s_cbranch_execz rel16`
-    SCBranchExecz { target_dw: usize },
-    /// `s_cbranch_scc0 / scc1`
-    SCBranchScc { on_one: bool, target_dw: usize },
-    /// `s_waitcnt` (no-op in SPIR-V structured memory model)
-    SWaitcnt,
-    /// `s_endpgm`
-    SEndpgm,
+    SMovB64 { dst: u8, src0: Operand },
+    SNotB64 { dst: u8, src0: Operand },
+    SAndSaveExecB64 { dst: u8, src0: Operand },
+    SOrSaveExecB64 { dst: u8, src0: Operand },
+    SMovkI32 { dst: u8, simm16: i16 },
+    SAddkI32 { dst: u8, simm16: i16 },
+    SMulkI32 { dst: u8, simm16: i16 },
+    SCmp { op: CmpOp, ty: CmpType, src0: Operand, src1: Operand },
 
-    /// `v_mov_b32 vdst, src0`
+    // --- Scalar Control Flow & Sync (SOPP) ---
+    SNop,
+    SBarrier,
+    SWaitcnt,
+    SEndpgm,
+    SBranch { target_dw: usize },
+    SCBranchExecz { target_dw: usize },
+    SCBranchExecnz { target_dw: usize },
+    SCBranchVccz { target_dw: usize },
+    SCBranchVccnz { target_dw: usize },
+    SCBranchScc { on_one: bool, target_dw: usize },
+
+    // --- Scalar Memory (SMEM) ---
+    SLoadDword { dst: u8, count: u8, sbase: u8, offset: i32 },
+
+    // --- Vector ALU (VOP1 / VOP2 / VOPC / VOP3) ---
     VMovB32 { dst: u8, src0: Operand },
-    /// `v_log_f32 vdst, src0` (exact base-2 log, matching RDNA2 & fixing blurry cube reflections)
-    VLogF32 { dst: u8, src0: Operand },
-    /// `v_add_f32 vdst, src0, vsrc1`
-    VAddF32 { dst: u8, src0: Operand, src1: Operand },
-    /// `v_mul_f32` / `v_mul_legacy_f32` (legacy: 0 * x = 0 even for NaN/Inf)
-    VMulF32 { dst: u8, src0: Operand, src1: Operand, legacy: bool },
-    /// `v_fmac_f32 vdst, src0, vsrc1` (vdst = src0 * src1 + vdst)
-    VFmacF32 { dst: u8, src0: Operand, src1: Operand },
-    /// `v_add_nc_u32 vdst, src0, vsrc1`
-    VAddU32 { dst: u8, src0: Operand, src1: Operand },
-    /// `v_lshlrev_b32 vdst, src0, vsrc1`
-    VLshlRevB32 { dst: u8, shift: Operand, src: Operand },
-    /// `v_cndmask_b32 vdst, src0, vsrc1, vcc`
-    VCndMaskB32 { dst: u8, src0: Operand, src1: Operand },
-    /// `v_cmp_lt_f32 vcc, src0, vsrc1`
-    VCmpLtF32 { src0: Operand, src1: Operand },
-    /// `v_readfirstlane_b32 sdst, vsrc`
     VReadFirstLaneB32 { dst: u8, src: u8 },
+    VLogF32 { dst: u8, src0: Operand },
+    VExpF32 { dst: u8, src0: Operand },
+    VRcpF32 { dst: u8, src0: Operand },
+    VRsqF32 { dst: u8, src0: Operand },
+    VSqrtF32 { dst: u8, src0: Operand },
+    VFloorF32 { dst: u8, src0: Operand },
+    VFractF32 { dst: u8, src0: Operand },
+    VCvtF32U32 { dst: u8, src0: Operand },
+    VCvtU32F32 { dst: u8, src0: Operand },
+    VCvtF32I32 { dst: u8, src0: Operand },
+    VCvtI32F32 { dst: u8, src0: Operand },
+    VAddF32 { dst: u8, src0: Operand, src1: Operand },
+    VSubF32 { dst: u8, src0: Operand, src1: Operand },
+    VMulF32 { dst: u8, src0: Operand, src1: Operand, legacy: bool },
+    VMinF32 { dst: u8, src0: Operand, src1: Operand },
+    VMaxF32 { dst: u8, src0: Operand, src1: Operand },
+    VFmacF32 { dst: u8, src0: Operand, src1: Operand },
+    VFmaF32 { dst: u8, src0: Operand, src1: Operand, src2: Operand, mods: Vop3Mods },
+    VAddU32 { dst: u8, src0: Operand, src1: Operand },
+    VSubU32 { dst: u8, src0: Operand, src1: Operand },
+    VAndB32 { dst: u8, src0: Operand, src1: Operand },
+    VOrB32 { dst: u8, src0: Operand, src1: Operand },
+    VXorB32 { dst: u8, src0: Operand, src1: Operand },
+    VLshlRevB32 { dst: u8, shift: Operand, src: Operand },
+    VLshrRevB32 { dst: u8, shift: Operand, src: Operand },
+    VAshrRevI32 { dst: u8, shift: Operand, src: Operand },
+    VLshlAddU32 { dst: u8, src0: Operand, shift: Operand, src2: Operand },
+    VBfeU32 { dst: u8, src0: Operand, offset: Operand, width: Operand },
+    VCndMaskB32 { dst: u8, src0: Operand, src1: Operand, mask_src: Option<Operand> },
+    VCmp { op: CmpOp, ty: CmpType, dst: Option<u8>, src0: Operand, src1: Operand },
     /// Intra-2x2-quad lane swap (`ds_swizzle` / DPP quad permute).
-    /// Lowered to `OpGroupNonUniformQuadSwap` so helper pixels participate (Belobug fix).
     VQuadSwap { dst: u8, src: u8, direction: u8 },
 
-    /// `global_load_dword{,x2,x4} vdst, vaddr[0:1], saddr, offset`
+    // --- Local Data Share / Workgroup Shared Memory (DS) ---
+    DsReadB32 { dst: u8, addr: u8, offset: u16 },
+    DsWriteB32 { addr: u8, data: u8, offset: u16 },
+    DsReadB64 { dst: u8, addr: u8, offset: u16 },
+    DsWriteB64 { addr: u8, data: u8, offset: u16 },
+    DsAddU32 { addr: u8, data: u8, offset: u16 },
+
+    // --- Flat / Global Memory (FLAT) ---
     GlobalLoad {
         dst: u8,
         count: u8,
@@ -117,7 +188,6 @@ pub enum Inst {
         saddr: Option<u8>,
         offset: i32,
     },
-    /// `global_store_dword{,x2,x4} vaddr[0:1], vdata, saddr, offset`
     GlobalStore {
         vaddr: u8,
         vdata: u8,
@@ -126,11 +196,68 @@ pub enum Inst {
         offset: i32,
     },
 
+    // --- Buffer Memory (MUBUF / MTBUF) ---
+    BufferLoad {
+        dst: u8,
+        count: u8,
+        vaddr: u8,
+        srsrc: u8,
+        soffset: Operand,
+        offset: u16,
+        offen: bool,
+        idxen: bool,
+        typed_format: Option<u8>,
+    },
+    BufferStore {
+        vdata: u8,
+        count: u8,
+        vaddr: u8,
+        srsrc: u8,
+        soffset: Operand,
+        offset: u16,
+        offen: bool,
+        idxen: bool,
+        typed_format: Option<u8>,
+    },
+
+    // --- Image & Ray Tracing (MIMG) ---
+    ImageSample {
+        dst: u8,
+        addr_vgpr: u8,
+        rsrc_sgpr: u8,
+        samp_sgpr: u8,
+        dmask: u8,
+        dim: u8,
+        lod_zero: bool,
+    },
+    ImageLoad {
+        dst: u8,
+        addr_vgpr: u8,
+        rsrc_sgpr: u8,
+        dmask: u8,
+        dim: u8,
+    },
+    ImageStore {
+        vdata: u8,
+        addr_vgpr: u8,
+        rsrc_sgpr: u8,
+        dmask: u8,
+        dim: u8,
+    },
     /// `image_bvh64_intersect_ray` — hardware ray/box or ray/triangle node test.
     ImageBvh64IntersectRay {
         dst: u8,
         addr_vgpr: u8,
         rsrc_sgpr: u8,
+    },
+
+    // --- Graphics Shader Output Export (EXP) ---
+    Exp {
+        target: u8,
+        en: u8,
+        vsrc: [u8; 4],
+        done: bool,
+        compr: bool,
     },
 }
 
@@ -143,6 +270,13 @@ pub struct DecodedInst {
 }
 
 /// Decode a stream of little-endian RDNA2 dwords.
+///
+/// Encoding precedence follows the AMD RDNA2 ISA specification:
+/// - 32-bit scalar: SOPP (`101111111`) -> SOPC (`101111110`) -> SOP1 (`101111101`)
+///   -> SOPK (`1011`) -> SOP2 (`10`)
+/// - 32-bit vector: VOP1 (`0111111`) -> VOPC (`0111110`) -> VOP2 (`0`)
+/// - 64-bit encodings: VOP3 (`110101`), DS (`110110`), FLAT/GLOBAL (`110111`),
+///   MUBUF (`111000`), MTBUF (`111010`), MIMG (`111100`), SMEM (`111101`), EXP (`111110`)
 pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
     let mut out = Vec::new();
     let mut pc = 0usize;
@@ -157,16 +291,50 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
             let simm16 = (w & 0xffff) as i16 as isize;
             let target_dw = ((pc as isize) + 1 + simm16).max(0) as usize;
             match op {
+                0x00 => Inst::SNop,
                 0x01 => Inst::SEndpgm,
                 0x02 => Inst::SBranch { target_dw },
                 0x04 => Inst::SCBranchScc { on_one: false, target_dw },
                 0x05 => Inst::SCBranchScc { on_one: true, target_dw },
+                0x06 => Inst::SCBranchVccz { target_dw },
+                0x07 => Inst::SCBranchVccnz { target_dw },
                 0x08 => Inst::SCBranchExecz { target_dw },
+                0x09 => Inst::SCBranchExecnz { target_dw },
+                0x0a => Inst::SBarrier,
                 0x0c => Inst::SWaitcnt,
                 _ => return Err(DecodeError::Unsupported { word: w, offset: pc }),
             }
+        } else if (w >> 23) == 0b1011_1111_0 {
+            // SOPC (must be checked BEFORE SOPK and SOP2)
+            let op = (w >> 16) & 0x7f;
+            let s0 = (w & 0xff) as u16;
+            let s1 = ((w >> 8) & 0xff) as u16;
+            let lit = if s0 == 255 || s1 == 255 {
+                len += 1;
+                Some(*words.get(pc + 1).ok_or(DecodeError::Truncated { offset: pc })?)
+            } else {
+                None
+            };
+            let src0 = Operand::from_src9(s0, lit);
+            let src1 = Operand::from_src9(s1, lit);
+            let (cmp_op, cmp_ty) = match op {
+                0x00 => (CmpOp::Eq, CmpType::I32),
+                0x01 => (CmpOp::Ne, CmpType::I32),
+                0x02 => (CmpOp::Gt, CmpType::I32),
+                0x03 => (CmpOp::Ge, CmpType::I32),
+                0x04 => (CmpOp::Lt, CmpType::I32),
+                0x05 => (CmpOp::Le, CmpType::I32),
+                0x06 => (CmpOp::Eq, CmpType::U32),
+                0x07 => (CmpOp::Ne, CmpType::U32),
+                0x08 => (CmpOp::Gt, CmpType::U32),
+                0x09 => (CmpOp::Ge, CmpType::U32),
+                0x0a => (CmpOp::Lt, CmpType::U32),
+                0x0b => (CmpOp::Le, CmpType::U32),
+                _ => return Err(DecodeError::Unsupported { word: w, offset: pc }),
+            };
+            Inst::SCmp { op: cmp_op, ty: cmp_ty, src0, src1 }
         } else if (w >> 23) == 0b1011_1110_1 {
-            // SOP1
+            // SOP1 (must be checked BEFORE SOPK and SOP2)
             let op = (w >> 8) & 0xff;
             let dst = ((w >> 16) & 0x7f) as u8;
             let ssrc0_code = (w & 0xff) as u16;
@@ -179,11 +347,25 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
             let src0 = Operand::from_src9(ssrc0_code, lit);
             match op {
                 0x03 => Inst::SMovB32 { dst, src0 },
+                0x04 => Inst::SMovB64 { dst, src0 },
+                0x1f => Inst::SNotB64 { dst, src0 },
                 0x3c => Inst::SAndSaveExecB64 { dst, src0 },
+                0x3d => Inst::SOrSaveExecB64 { dst, src0 },
                 _ => return Err(DecodeError::Unsupported { word: w, offset: pc }),
             }
-        } else if (w >> 30) == 0b10 && (w >> 23) != 0b1011_1111_0 {
-            // SOP2
+        } else if (w >> 28) == 0b1011 {
+            // SOPK (must be checked AFTER SOPP/SOPC/SOP1 and BEFORE SOP2)
+            let op = (w >> 23) & 0x1f;
+            let dst = ((w >> 16) & 0x7f) as u8;
+            let simm16 = (w & 0xffff) as i16;
+            match op {
+                0x00 => Inst::SMovkI32 { dst, simm16 },
+                0x0f => Inst::SAddkI32 { dst, simm16 },
+                0x10 => Inst::SMulkI32 { dst, simm16 },
+                _ => return Err(DecodeError::Unsupported { word: w, offset: pc }),
+            }
+        } else if (w >> 30) == 0b10 {
+            // SOP2 (all SOPP/SOPC/SOP1/SOPK prefixes already excluded above)
             let op = (w >> 23) & 0x7f;
             let dst = ((w >> 16) & 0x7f) as u8;
             let s0 = (w & 0xff) as u16;
@@ -198,7 +380,18 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
             let src1 = Operand::from_src9(s1, lit);
             match op {
                 0x00 => Inst::SAddU32 { dst, src0, src1 },
+                0x01 => Inst::SSubU32 { dst, src0, src1 },
+                0x0e => Inst::SAndB32 { dst, src0, src1 },
                 0x0f => Inst::SAndB64 { dst, src0, src1 },
+                0x10 => Inst::SOrB32 { dst, src0, src1 },
+                0x11 => Inst::SOrB64 { dst, src0, src1 },
+                0x12 => Inst::SXorB32 { dst, src0, src1 },
+                0x13 => Inst::SXorB64 { dst, src0, src1 },
+                0x15 => Inst::SAndN2B64 { dst, src0, src1 },
+                0x17 => Inst::SOrN2B64 { dst, src0, src1 },
+                0x1e => Inst::SLshlB32 { dst, src0, shift: src1 },
+                0x20 => Inst::SLshrB32 { dst, src0, shift: src1 },
+                0x2c => Inst::SMulI32 { dst, src0, src1 },
                 _ => return Err(DecodeError::Unsupported { word: w, offset: pc }),
             }
         } else if (w >> 25) == 0b0111_111 {
@@ -212,12 +405,7 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
             } else {
                 None
             };
-            match op {
-                0x01 => Inst::VMovB32 { dst, src0: Operand::from_src9(s0, lit) },
-                0x02 => Inst::VReadFirstLaneB32 { dst, src: (s0.saturating_sub(256)) as u8 },
-                0x27 => Inst::VLogF32 { dst, src0: Operand::from_src9(s0, lit) },
-                _ => return Err(DecodeError::Unsupported { word: w, offset: pc }),
-            }
+            decode_vop1(op, dst, Operand::from_src9(s0, lit), s0, w, pc)?
         } else if (w >> 25) == 0b0111_110 {
             // VOPC
             let op = (w >> 17) & 0xff;
@@ -229,13 +417,7 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
             } else {
                 None
             };
-            match op {
-                0x11 => Inst::VCmpLtF32 {
-                    src0: Operand::from_src9(s0, lit),
-                    src1: Operand::Vgpr(v1),
-                },
-                _ => return Err(DecodeError::Unsupported { word: w, offset: pc }),
-            }
+            decode_vopc(op, None, Operand::from_src9(s0, lit), Operand::Vgpr(v1), w, pc)?
         } else if (w >> 31) == 0 {
             // VOP2
             let op = (w >> 25) & 0x3f;
@@ -248,33 +430,74 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
             } else {
                 None
             };
+            decode_vop2(op, dst, Operand::from_src9(s0, lit), Operand::Vgpr(v1), None, w, pc)?
+        } else if (w >> 26) == 0b1101_01 {
+            // VOP3 (64-bit encoding, optional 32-bit literal)
+            len = 2;
+            let w1 = *words.get(pc + 1).ok_or(DecodeError::Truncated { offset: pc })?;
+            let op = (w >> 16) & 0x3ff;
+            let dst = (w & 0xff) as u8;
+            let abs = ((w >> 8) & 0x7) as u8;
+            let clamp = ((w >> 15) & 1) != 0;
+            let s0 = (w1 & 0x1ff) as u16;
+            let s1 = ((w1 >> 9) & 0x1ff) as u16;
+            let s2 = ((w1 >> 18) & 0x1ff) as u16;
+            let omod = ((w1 >> 27) & 0x3) as u8;
+            let neg = ((w1 >> 29) & 0x7) as u8;
+            let lit = if s0 == 255 || s1 == 255 || s2 == 255 {
+                len += 1;
+                Some(*words.get(pc + 2).ok_or(DecodeError::Truncated { offset: pc })?)
+            } else {
+                None
+            };
             let src0 = Operand::from_src9(s0, lit);
-            let src1 = Operand::Vgpr(v1);
-            match op {
-                0x01 => Inst::VCndMaskB32 { dst, src0, src1 },
-                0x03 => Inst::VAddF32 { dst, src0, src1 },
-                0x07 => Inst::VMulF32 { dst, src0, src1, legacy: true },
-                0x08 => Inst::VMulF32 { dst, src0, src1, legacy: false },
-                0x1a => Inst::VLshlRevB32 { dst, shift: src0, src: src1 },
-                0x25 => Inst::VAddU32 { dst, src0, src1 },
-                0x2b => Inst::VFmacF32 { dst, src0, src1 },
-                _ => return Err(DecodeError::Unsupported { word: w, offset: pc }),
+            let src1 = Operand::from_src9(s1, lit);
+            let src2 = Operand::from_src9(s2, lit);
+            let mods = Vop3Mods { abs, neg, clamp, omod };
+
+            if op < 0x100 {
+                // VOPC promoted to VOP3 (writes arbitrary SGPR pair `dst`)
+                decode_vopc(op, Some(dst), src0, src1, w, pc)?
+            } else if (0x100..0x140).contains(&op) {
+                // VOP2 promoted to VOP3
+                decode_vop2(op - 0x100, dst, src0, src1, Some(src2), w, pc)?
+            } else if (0x180..0x200).contains(&op) {
+                // VOP1 promoted to VOP3
+                decode_vop1(op - 0x180, dst, src0, s0, w, pc)?
+            } else {
+                match op {
+                    0x141 | 0x14b => Inst::VFmaF32 { dst, src0, src1, src2, mods }, // v_mad_f32 / v_fma_f32
+                    0x148 => Inst::VBfeU32 { dst, src0, offset: src1, width: src2 }, // v_bfe_u32
+                    0x346 => Inst::VLshlAddU32 { dst, src0, shift: src1, src2 },     // v_lshl_add_u32
+                    _ => return Err(DecodeError::Unsupported { word: w, offset: pc }),
+                }
             }
-        } else if (w >> 26) == 0b1111_01 {
-            // SMEM (64-bit encoding)
+        } else if (w >> 26) == 0b1101_10 {
+            // DS (LDS / Workgroup shared memory, 64-bit encoding)
             len = 2;
             let w1 = *words.get(pc + 1).ok_or(DecodeError::Truncated { offset: pc })?;
             let op = (w >> 18) & 0xff;
-            let sbase = ((w & 0x3f) << 1) as u8;
-            let dst = ((w >> 6) & 0x7f) as u8;
-            let offset = (w1 & 0x1f_ffff) as i32;
-            let count = match op {
-                0x00 => 1,
-                0x01 => 2,
-                0x02 => 4,
+            let offset = (w & 0xffff) as u16;
+            let addr = (w1 & 0xff) as u8;
+            let data0 = ((w1 >> 8) & 0xff) as u8;
+            let vdst = ((w1 >> 24) & 0xff) as u8;
+            match op {
+                0x00 => Inst::DsAddU32 { addr, data: data0, offset },
+                0x0d => Inst::DsWriteB32 { addr, data: data0, offset },
+                0x36 => Inst::DsReadB32 { dst: vdst, addr, offset },
+                0x3d => Inst::DsWriteB64 { addr, data: data0, offset },
+                0x76 => Inst::DsReadB64 { dst: vdst, addr, offset },
+                0x35 => {
+                    // ds_swizzle_b32 quad-permute mode (offset bit 15 == 1)
+                    let dir = match offset & 0x3 {
+                        0x1 => 0, // quad swap X
+                        0x2 => 1, // quad swap Y
+                        _ => 2,   // quad swap diagonal
+                    };
+                    Inst::VQuadSwap { dst: vdst, src: addr, direction: dir }
+                }
                 _ => return Err(DecodeError::Unsupported { word: w, offset: pc }),
-            };
-            Inst::SLoadDword { dst, count, sbase, offset }
+            }
         } else if (w >> 26) == 0b1101_11 {
             // FLAT / GLOBAL (64-bit encoding)
             len = 2;
@@ -295,18 +518,101 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
                 0x1e => Inst::GlobalStore { vaddr, vdata, count: 4, saddr, offset },
                 _ => return Err(DecodeError::Unsupported { word: w, offset: pc }),
             }
-        } else if (w >> 26) == 0b1111_00 {
-            // MIMG (including image_bvh64_intersect_ray)
+        } else if (w >> 26) == 0b1110_00 {
+            // MUBUF (64-bit encoding)
             len = 2;
             let w1 = *words.get(pc + 1).ok_or(DecodeError::Truncated { offset: pc })?;
+            let offset = (w & 0xfff) as u16;
+            let offen = ((w >> 12) & 1) != 0;
+            let idxen = ((w >> 13) & 1) != 0;
+            let op = (w >> 18) & 0x7f;
+            let vaddr = (w1 & 0xff) as u8;
+            let vdata = ((w1 >> 8) & 0xff) as u8;
+            let srsrc = (((w1 >> 16) & 0x1f) << 2) as u8;
+            let soff_code = ((w1 >> 24) & 0xff) as u16;
+            let soffset = Operand::from_src9(soff_code, None);
+            match op {
+                0x0c => Inst::BufferLoad { dst: vdata, count: 1, vaddr, srsrc, soffset, offset, offen, idxen, typed_format: None },
+                0x0d => Inst::BufferLoad { dst: vdata, count: 2, vaddr, srsrc, soffset, offset, offen, idxen, typed_format: None },
+                0x0e => Inst::BufferLoad { dst: vdata, count: 4, vaddr, srsrc, soffset, offset, offen, idxen, typed_format: None },
+                0x1c => Inst::BufferStore { vdata, count: 1, vaddr, srsrc, soffset, offset, offen, idxen, typed_format: None },
+                0x1d => Inst::BufferStore { vdata, count: 2, vaddr, srsrc, soffset, offset, offen, idxen, typed_format: None },
+                0x1e => Inst::BufferStore { vdata, count: 4, vaddr, srsrc, soffset, offset, offen, idxen, typed_format: None },
+                _ => return Err(DecodeError::Unsupported { word: w, offset: pc }),
+            }
+        } else if (w >> 26) == 0b1110_10 {
+            // MTBUF (64-bit encoding)
+            len = 2;
+            let w1 = *words.get(pc + 1).ok_or(DecodeError::Truncated { offset: pc })?;
+            let offset = (w & 0xfff) as u16;
+            let offen = ((w >> 12) & 1) != 0;
+            let idxen = ((w >> 13) & 1) != 0;
+            let op = (w >> 15) & 0xf;
+            let format = ((w >> 19) & 0x7f) as u8;
+            let vaddr = (w1 & 0xff) as u8;
+            let vdata = ((w1 >> 8) & 0xff) as u8;
+            let srsrc = (((w1 >> 16) & 0x1f) << 2) as u8;
+            let soff_code = ((w1 >> 24) & 0xff) as u16;
+            let soffset = Operand::from_src9(soff_code, None);
+            match op {
+                0x0 => Inst::BufferLoad { dst: vdata, count: 1, vaddr, srsrc, soffset, offset, offen, idxen, typed_format: Some(format) },
+                0x1 => Inst::BufferLoad { dst: vdata, count: 2, vaddr, srsrc, soffset, offset, offen, idxen, typed_format: Some(format) },
+                0x3 => Inst::BufferLoad { dst: vdata, count: 4, vaddr, srsrc, soffset, offset, offen, idxen, typed_format: Some(format) },
+                0x4 => Inst::BufferStore { vdata, count: 1, vaddr, srsrc, soffset, offset, offen, idxen, typed_format: Some(format) },
+                0x5 => Inst::BufferStore { vdata, count: 2, vaddr, srsrc, soffset, offset, offen, idxen, typed_format: Some(format) },
+                0x7 => Inst::BufferStore { vdata, count: 4, vaddr, srsrc, soffset, offset, offen, idxen, typed_format: Some(format) },
+                _ => return Err(DecodeError::Unsupported { word: w, offset: pc }),
+            }
+        } else if (w >> 26) == 0b1111_00 {
+            // MIMG (image load/store/sample and image_bvh64_intersect_ray)
+            len = 2;
+            let w1 = *words.get(pc + 1).ok_or(DecodeError::Truncated { offset: pc })?;
+            let dim = ((w >> 3) & 0x7) as u8;
+            let dmask = ((w >> 8) & 0xf) as u8;
             let op = (w >> 18) & 0xff;
             let addr_vgpr = (w1 & 0xff) as u8;
             let dst = ((w1 >> 8) & 0xff) as u8;
             let rsrc_sgpr = (((w1 >> 16) & 0x1f) << 2) as u8;
+            let samp_sgpr = (((w1 >> 21) & 0x1f) << 2) as u8;
             match op {
+                0x00 => Inst::ImageLoad { dst, addr_vgpr, rsrc_sgpr, dmask, dim },
+                0x08 => Inst::ImageStore { vdata: dst, addr_vgpr, rsrc_sgpr, dmask, dim },
+                0x20 => Inst::ImageSample { dst, addr_vgpr, rsrc_sgpr, samp_sgpr, dmask, dim, lod_zero: false },
+                0x25 => Inst::ImageSample { dst, addr_vgpr, rsrc_sgpr, samp_sgpr, dmask, dim, lod_zero: true },
                 0x66 => Inst::ImageBvh64IntersectRay { dst, addr_vgpr, rsrc_sgpr },
                 _ => return Err(DecodeError::Unsupported { word: w, offset: pc }),
             }
+        } else if (w >> 26) == 0b1111_01 {
+            // SMEM (64-bit encoding)
+            len = 2;
+            let w1 = *words.get(pc + 1).ok_or(DecodeError::Truncated { offset: pc })?;
+            let op = (w >> 18) & 0xff;
+            let sbase = ((w & 0x3f) << 1) as u8;
+            let dst = ((w >> 6) & 0x7f) as u8;
+            let offset = (w1 & 0x1f_ffff) as i32;
+            let count = match op {
+                0x00 => 1,
+                0x01 => 2,
+                0x02 => 4,
+                0x03 => 8,
+                _ => return Err(DecodeError::Unsupported { word: w, offset: pc }),
+            };
+            Inst::SLoadDword { dst, count, sbase, offset }
+        } else if (w >> 26) == 0b1111_10 {
+            // EXP (graphics shader export, 64-bit encoding)
+            len = 2;
+            let w1 = *words.get(pc + 1).ok_or(DecodeError::Truncated { offset: pc })?;
+            let en = (w & 0xf) as u8;
+            let target = ((w >> 4) & 0x3f) as u8;
+            let compr = ((w >> 10) & 1) != 0;
+            let done = ((w >> 11) & 1) != 0;
+            let vsrc = [
+                (w1 & 0xff) as u8,
+                ((w1 >> 8) & 0xff) as u8,
+                ((w1 >> 16) & 0xff) as u8,
+                ((w1 >> 24) & 0xff) as u8,
+            ];
+            Inst::Exp { target, en, vsrc, done, compr }
         } else {
             return Err(DecodeError::Unsupported { word: w, offset: pc });
         };
@@ -318,10 +624,117 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
     Ok(out)
 }
 
+fn decode_vop1(op: u32, dst: u8, src0: Operand, s0_raw: u16, word: u32, offset: usize) -> Result<Inst, DecodeError> {
+    Ok(match op {
+        0x01 => Inst::VMovB32 { dst, src0 },
+        0x02 => Inst::VReadFirstLaneB32 { dst, src: (s0_raw.saturating_sub(256)) as u8 },
+        0x05 => Inst::VCvtF32I32 { dst, src0 },
+        0x06 => Inst::VCvtF32U32 { dst, src0 },
+        0x07 => Inst::VCvtU32F32 { dst, src0 },
+        0x08 => Inst::VCvtI32F32 { dst, src0 },
+        0x20 => Inst::VFractF32 { dst, src0 },
+        0x24 => Inst::VFloorF32 { dst, src0 },
+        0x25 => Inst::VExpF32 { dst, src0 },
+        0x27 => Inst::VLogF32 { dst, src0 },
+        0x2a => Inst::VRcpF32 { dst, src0 },
+        0x2e => Inst::VRsqF32 { dst, src0 },
+        0x33 => Inst::VSqrtF32 { dst, src0 },
+        _ => return Err(DecodeError::Unsupported { word, offset }),
+    })
+}
+
+fn decode_vop2(
+    op: u32,
+    dst: u8,
+    src0: Operand,
+    src1: Operand,
+    src2: Option<Operand>,
+    word: u32,
+    offset: usize,
+) -> Result<Inst, DecodeError> {
+    Ok(match op {
+        0x01 => Inst::VCndMaskB32 { dst, src0, src1, mask_src: src2 },
+        0x03 => Inst::VAddF32 { dst, src0, src1 },
+        0x04 => Inst::VSubF32 { dst, src0, src1 },
+        0x05 => Inst::VSubF32 { dst, src0: src1, src1: src0 }, // v_subrev_f32
+        0x07 => Inst::VMulF32 { dst, src0, src1, legacy: true },
+        0x08 => Inst::VMulF32 { dst, src0, src1, legacy: false },
+        0x0f => Inst::VMinF32 { dst, src0, src1 },
+        0x10 => Inst::VMaxF32 { dst, src0, src1 },
+        0x18 => Inst::VLshrRevB32 { dst, shift: src0, src: src1 },
+        0x19 => Inst::VAshrRevI32 { dst, shift: src0, src: src1 },
+        0x1a => Inst::VLshlRevB32 { dst, shift: src0, src: src1 },
+        0x1b => Inst::VAndB32 { dst, src0, src1 },
+        0x1c => Inst::VOrB32 { dst, src0, src1 },
+        0x1d => Inst::VXorB32 { dst, src0, src1 },
+        0x25 => Inst::VAddU32 { dst, src0, src1 },
+        0x26 => Inst::VSubU32 { dst, src0, src1 },
+        0x27 => Inst::VSubU32 { dst, src0: src1, src1: src0 }, // v_subrev_nc_u32
+        0x2b => Inst::VFmacF32 { dst, src0, src1 },
+        _ => return Err(DecodeError::Unsupported { word, offset }),
+    })
+}
+
+fn decode_vopc(
+    op: u32,
+    dst: Option<u8>,
+    src0: Operand,
+    src1: Operand,
+    word: u32,
+    offset: usize,
+) -> Result<Inst, DecodeError> {
+    let (cmp_op, cmp_ty) = match op {
+        0x11 => (CmpOp::Lt, CmpType::F32),
+        0x12 => (CmpOp::Eq, CmpType::F32),
+        0x13 => (CmpOp::Le, CmpType::F32),
+        0x14 => (CmpOp::Gt, CmpType::F32),
+        0x15 => (CmpOp::Ne, CmpType::F32),
+        0x16 => (CmpOp::Ge, CmpType::F32),
+        0x81 => (CmpOp::Lt, CmpType::I32),
+        0x82 => (CmpOp::Eq, CmpType::I32),
+        0x83 => (CmpOp::Le, CmpType::I32),
+        0x84 => (CmpOp::Gt, CmpType::I32),
+        0x85 => (CmpOp::Ne, CmpType::I32),
+        0x86 => (CmpOp::Ge, CmpType::I32),
+        0xc1 => (CmpOp::Lt, CmpType::U32),
+        0xc2 => (CmpOp::Eq, CmpType::U32),
+        0xc3 => (CmpOp::Le, CmpType::U32),
+        0xc4 => (CmpOp::Gt, CmpType::U32),
+        0xc5 => (CmpOp::Ne, CmpType::U32),
+        0xc6 => (CmpOp::Ge, CmpType::U32),
+        _ => return Err(DecodeError::Unsupported { word, offset }),
+    };
+    Ok(Inst::VCmp { op: cmp_op, ty: cmp_ty, dst, src0, src1 })
+}
+
 /// Mini-encoder helpers for tests & synthetic RDNA2 programs.
 pub mod encode {
+    pub fn s_nop() -> u32 {
+        0b1011_1111_1 << 23
+    }
+
     pub fn s_endpgm() -> u32 {
         (0b1011_1111_1 << 23) | (0x01 << 16)
+    }
+
+    pub fn s_branch(rel16: i16) -> u32 {
+        (0b1011_1111_1 << 23) | (0x02 << 16) | (rel16 as u16 as u32)
+    }
+
+    pub fn s_cbranch_scc0(rel16: i16) -> u32 {
+        (0b1011_1111_1 << 23) | (0x04 << 16) | (rel16 as u16 as u32)
+    }
+
+    pub fn s_cbranch_scc1(rel16: i16) -> u32 {
+        (0b1011_1111_1 << 23) | (0x05 << 16) | (rel16 as u16 as u32)
+    }
+
+    pub fn s_cbranch_execz(rel16: i16) -> u32 {
+        (0b1011_1111_1 << 23) | (0x08 << 16) | (rel16 as u16 as u32)
+    }
+
+    pub fn s_barrier() -> u32 {
+        (0b1011_1111_1 << 23) | (0x0a << 16)
     }
 
     pub fn s_waitcnt() -> u32 {
@@ -332,8 +745,40 @@ pub mod encode {
         (0b1011_1110_1 << 23) | ((dst as u32) << 16) | (0x03 << 8) | (ssrc0 as u32)
     }
 
+    pub fn s_mov_b64(dst: u8, ssrc0: u8) -> u32 {
+        (0b1011_1110_1 << 23) | ((dst as u32) << 16) | (0x04 << 8) | (ssrc0 as u32)
+    }
+
+    pub fn s_and_saveexec_b64(dst: u8, ssrc0: u8) -> u32 {
+        (0b1011_1110_1 << 23) | ((dst as u32) << 16) | (0x3c << 8) | (ssrc0 as u32)
+    }
+
+    pub fn s_xor_b64(dst: u8, ssrc0: u8, ssrc1: u8) -> u32 {
+        (0b10 << 30) | (0x13 << 23) | ((dst as u32) << 16) | ((ssrc1 as u32) << 8) | (ssrc0 as u32)
+    }
+
+    pub fn s_or_b64(dst: u8, ssrc0: u8, ssrc1: u8) -> u32 {
+        (0b10 << 30) | (0x11 << 23) | ((dst as u32) << 16) | ((ssrc1 as u32) << 8) | (ssrc0 as u32)
+    }
+
+    pub fn s_and_b64(dst: u8, ssrc0: u8, ssrc1: u8) -> u32 {
+        (0b10 << 30) | (0x0f << 23) | ((dst as u32) << 16) | ((ssrc1 as u32) << 8) | (ssrc0 as u32)
+    }
+
+    pub fn s_movk_i32(dst: u8, simm16: i16) -> u32 {
+        (0b1011 << 28) | ((dst as u32) << 16) | (simm16 as u16 as u32)
+    }
+
+    pub fn s_cmp_eq_u32(ssrc0: u8, ssrc1: u8) -> u32 {
+        (0b1011_1111_0 << 23) | (0x06 << 16) | ((ssrc1 as u32) << 8) | (ssrc0 as u32)
+    }
+
     pub fn v_mov_b32_vgpr(dst: u8, src_vgpr: u8) -> u32 {
         (0b0111_111 << 25) | ((dst as u32) << 17) | (0x01 << 9) | (256 + src_vgpr as u32)
+    }
+
+    pub fn v_mov_b32_sgpr(dst: u8, src_sgpr: u8) -> u32 {
+        (0b0111_111 << 25) | ((dst as u32) << 17) | (0x01 << 9) | (src_sgpr as u32)
     }
 
     pub fn v_add_f32(dst: u8, src0_vgpr: u8, src1_vgpr: u8) -> u32 {
@@ -348,8 +793,46 @@ pub mod encode {
         (0x2b << 25) | ((dst as u32) << 17) | ((src1_vgpr as u32) << 9) | (256 + src0_vgpr as u32)
     }
 
+    pub fn v_add_nc_u32_imm(dst: u8, imm: u8, src_vgpr: u8) -> u32 {
+        (0x25 << 25) | ((dst as u32) << 17) | ((src_vgpr as u32) << 9) | (128 + imm as u32)
+    }
+
+    pub fn v_and_b32_imm(dst: u8, imm: u8, src_vgpr: u8) -> u32 {
+        (0x1b << 25) | ((dst as u32) << 17) | ((src_vgpr as u32) << 9) | (128 + imm as u32)
+    }
+
     pub fn v_lshlrev_b32_imm(dst: u8, shift_imm: u8, src_vgpr: u8) -> u32 {
         (0x1a << 25) | ((dst as u32) << 17) | ((src_vgpr as u32) << 9) | (128 + shift_imm as u32)
+    }
+
+    /// `v_cmp_lt_u32 vcc, vsrc0, imm` encoded via `v_cmp_gt_u32 vcc, imm, vsrc0`.
+    pub fn v_cmp_lt_u32_imm(vsrc: u8, imm: u8) -> u32 {
+        // VOPC: op=0xc4 (gt_u32) with src0=imm, vsrc1=vsrc => imm > vsrc <=> vsrc < imm
+        (0b0111_110 << 25) | (0xc4 << 17) | ((vsrc as u32) << 9) | (128 + imm as u32)
+    }
+
+    pub fn v_cmp_eq_u32_imm(vsrc: u8, imm: u8) -> u32 {
+        (0b0111_110 << 25) | (0xc2 << 17) | ((vsrc as u32) << 9) | (128 + imm as u32)
+    }
+
+    pub fn v_fma_f32_vop3(dst: u8, src0_vgpr: u8, src1_vgpr: u8, src2_vgpr: u8) -> [u32; 2] {
+        let w0 = (0b1101_01 << 26) | (0x14b << 16) | (dst as u32);
+        let w1 = ((256 + src2_vgpr as u32) << 18)
+            | ((256 + src1_vgpr as u32) << 9)
+            | (256 + src0_vgpr as u32);
+        [w0, w1]
+    }
+
+    pub fn ds_write_b32(addr: u8, data: u8, offset: u16) -> [u32; 2] {
+        let w0 = (0b1101_10 << 26) | (0x0d << 18) | (offset as u32);
+        let w1 = ((data as u32) << 8) | (addr as u32);
+        [w0, w1]
+    }
+
+    pub fn ds_read_b32(dst: u8, addr: u8, offset: u16) -> [u32; 2] {
+        let w0 = (0b1101_10 << 26) | (0x36 << 18) | (offset as u32);
+        let w1 = ((dst as u32) << 24) | (addr as u32);
+        [w0, w1]
     }
 
     pub fn global_load_dword(dst: u8, vaddr: u8, saddr: u8, offset: u16) -> [u32; 2] {
@@ -362,5 +845,60 @@ pub mod encode {
         let w0 = (0b1101_11 << 26) | (0x1c << 18) | (offset as u32 & 0xfff);
         let w1 = ((saddr as u32) << 16) | ((vdata as u32) << 8) | (vaddr as u32);
         [w0, w1]
+    }
+
+    pub fn buffer_load_dword(dst: u8, vaddr: u8, srsrc: u8, offset: u16) -> [u32; 2] {
+        let w0 = (0b1110_00 << 26) | (0x0c << 18) | (1 << 12) | (offset as u32 & 0xfff);
+        let w1 = (128 << 24) | (((srsrc as u32 >> 2) & 0x1f) << 16) | ((dst as u32) << 8) | (vaddr as u32);
+        [w0, w1]
+    }
+
+    pub fn buffer_store_dword(vdata: u8, vaddr: u8, srsrc: u8, offset: u16) -> [u32; 2] {
+        let w0 = (0b1110_00 << 26) | (0x1c << 18) | (1 << 12) | (offset as u32 & 0xfff);
+        let w1 = (128 << 24) | (((srsrc as u32 >> 2) & 0x1f) << 16) | ((vdata as u32) << 8) | (vaddr as u32);
+        [w0, w1]
+    }
+
+    pub fn image_bvh64_intersect_ray(dst: u8, addr_vgpr: u8, rsrc_sgpr: u8) -> [u32; 2] {
+        let w0 = (0b1111_00 << 26) | (0x66 << 18) | (0xf << 8);
+        let w1 = (((rsrc_sgpr as u32 >> 2) & 0x1f) << 16) | ((dst as u32) << 8) | (addr_vgpr as u32);
+        [w0, w1]
+    }
+
+    pub fn exp_mrt0(vsrc: [u8; 4], done: bool) -> [u32; 2] {
+        let w0 = (0b1111_10 << 26) | ((done as u32) << 11) | 0xf;
+        let w1 = ((vsrc[3] as u32) << 24)
+            | ((vsrc[2] as u32) << 16)
+            | ((vsrc[1] as u32) << 8)
+            | (vsrc[0] as u32);
+        [w0, w1]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_sopc_sopk_vop3_ds_mubuf_exp_without_misclassification() {
+        let mut prog = Vec::new();
+        prog.push(encode::s_movk_i32(4, -12));
+        prog.push(encode::s_cmp_eq_u32(4, 5));
+        prog.extend_from_slice(&encode::v_fma_f32_vop3(3, 0, 1, 2));
+        prog.extend_from_slice(&encode::ds_write_b32(0, 3, 16));
+        prog.extend_from_slice(&encode::ds_read_b32(4, 0, 16));
+        prog.extend_from_slice(&encode::buffer_load_dword(5, 0, 8, 64));
+        prog.extend_from_slice(&encode::exp_mrt0([0, 1, 2, 3], true));
+        prog.push(encode::s_endpgm());
+
+        let decoded = decode_program(&prog).expect("decode failed");
+        assert!(matches!(decoded[0].inst, Inst::SMovkI32 { dst: 4, simm16: -12 }));
+        assert!(matches!(decoded[1].inst, Inst::SCmp { op: CmpOp::Eq, ty: CmpType::U32, .. }));
+        assert!(matches!(decoded[2].inst, Inst::VFmaF32 { dst: 3, .. }));
+        assert!(matches!(decoded[3].inst, Inst::DsWriteB32 { addr: 0, data: 3, offset: 16 }));
+        assert!(matches!(decoded[4].inst, Inst::DsReadB32 { dst: 4, addr: 0, offset: 16 }));
+        assert!(matches!(decoded[5].inst, Inst::BufferLoad { dst: 5, srsrc: 8, offset: 64, .. }));
+        assert!(matches!(decoded[6].inst, Inst::Exp { target: 0, done: true, .. }));
+        assert!(matches!(decoded[7].inst, Inst::SEndpgm));
     }
 }

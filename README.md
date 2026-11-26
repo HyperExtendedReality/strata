@@ -125,20 +125,20 @@ Instead of rebuilding legacy Direct3D 12 abstractions on top of console hardware
 
 ---
 
-## What Works Today
+## What Works Today (Experimental Prototype)
 
-All implemented subsystems are covered by automated unit tests, `spirv-val --target-env vulkan1.3` validation, and live GPU execution tests.
+Strata is an early-stage research prototype. Subsystems below are verified on synthetic unit tests, `spirv-val --target-env vulkan1.3`, and live Vulkan 1.3 GPU hardware tests—**not** yet full retail console games.
 
 <details>
 <summary><b>Shader Compiler & Slang Runtime Shaders</b></summary>
 
-| Component | Status | Verified By |
+| Component | Status | Verified By / Current Scope |
 | :--- | :---: | :--- |
-| Direct RDNA2 → SSA → SPIR-V 1.6 (BDA) | ✅ | `spirv-val` + live GPU execution (64/64 lanes bit-exact) |
+| RDNA2 decoder (`SOPP`/`SOPC`/`SOP1`/`SOPK`/`SOP2`, `VOP1`/`VOPC`/`VOP2`/`VOP3`, `SMEM`, `FLAT`/`GLOBAL`, `DS`, `MUBUF`/`MTBUF`, `MIMG`, `EXP`) | 🟡 | Unit tests; covers core compute/ALU/memory/ray-tracing encodings (not full 400+ opcode ISA yet) |
+| Direct RDNA2 → SSA → SPIR-V 1.6 (BDA, LDS, VOP3, BVH64) | 🟡 | `spirv-val` + live GPU execution on synthetic RDNA2 compute kernels; graphics `EXP`/bindless `MIMG` return explicit errors |
 | 128-bit BDA load coalescing & bitcast/CSE/DCE opt | ✅ | Unit test + live GPU execution |
-| Structured CFG (`OpSelectionMerge` + `OpPhi`) | ✅ | `spirv-val` + live GPU divergent-lane execution |
-| Subgroup-agnostic Wave64 ballot (`OpGroupNonUniformBallot` + `Workgroup` atomic merge + `subgroupSizeControl`) | ✅ | `spirv-val` + live GPU test across SIMD8/16, Wave32 & native Wave64 (`0x5555555555555555`) |
-| Exact RDNA2 `v_log_f32` (`Log2`), `v_mul_legacy_f32`, quad-safe `OpGroupNonUniformQuadSwap` | ✅ | Compiler unit tests |
+| RDNA2-translated Structured CFG (`s_and_saveexec_b64` + `s_cbranch_execz` → `OpSelectionMerge` + `OpPhi`) | 🟡 | `spirv-val` + live GPU divergent-lane execution (forward branches; loops/irreducible CFG return explicit errors) |
+| RDNA2-translated Wave64 ballot (`wave.rs` whole-live analysis → `OpGroupNonUniformBallot` + Workgroup atomic merge) | ✅ | `spirv-val` + live GPU test across hardware subgroup sizes (`0x5555555555555555`) |
 | `DXBC` / `XDAT` / `XBCH` (pure-Rust RFC 1950/1951 zlib) / `FSSM` parser | ✅ | Unit tests on synthetic containers & streams |
 | Atomic content-addressed SPIR-V disk cache | ✅ | Roundtrip unit test |
 | Build-time Slang shaders (`dirty_hash`, `detile`, `clamp_indirect`, `bvh_oracle`, `present_blit`) | ✅ | Compiled by `slangc` in `build.rs` + live GPU execution |
@@ -148,30 +148,29 @@ All implemented subsystems are covered by automated unit tests, `spirv-val --tar
 <details>
 <summary><b>No-API Vulkan 1.3+ GPU Backend & 3-Tier Hybrid UMA</b></summary>
 
-| Component | Status | Verified By |
+| Component | Status | Verified By / Current Scope |
 | :--- | :---: | :--- |
-| Tier 1 Zero-Copy Host UMA (`VirtualAlloc` → `VK_EXT_external_memory_host` → 64-bit BDA) | ✅ | Live GPU read/write test (0 `memcpy`, 64/64 lanes) |
+| Tier 1 Zero-Copy Host UMA (`VirtualAlloc`/`mmap` → `VK_EXT_external_memory_host` → 64-bit BDA) | ✅ | Live GPU read/write test (0 `memcpy`, 64/64 lanes) |
 | Tier 2 `DEVICE_LOCAL` GDDR6 VRAM Mirror + Cross-Tier GPU execution | ✅ | Live GPU test reading Tier 2 VRAM → writing Tier 1 CPU RAM |
 | Tier 3 `vkQueueBindSparse` 64 KiB Aliased 2D `VkImage`s | ✅ | Live GPU sparse bind test (2 `SPARSE_ALIASED` images sharing 1 tile) |
 | No-API `VK_KHR_dynamic_rendering` + Slang vertex-less `present_blit.slang` | ✅ | Live GPU render test (0 RenderPasses, 0 Framebuffers, 0 VertexBuffers) |
 | Fence-gated Bindless Slot Manager (`SHOW_AFTER` pattern) | ✅ | Unit test |
-| `ThinCommandList` (bind deduplication, integer-RT blend sanitization, hoisted clamps) | ✅ | Unit test + live COM → Vulkan execution |
-| `FramePacingClock` + Win32 `Win32Window` / `SwapchainPresenter` + atomic `VkPipelineCache` | ✅ | Unit test + build verification |
+| `ThinCommandList` (bind deduplication, integer-RT blend sanitization, hoisted clamps, draw/barrier/copy commands) | ✅ | Unit test + live COM → Vulkan compute execution |
+| `FramePacingClock` + Win32 `Win32Window` / `SwapchainPresenter` + atomic `VkPipelineCache` | 🟡 | Windows x64 only today; Linux X11/Wayland surface support planned |
 
 </details>
 
 <details>
 <summary><b>PE32+ Loader & Console HLE</b></summary>
 
-| Component | Status | Verified By |
+| Component | Status | Verified By / Current Scope |
 | :--- | :---: | :--- |
-| PE32+ parser (sections, imports, exports, relocations, static TLS directory) | ✅ | Tested on real 64-bit PE images |
-| In-memory PE32+ mapper (`VirtualAlloc`, DIR64 relocations, live IAT patching, R/W/X protections) | ✅ | `strata-cli map-test` |
-| Static TLS slot allocation (`TlsAlloc`) + template initialization | ✅ | `strata-cli map-test` |
-| Live Windows VEH + Zen 2 instruction decoder (`clwb`, `clzero`, `rdpru`, `monitorx`, `rdpid`) | ✅ | Unit tests |
-| `PhysicalPagePool` 64 KiB scatter mapper & aliased-view tracking | ✅ | Unit test |
-| `D3D12.X` COM vtables (`Device`, `Queue`, `CommandList`, `PresentX`) → live Vulkan bridge | ✅ | Unit test + live GPU roundtrip |
-| Dynamic `LoadLibrary`/`GetProcAddress` pseudo-handle hooks, VFS, offline `DStorage`, `xg_xs` swizzle layouts, gamepad input | ✅ | Unit tests |
+| PE32+ parser & in-memory mapper (`VirtualAlloc`, DIR64 relocations, live IAT patching, R/W/X protections, real entry-point execution) | ✅ | Unit test executes real mapped x86-64 PE32+ entry point (`strata-cli run <exe>`) |
+| Static TLS slot allocation (`TlsAlloc`) + template initialization | 🟡 | Basic slot setup; full TEB `ThreadLocalStoragePointer` multi-thread injection in progress |
+| Live Windows VEH (`clzero`, `rdpru` via QPC, `rdpid` via `GetCurrentProcessorNumber`, `monitorx`/`mwaitx`, `clwb`) | ✅ | Unit tests (note: `clwb`/`rdpid` are also present on modern Intel CPUs; VEH catches faults on older/non-AMD CPUs) |
+| `xmem.dll` (`XMemVirtualAlloc`, `XMemFree`, physical-page pool & scatter mapping, working-set stats, `XMemTransferMemory`) | 🟡 | Wired to `UmaManager` + `PhysicalPagePool`; partial console flag coverage |
+| `d3d12_xs.dll` COM vtables (`Device`, `Queue`, `CommandList`, `Resource`, `Fence`, `ID3DBlob`) & `xg_xs.dll` (`XGTextureAddressComputer`) | 🟡 | Unit tests + synthetic GPU compute dispatch; full retail vtable slot parity in progress |
+| Audio (`xapu.dll` / `AcpHal.dll`) & unimplemented console imports | 🟡 | Offline silent audio stubs + logged `E_NOTIMPL` fallback stubs for unresolved imports |
 
 </details>
 
@@ -210,9 +209,10 @@ strata-cli probe                   # Query GPU No-API Vulkan 1.3+ features & sub
 strata-cli selftest                # Verify embedded Slang SPIR-V & direct RDNA2 -> SPIR-V emitter
 strata-cli gpu-test                # Run 9 live GPU tests (RDNA2 BDA, Slang, Zero-Copy UMA, Wave64-on-32)
 strata-cli uma-test                # Run live 3-tier hybrid UMA + vkQueueBindSparse test
-strata-cli inspect <path.exe>      # Parse PE32+ headers and classify all DLL imports
-strata-cli bind-check <path.exe>   # Dry-run IAT resolution against Strata HLE + Host Windows
-strata-cli map-test <path.exe>     # Map PE32+ in memory, patch IAT, init TLS, run COM->Vulkan test
+strata-cli inspect <path.exe>          # Parse PE32+ headers and classify all DLL imports
+strata-cli bind-check <path.exe>       # Dry-run IAT resolution against Strata HLE + Host Windows
+strata-cli map-test <path.exe> [--execute] # Map PE32+, patch IAT, init TLS (+ optional entry exec & synthetic COM check)
+strata-cli run <path.exe>              # Map PE32+, patch IAT, install VEH, and execute the entry point
 ```
 
 ---

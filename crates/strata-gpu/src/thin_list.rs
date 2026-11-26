@@ -38,7 +38,11 @@ pub enum ThinCommand {
     PushUserSgprs { offset_dw: u8, values: Vec<u32> },
     Dispatch { x: u32, y: u32, z: u32, is_thread_count: bool },
     DispatchIndirect { args_bda: u64, max_x: u32, max_y: u32, max_z: u32 },
+    DrawInstanced { vertex_count: u32, instance_count: u32, start_vertex: u32, start_instance: u32 },
+    DrawIndexedInstanced { index_count: u32, instance_count: u32, start_index: u32, base_vertex: i32, start_instance: u32 },
     DrawIndirect { args_bda: u64, max_verts: u32, max_inst: u32 },
+    ResourceBarrier { resource_va: u64, state_before: u32, state_after: u32 },
+    CopyBufferRegion { dst_va: u64, dst_offset: u64, src_va: u64, src_offset: u64, num_bytes: u64 },
     /// Schedule GPU -> CPU readback of a compute-written texture (e.g. ocean heightmap).
     ReadbackTexture { console_va: u64, byte_len: u64 },
 }
@@ -113,6 +117,70 @@ impl ThinCommandList {
             max_verts,
             max_inst,
         });
+    }
+
+    pub fn draw_instanced(
+        &mut self,
+        vertex_count: u32,
+        instance_count: u32,
+        start_vertex: u32,
+        start_instance: u32,
+    ) {
+        self.commands.push(ThinCommand::DrawInstanced {
+            vertex_count,
+            instance_count,
+            start_vertex,
+            start_instance,
+        });
+    }
+
+    pub fn draw_indexed_instanced(
+        &mut self,
+        index_count: u32,
+        instance_count: u32,
+        start_index: u32,
+        base_vertex: i32,
+        start_instance: u32,
+    ) {
+        self.commands.push(ThinCommand::DrawIndexedInstanced {
+            index_count,
+            instance_count,
+            start_index,
+            base_vertex,
+            start_instance,
+        });
+    }
+
+    pub fn resource_barrier(&mut self, resource_va: u64, state_before: u32, state_after: u32) {
+        self.commands.push(ThinCommand::ResourceBarrier {
+            resource_va,
+            state_before,
+            state_after,
+        });
+    }
+
+    pub fn copy_buffer_region(
+        &mut self,
+        dst_va: u64,
+        dst_offset: u64,
+        src_va: u64,
+        src_offset: u64,
+        num_bytes: u64,
+    ) {
+        self.commands.push(ThinCommand::CopyBufferRegion {
+            dst_va,
+            dst_offset,
+            src_va,
+            src_offset,
+            num_bytes,
+        });
+    }
+
+    pub fn reset(&mut self) {
+        self.commands.clear();
+        self.bound_pipeline = None;
+        self.bound_rts.clear();
+        self.hoisted_clamps.clear();
     }
 
     pub fn schedule_texture_readback(&mut self, console_va: u64, byte_len: u64) {

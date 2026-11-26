@@ -11,6 +11,8 @@ use strata_gpu::runner::ComputeRunner;
 use strata_gpu::thin_list::ThinCommandList;
 use strata_gpu::uma::UmaManager;
 
+use crate::xmem_phys::PhysicalPagePool;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DllClass {
     StrataHle,
@@ -75,6 +77,7 @@ pub fn classify_dll(dll_name: &str) -> DllClass {
 /// Strata's 3-tier hybrid UMA + No-API Vulkan thin command lists.
 pub struct HleRuntime {
     pub uma: UmaManager,
+    pub phys_pool: PhysicalPagePool,
     pub active_list: ThinCommandList,
     next_console_va: u64,
 }
@@ -83,13 +86,14 @@ impl HleRuntime {
     pub fn new() -> Self {
         Self {
             uma: UmaManager::new(),
+            phys_pool: PhysicalPagePool::new(),
             active_list: ThinCommandList::new(),
             next_console_va: 0x0000_0400_0000_0000,
         }
     }
 
     /// Emulates `kernelx!XMemVirtualAlloc` using Tier 1 Zero-Copy Host UMA
-    /// (`VirtualAlloc` + `VK_EXT_external_memory_host` -> 64-bit GPU BDA pointer).
+    /// (`VirtualAlloc`/`mmap` + `VK_EXT_external_memory_host` -> 64-bit GPU BDA pointer).
     pub fn xmem_virtual_alloc(
         &mut self,
         runner: &ComputeRunner,
@@ -105,6 +109,12 @@ impl HleRuntime {
         };
         let alloc = self.uma.xmem_virtual_alloc_zero_copy(runner, va, size)?;
         Ok((alloc.console_va, alloc.host_bda))
+    }
+
+    /// Emulates `xmem!XMemFree` / `XMemFreeDefault`, releasing both the Vulkan BDA
+    /// buffer and the underlying host allocation.
+    pub fn xmem_free(&mut self, runner: &ComputeRunner, addr: u64) -> bool {
+        self.uma.free_allocation(runner, addr)
     }
 
     pub fn shutdown(&mut self, runner: &ComputeRunner) {

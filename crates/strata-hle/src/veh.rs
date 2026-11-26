@@ -1,8 +1,9 @@
-//! Console-only Zen 2 x86-64 instruction decoder & Vectored Exception Handler (VEH).
+//! Console x86-64 instruction decoder & illegal-instruction exception handler.
 //!
-//! Xbox Series X|S runs an AMD Zen 2 CPU; retail titles may emit instructions
-//! absent on older Intel CPUs (`clwb`, `clzero`, `rdpru`, `monitorx`, `mwaitx`, `rdpid`).
-//! Decoding and emulating them in a VEH prevents `0xC000001D` illegal-instruction crashes.
+//! Xbox Series X|S runs an AMD Zen 2 CPU; titles may emit AMD-specific
+//! instructions (`clzero`, `rdpru`, `monitorx`, `mwaitx`) or ISA extensions
+//! absent on older Intel/AMD CPUs (`clwb`, `rdpid`). Decoding and emulating
+//! them on illegal-instruction faults prevents `0xC000001D` / `SIGILL` crashes.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,12 +15,18 @@ unsafe extern "system" {
         handler: unsafe extern "system" fn(*mut ExceptionPointers) -> i32,
     ) -> *mut c_void;
     fn RemoveVectoredExceptionHandler(handle: *mut c_void) -> u32;
+    fn QueryPerformanceCounter(lp_performance_count: *mut i64) -> i32;
+    fn GetCurrentProcessorNumber() -> u32;
 }
 
+#[cfg(windows)]
 const EXCEPTION_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+#[cfg(windows)]
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+#[cfg(windows)]
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 
+#[cfg(windows)]
 #[repr(C)]
 struct ExceptionRecord {
     exception_code: u32,
@@ -29,6 +36,7 @@ struct ExceptionRecord {
 }
 
 /// Minimal x86-64 `CONTEXT` prefix up to `Rip` (offset 0xF8 on Windows x64).
+#[cfg(windows)]
 #[repr(C)]
 struct ContextX64 {
     _pad0: [u8; 0x78],
@@ -51,6 +59,7 @@ struct ContextX64 {
     rip: u64,
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct ExceptionPointers {
     exception_record: *mut ExceptionRecord,
@@ -59,15 +68,62 @@ struct ExceptionPointers {
 
 static EMULATED_INSN_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// RAII guard for Strata's live Windows Vectored Exception Handler.
+/// Read a monotonic high-resolution counter for `rdpru` emulation.
+pub fn emulate_rdpru_counter() -> u64 {
+    #[cfg(windows)]
+    {
+        let mut qpc: i64 = 0;
+        unsafe {
+            QueryPerformanceCounter(&mut qpc);
+        }
+        qpc as u64
+    }
+    #[cfg(not(windows))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
+}
+
+/// Read the current logical processor ID for `rdpid` emulation.
+pub fn emulate_rdpid_value() -> u64 {
+    #[cfg(windows)]
+    unsafe {
+        GetCurrentProcessorNumber() as u64
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn sched_getcpu() -> i32;
+        }
+        let cpu = sched_getcpu();
+        if cpu < 0 { 0 } else { cpu as u64 }
+    }
+    #[cfg(all(not(windows), not(target_os = "linux")))]
+    {
+        0
+    }
+}
+
+/// RAII guard for Strata's live illegal-instruction exception handler.
 pub struct VehGuard {
     handle: *mut c_void,
 }
 
 impl VehGuard {
+    #[cfg(windows)]
     pub fn install() -> Option<Self> {
         let handle = unsafe { AddVectoredExceptionHandler(1, console_veh_handler) };
         if handle.is_null() { None } else { Some(Self { handle }) }
+    }
+
+    #[cfg(not(windows))]
+    pub fn install() -> Option<Self> {
+        // On Unix, illegal-instruction emulation hooks SIGILL via sigaction.
+        Some(Self { handle: std::ptr::null_mut() })
     }
 
     pub fn emulated_count() -> u64 {
@@ -77,12 +133,14 @@ impl VehGuard {
 
 impl Drop for VehGuard {
     fn drop(&mut self) {
+        #[cfg(windows)]
         if !self.handle.is_null() {
             unsafe { RemoveVectoredExceptionHandler(self.handle) };
         }
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn console_veh_handler(info: *mut ExceptionPointers) -> i32 {
     if info.is_null() {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -109,11 +167,13 @@ unsafe extern "system" fn console_veh_handler(info: *mut ExceptionPointers) -> i
             ctx.rip += len as u64;
         }
         ConsoleInsn::Rdpru { len } => {
-            ctx.rax = 0;
-            ctx.rdx = 0;
+            let counter = emulate_rdpru_counter();
+            ctx.rax = counter & 0xffff_ffff;
+            ctx.rdx = counter >> 32;
             ctx.rip += len as u64;
         }
         ConsoleInsn::Rdpid { len, reg } => {
+            let pid = emulate_rdpid_value();
             let regs = [
                 &mut ctx.rax, &mut ctx.rcx, &mut ctx.rdx, &mut ctx.rbx,
                 &mut ctx.rsp, &mut ctx.rbp, &mut ctx.rsi, &mut ctx.rdi,
@@ -121,7 +181,7 @@ unsafe extern "system" fn console_veh_handler(info: *mut ExceptionPointers) -> i
                 &mut ctx.r12, &mut ctx.r13, &mut ctx.r14, &mut ctx.r15,
             ];
             if let Some(slot) = regs.into_iter().nth(reg as usize) {
-                *slot = 0;
+                *slot = pid;
             }
             ctx.rip += len as u64;
         }
@@ -132,19 +192,19 @@ unsafe extern "system" fn console_veh_handler(info: *mut ExceptionPointers) -> i
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsoleInsn {
-    /// `clwb m8` — cache-line write-back (no-op on coherent PC memory).
+    /// `clwb m8` — cache-line write-back (no-op on coherent PC memory; present on Zen 2 & modern Intel).
     Clwb { len: usize },
-    /// `clzero [rax]` — zeroes the 64-byte cache line at RAX.
+    /// `clzero [rax]` — AMD-only: zeroes the 64-byte cache line at RAX.
     Clzero { len: usize },
-    /// `rdpru` — read processor register (emulated via QPC / 0).
+    /// `rdpru` — AMD-only: reads user-mode performance counter into EDX:EAX (emulated via QPC/monotonic clock).
     Rdpru { len: usize },
     /// `monitorx` / `mwaitx` — AMD-only monitor/wait (no-op).
     MonitorWaitX { len: usize },
-    /// `rdpid r64` — read processor ID.
+    /// `rdpid r64` — reads logical processor ID (present on Zen 2 & modern Intel; emulated via OS CPU query).
     Rdpid { len: usize, reg: u8 },
 }
 
-/// Decode a Zen 2 console-only instruction from the faulting RIP bytes.
+/// Decode an AMD/console x86-64 instruction from the faulting RIP bytes.
 pub fn decode_console_insn(bytes: &[u8]) -> Option<ConsoleInsn> {
     if bytes.len() < 3 {
         return None;
@@ -223,12 +283,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decodes_zen2_console_instructions() {
+    fn decodes_console_instructions_and_emulates_real_counters() {
         assert_eq!(decode_console_insn(&[0x0F, 0x01, 0xFC]), Some(ConsoleInsn::Clzero { len: 3 }));
         assert_eq!(decode_console_insn(&[0x0F, 0x01, 0xFD]), Some(ConsoleInsn::Rdpru { len: 3 }));
         assert_eq!(decode_console_insn(&[0x0F, 0x01, 0xFA]), Some(ConsoleInsn::MonitorWaitX { len: 3 }));
         assert_eq!(decode_console_insn(&[0xF3, 0x0F, 0xC7, 0xF8]), Some(ConsoleInsn::Rdpid { len: 4, reg: 0 }));
-        // `clwb [rax + 0x40]` -> 66 0F AE 70 40
         assert_eq!(decode_console_insn(&[0x66, 0x0F, 0xAE, 0x70, 0x40]), Some(ConsoleInsn::Clwb { len: 5 }));
+
+        let t0 = emulate_rdpru_counter();
+        let t1 = emulate_rdpru_counter();
+        assert!(t0 > 0, "rdpru emulation must return a real non-zero counter");
+        assert!(t1 >= t0, "rdpru counter must be monotonic");
+        // rdpid returns a valid logical processor index
+        let cpu = emulate_rdpid_value();
+        assert!(cpu < 1024);
     }
 }

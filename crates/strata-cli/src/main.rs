@@ -35,13 +35,21 @@ fn main() {
         }
         "map-test" => {
             let path = std::env::args().nth(2).unwrap_or_else(|| {
-                eprintln!("Usage: strata-cli map-test <path-to-exe-or-dll>");
+                eprintln!("Usage: strata-cli map-test <path-to-exe-or-dll> [--execute]");
                 std::process::exit(1);
             });
-            cmd_map_test(&path);
+            let execute = std::env::args().any(|a| a == "--execute");
+            cmd_map_test(&path, execute);
+        }
+        "run" => {
+            let path = std::env::args().nth(2).unwrap_or_else(|| {
+                eprintln!("Usage: strata-cli run <path-to-exe>");
+                std::process::exit(1);
+            });
+            cmd_run(&path);
         }
         other => {
-            eprintln!("Unknown command '{other}'. Usage: strata-cli [probe|selftest|gpu-test|uma-test|inspect|bind-check|map-test]");
+            eprintln!("Unknown command '{other}'. Usage: strata-cli [probe|selftest|gpu-test|uma-test|inspect|bind-check|map-test|run]");
             std::process::exit(1);
         }
     }
@@ -250,12 +258,16 @@ fn cmd_gpu_test() {
     // 7. SLANG `bvh_oracle.slang` vs CPU `bvh::intersect_box32` DIFFERENTIAL GPU PARITY TEST:
     test_gpu_bvh_oracle_parity(&runner);
 
-    // 8. DIRECT SPIR-V STRUCTURED CFG (`OpSelectionMerge` + `OpBranchConditional` + `OpPhi`) GPU TEST:
-    let cfg_spv = strata_shader::spirv::emit_structured_select_kernel([64, 1, 1]);
+    // 8. RDNA2-TRANSLATED STRUCTURED CFG (`v_cmp_lt_u32` + `s_and_saveexec_b64` + `s_cbranch_execz` -> `OpSelectionMerge`/`OpPhi`) GPU TEST:
+    let cfg_compiled = build_divergent_cfg_rdna2_kernel();
     let cfg_out = runner.alloc_bda_buffer(64 * 4).unwrap();
+    let mut cfg_push = [0u32; 32];
+    cfg_push[0] = cfg_out.bda as u32;
+    cfg_push[1] = (cfg_out.bda >> 32) as u32;
+    let cfg_push_bytes: Vec<u8> = cfg_push.iter().flat_map(|w| w.to_le_bytes()).collect();
     runner
-        .dispatch_spirv(&cfg_spv, &cfg_out.bda.to_le_bytes(), [1, 1, 1])
-        .expect("structured CFG SPIR-V dispatch failed");
+        .dispatch_spirv(&cfg_compiled.spirv, &cfg_push_bytes, [1, 1, 1])
+        .expect("RDNA2-translated structured CFG SPIR-V dispatch failed");
     unsafe {
         let vals = cfg_out.as_slice::<u32>(64);
         for (i, &v) in vals.iter().enumerate() {
@@ -263,15 +275,23 @@ fn cmd_gpu_test() {
             assert_eq!(v, expected, "CFG lane {i} mismatch: got {v}, expected {expected}");
         }
     }
-    println!("[PASS] Direct SPIR-V Structured CFG (OpSelectionMerge + OpPhi + BDA): 64/64 divergent lanes exact on GPU");
+    println!("[PASS] RDNA2->SPIR-V Structured CFG (s_and_saveexec_b64 + s_cbranch_execz -> OpSelectionMerge + OpPhi): 64/64 divergent lanes exact on GPU");
     runner.free_bda_buffer(cfg_out);
 
-    // 9. LIVE WAVE64 BALLOT EXCHANGE (works across Intel SIMD8/16, NVIDIA Wave32, AMD Wave32/64):
-    let w64_spv = strata_shader::spirv::emit_wave64_on_wave32_ballot_kernel();
+    // 9. RDNA2-TRANSLATED WAVE64 BALLOT (`v_cmp_eq_u32` + `v_mov_b32 vcc_lo/hi` -> Wave64 ballot exchange):
+    let w64_compiled = build_wave64_ballot_rdna2_kernel();
+    assert!(
+        !w64_compiled.wave.whole_live_pcs.is_empty(),
+        "wave.rs must classify VCC ballot as whole-live"
+    );
     let w64_out = runner.alloc_bda_buffer(16).unwrap();
+    let mut w64_push = [0u32; 32];
+    w64_push[0] = w64_out.bda as u32;
+    w64_push[1] = (w64_out.bda >> 32) as u32;
+    let w64_push_bytes: Vec<u8> = w64_push.iter().flat_map(|w| w.to_le_bytes()).collect();
     runner
-        .dispatch_spirv(&w64_spv, &w64_out.bda.to_le_bytes(), [1, 1, 1])
-        .expect("Wave64 ballot SPIR-V dispatch failed");
+        .dispatch_spirv(&w64_compiled.spirv, &w64_push_bytes, [1, 1, 1])
+        .expect("RDNA2-translated Wave64 ballot SPIR-V dispatch failed");
     let mask = unsafe { w64_out.as_slice::<u64>(1)[0] };
     assert_eq!(mask, 0x5555_5555_5555_5555, "unexpected Wave64 mask: 0x{mask:016x}");
     let tested_sizes: Vec<u32> = if runner.subgroup_size_control {
@@ -286,8 +306,8 @@ fn cmd_gpu_test() {
         for &req_sg in &tested_sizes {
             runner
                 .dispatch_spirv_with_subgroup_size(
-                    &w64_spv,
-                    &w64_out.bda.to_le_bytes(),
+                    &w64_compiled.spirv,
+                    &w64_push_bytes,
                     [1, 1, 1],
                     Some(req_sg),
                 )
@@ -299,14 +319,14 @@ fn cmd_gpu_test() {
             );
         }
         println!(
-            "[PASS] Wave64 Ballot (verified subgroup sizes {:?} -> 64-bit console EXEC/ballot): 0x{mask:016x}",
+            "[PASS] RDNA2->SPIR-V Wave64 Ballot (verified subgroup sizes {:?} -> 64-bit console VCC): 0x{mask:016x}",
             tested_sizes
         );
     } else if runner.native_wave64 {
-        println!("[PASS] Wave64 Ballot (native Wave64 -> 64-bit console EXEC/ballot): 0x{mask:016x}");
+        println!("[PASS] RDNA2->SPIR-V Wave64 Ballot (native Wave64 -> 64-bit console VCC): 0x{mask:016x}");
     } else {
         println!(
-            "[PASS] Wave64 Ballot (Wave{} + Workgroup atomic merge -> 64-bit console EXEC/ballot): 0x{mask:016x}",
+            "[PASS] RDNA2->SPIR-V Wave64 Ballot (Wave{} + Workgroup atomic merge -> 64-bit console VCC): 0x{mask:016x}",
             runner.subgroup_size
         );
     }
@@ -664,7 +684,7 @@ fn cmd_bind_check(path: &str) {
     }
 }
 
-fn cmd_map_test(path: &str) {
+fn cmd_run(path: &str) {
     let bytes = std::fs::read(path).unwrap_or_else(|e| {
         eprintln!("Failed to read '{path}': {e}");
         std::process::exit(1);
@@ -673,9 +693,49 @@ fn cmd_map_test(path: &str) {
         eprintln!("PE32+ map failed for '{path}': {e}");
         std::process::exit(1);
     });
-    println!("=== Strata In-Memory PE32+ Map + Live COM->Vulkan Test ===");
     println!(
-        "[PASS] Mapped {} ({} MiB) at {:p}, Entry=0x{:x}, Relocs={}, IAT(HLE={}, Host={}, Local={}, Missing={})",
+        "[INFO] Mapped {} ({} KiB) at {:p}, Entry=0x{:x}, Relocs={}, IAT(HLE={}, Host={}, Local={}, Stubbed={})",
+        path,
+        mapped.size / 1024,
+        mapped.base,
+        mapped.entry_point,
+        mapped.relocations_applied,
+        mapped.bind_report.resolved_hle,
+        mapped.bind_report.resolved_host,
+        mapped.bind_report.deferred_title_local,
+        mapped.bind_report.unresolved.len()
+    );
+    if !mapped.bind_report.unresolved.is_empty() {
+        println!("[WARN] {} unresolved imports patched to logged E_NOTIMPL stubs", mapped.bind_report.unresolved.len());
+    }
+    println!("[INFO] Invoking mapped PE32+ entry point 0x{:x} on guest thread...", mapped.entry_point);
+    match unsafe { mapped.execute_entry_point() } {
+        Ok(exit_code) => {
+            println!(
+                "[PASS] Guest entry point exited cleanly with code {exit_code} (unimplemented_stubs={}, audio_stubs={})",
+                strata_hle::thunks::unimplemented_stub_call_count(),
+                strata_hle::thunks::audio_stub_call_count(),
+            );
+        }
+        Err(e) => {
+            eprintln!("[FAIL] Guest execution failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_map_test(path: &str, execute: bool) {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("Failed to read '{path}': {e}");
+        std::process::exit(1);
+    });
+    let mapped = MappedImage::load_from_bytes(&bytes).unwrap_or_else(|e| {
+        eprintln!("PE32+ map failed for '{path}': {e}");
+        std::process::exit(1);
+    });
+    println!("=== Strata In-Memory PE32+ Map Diagnostic ===");
+    println!(
+        "[PASS] Mapped {} ({} MiB) at {:p}, Entry=0x{:x}, Relocs={}, IAT(HLE={}, Host={}, Local={}, Stubbed={})",
         path,
         mapped.size / (1024 * 1024),
         mapped.base,
@@ -693,7 +753,18 @@ fn cmd_map_test(path: &str) {
         );
     }
 
-    // End-to-end live COM vtable -> ThinCommandList -> Vulkan 1.3 BDA -> Zero-Copy UMA execution!
+    if execute {
+        println!("[INFO] Executing mapped entry point 0x{:x} (--execute)...", mapped.entry_point);
+        let code = unsafe { mapped.execute_entry_point() }.unwrap_or_else(|e| {
+            eprintln!("[FAIL] Guest entry execution failed: {e}");
+            std::process::exit(1);
+        });
+        println!("[PASS] Guest entry point returned {code}");
+    } else {
+        println!("[INFO] Entry point was NOT executed (pass `--execute` or use `strata-cli run <path.exe>` to run guest code).");
+    }
+
+    // Separate synthetic COM vtable -> ThinCommandList -> Vulkan 1.3 BDA sanity check (independent of mapped PE)
     let runner = std::sync::Arc::new(ComputeRunner::new().expect("Vulkan 1.3 runner failed"));
     let compiled = build_sample_rdna2_kernel();
     let mut uma = UmaManager::new();
@@ -728,12 +799,41 @@ fn cmd_map_test(path: &str) {
             let expected = ((i + 1) as f32).mul_add(2.0, 3.0) + 1.0;
             assert!((slot[0] - expected).abs() < 1e-5);
         }
-        println!("[PASS] Live D3D12.X COM VTable -> ThinCommandList -> Vulkan BDA -> Zero-Copy CPU RAM (64/64 lanes)");
+        println!("[PASS] Synthetic D3D12.X COM VTable -> ThinCommandList -> Vulkan BDA sanity check (64/64 lanes)");
 
         (lvt.release)(list as *mut _);
         ((*queue).header.vtable.release)(queue as *mut _);
     }
     uma.destroy_all(&runner);
+}
+
+fn build_divergent_cfg_rdna2_kernel() -> strata_shader::CompiledShader {
+    let mut prog = Vec::new();
+    prog.push(encode::v_cmp_lt_u32_imm(0, 32));
+    prog.push(encode::s_and_saveexec_b64(4, 106));
+    prog.push(encode::s_cbranch_execz(1));
+    prog.push(encode::v_add_nc_u32_imm(1, 10, 0));
+    prog.push(encode::s_xor_b64(126, 126, 4));
+    prog.push(encode::s_cbranch_execz(1));
+    prog.push(encode::v_add_nc_u32_imm(1, 20, 0));
+    prog.push(encode::s_or_b64(126, 126, 4));
+    prog.push(encode::v_lshlrev_b32_imm(2, 2, 0));
+    prog.extend_from_slice(&encode::global_store_dword(2, 1, 0, 0));
+    prog.push(encode::s_endpgm());
+    compile_rdna2_to_spirv(&prog, [64, 1, 1]).expect("RDNA2 divergent CFG -> SPIR-V failed")
+}
+
+fn build_wave64_ballot_rdna2_kernel() -> strata_shader::CompiledShader {
+    let mut prog = Vec::new();
+    prog.push(encode::v_and_b32_imm(1, 1, 0));
+    prog.push(encode::v_cmp_eq_u32_imm(1, 0));
+    prog.push(encode::v_mov_b32_sgpr(2, 106)); // vcc_lo
+    prog.push(encode::v_mov_b32_sgpr(3, 107)); // vcc_hi
+    prog.push(encode::v_mov_b32_sgpr(4, 128)); // 0
+    prog.extend_from_slice(&encode::global_store_dword(4, 2, 0, 0));
+    prog.extend_from_slice(&encode::global_store_dword(4, 3, 0, 4));
+    prog.push(encode::s_endpgm());
+    compile_rdna2_to_spirv(&prog, [64, 1, 1]).expect("RDNA2 Wave64 ballot -> SPIR-V failed")
 }
 
 fn build_sample_rdna2_kernel() -> strata_shader::CompiledShader {

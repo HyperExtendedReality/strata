@@ -6,8 +6,9 @@ use thiserror::Error;
 
 use crate::pe::{Pe64Info, PeError, parse_pe64};
 use crate::runtime::{DllClass, classify_dll};
-use crate::thunks::resolve_hle;
+use crate::thunks::{logged_unimplemented_stub, resolve_hle};
 use crate::tls::TlsSetup;
+use crate::veh::VehGuard;
 
 #[cfg(windows)]
 unsafe extern "system" {
@@ -41,6 +42,8 @@ pub enum MapError {
     Pe(#[from] PeError),
     #[error("VirtualAlloc failed for {size} bytes")]
     AllocFailed { size: u32 },
+    #[error("entry point execution failed: {0}")]
+    ExecFailed(String),
 }
 
 #[derive(Debug, Default)]
@@ -169,6 +172,33 @@ impl MappedImage {
             })
         }
     }
+
+    /// Execute the mapped PE32+ image's entry point on a dedicated thread
+    /// with Strata's console instruction exception handler (`VehGuard`) installed.
+    ///
+    /// # Safety
+    /// The mapped image must contain valid x86-64 machine code at `entry_point`
+    /// using the Windows x64 ABI (`extern "system" fn() -> i32`).
+    pub unsafe fn execute_entry_point(&self) -> Result<i32, MapError> {
+        if self.entry_point == 0 || self.base.is_null() {
+            return Err(MapError::ExecFailed("image has no valid entry point".into()));
+        }
+        let ep = self.entry_point;
+        let handle = std::thread::Builder::new()
+            .name("strata-guest-main".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let _veh = VehGuard::install();
+                let entry_fn: unsafe extern "system" fn() -> i32 =
+                    unsafe { std::mem::transmute(ep) };
+                unsafe { entry_fn() }
+            })
+            .map_err(|e| MapError::ExecFailed(e.to_string()))?;
+
+        handle
+            .join()
+            .map_err(|_| MapError::ExecFailed("guest entry thread panicked".into()))
+    }
 }
 
 impl Drop for MappedImage {
@@ -193,6 +223,12 @@ unsafe fn patch_iat(pe: &Pe64Info, base: *mut u8, size: usize) -> BindReport {
                         write_iat_slot(base, size, iat_base + idx * 8, addr as u64);
                         report.resolved_hle += 1;
                     } else {
+                        write_iat_slot(
+                            base,
+                            size,
+                            iat_base + idx * 8,
+                            logged_unimplemented_stub as *const () as usize as u64,
+                        );
                         report.unresolved.push(format!("{}!{}", dll.dll_name, func));
                     }
                 }
@@ -228,7 +264,13 @@ unsafe fn patch_iat(pe: &Pe64Info, base: *mut u8, size: usize) -> BindReport {
                 report.deferred_title_local += dll.functions.len();
             }
             DllClass::NeedsStub => {
-                for func in &dll.functions {
+                for (idx, func) in dll.functions.iter().enumerate() {
+                    write_iat_slot(
+                        base,
+                        size,
+                        iat_base + idx * 8,
+                        logged_unimplemented_stub as *const () as usize as u64,
+                    );
                     report.unresolved.push(format!("{}!{}", dll.dll_name, func));
                 }
             }
@@ -299,4 +341,51 @@ pub fn check_import_binding(pe: &Pe64Info) -> BindReport {
     }
 
     report
+}
+
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    /// Build a minimal valid PE32+ x86-64 image whose entry point executes `mov eax, 42; ret`.
+    fn build_minimal_pe64_returning_42() -> Vec<u8> {
+        let mut img = vec![0u8; 0x2000];
+        img[0] = b'M';
+        img[1] = b'Z';
+        img[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+
+        let pe = 0x80usize;
+        img[pe..pe + 4].copy_from_slice(b"PE\0\0");
+        img[pe + 4..pe + 6].copy_from_slice(&0x8664u16.to_le_bytes());
+        img[pe + 6..pe + 8].copy_from_slice(&1u16.to_le_bytes());
+        img[pe + 20..pe + 22].copy_from_slice(&240u16.to_le_bytes());
+
+        let opt = pe + 24;
+        img[opt..opt + 2].copy_from_slice(&0x020bu16.to_le_bytes());
+        img[opt + 16..opt + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+        img[opt + 24..opt + 32].copy_from_slice(&0x14000_0000u64.to_le_bytes());
+        img[opt + 56..opt + 60].copy_from_slice(&0x2000u32.to_le_bytes());
+        img[opt + 60..opt + 64].copy_from_slice(&0x200u32.to_le_bytes());
+        img[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+
+        let sec = opt + 240;
+        img[sec..sec + 5].copy_from_slice(b".text");
+        img[sec + 8..sec + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+        img[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        img[sec + 16..sec + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+        img[sec + 20..sec + 24].copy_from_slice(&0x1000u32.to_le_bytes());
+        img[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+
+        // `mov eax, 42; ret`
+        img[0x1000..0x1006].copy_from_slice(&[0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3]);
+        img
+    }
+
+    #[test]
+    fn maps_and_executes_real_pe64_entry_point() {
+        let pe_bytes = build_minimal_pe64_returning_42();
+        let mapped = MappedImage::load_from_bytes(&pe_bytes).expect("failed to map test PE");
+        let code = unsafe { mapped.execute_entry_point() }.expect("entry execution failed");
+        assert_eq!(code, 42);
+    }
 }

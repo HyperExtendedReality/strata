@@ -9,11 +9,179 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use strata_gpu::present::FramePacingClock;
 use strata_gpu::runner::ComputeRunner;
-use strata_gpu::thin_list::{PipelineKey, ThinCommand, ThinCommandList};
+use strata_gpu::thin_list::{PipelineKey, RenderTargetDesc, ThinCommand, ThinCommandList};
 use strata_runtime_shaders::CLAMP_INDIRECT_SPV;
 
 const S_OK: i32 = 0;
 const E_NOINTERFACE: i32 = 0x8000_4002u32 as i32;
+
+// ============================================================================
+// ID3D12ResourceX, ID3D12PipelineStateX, ID3D12FenceX COM Objects
+// ============================================================================
+
+#[repr(C)]
+pub struct ResourceVTable {
+    pub query_interface: unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> i32,
+    pub add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub release: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub map: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> i32,
+    pub unmap: unsafe extern "system" fn(*mut c_void, u32, *const c_void),
+    pub get_gpu_virtual_address: unsafe extern "system" fn(*mut c_void) -> u64,
+}
+
+#[repr(C)]
+pub struct D3D12ResourceX {
+    pub header: ComHeader<ResourceVTable>,
+    pub gpu_va: u64,
+    pub backing: Mutex<Vec<u8>>,
+}
+
+static RESOURCE_VTABLE: ResourceVTable = ResourceVTable {
+    query_interface: res_qi,
+    add_ref: res_add_ref,
+    release: res_release,
+    map: res_map,
+    unmap: res_unmap,
+    get_gpu_virtual_address: res_get_gpu_va,
+};
+
+impl D3D12ResourceX {
+    pub fn new_boxed(size_bytes: usize, gpu_va: u64) -> *mut Self {
+        let backing = vec![0u8; size_bytes.max(256)];
+        let va = if gpu_va != 0 { gpu_va } else { backing.as_ptr() as u64 };
+        Box::into_raw(Box::new(Self {
+            header: ComHeader {
+                vtable: &RESOURCE_VTABLE,
+                ref_count: AtomicU32::new(1),
+            },
+            gpu_va: va,
+            backing: Mutex::new(backing),
+        }))
+    }
+}
+
+unsafe extern "system" fn res_qi(this: *mut c_void, _riid: *const c_void, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return E_NOINTERFACE;
+    }
+    unsafe {
+        res_add_ref(this);
+        *out = this;
+    }
+    S_OK
+}
+
+unsafe extern "system" fn res_add_ref(this: *mut c_void) -> u32 {
+    let obj = unsafe { &*(this as *const D3D12ResourceX) };
+    obj.header.ref_count.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
+    let obj = unsafe { &*(this as *const D3D12ResourceX) };
+    let prev = obj.header.ref_count.fetch_sub(1, Ordering::Release);
+    if prev == 1 {
+        std::sync::atomic::fence(Ordering::Acquire);
+        unsafe { drop(Box::from_raw(this as *mut D3D12ResourceX)) };
+        0
+    } else {
+        prev - 1
+    }
+}
+
+unsafe extern "system" fn res_map(
+    this: *mut c_void,
+    _subresource: u32,
+    _read_range: *const c_void,
+    out_data: *mut *mut c_void,
+) -> i32 {
+    let obj = unsafe { &*(this as *const D3D12ResourceX) };
+    if !out_data.is_null() {
+        let mut guard = obj.backing.lock().unwrap();
+        unsafe { *out_data = guard.as_mut_ptr() as *mut c_void };
+    }
+    S_OK
+}
+
+unsafe extern "system" fn res_unmap(_this: *mut c_void, _subresource: u32, _written_range: *const c_void) {}
+
+unsafe extern "system" fn res_get_gpu_va(this: *mut c_void) -> u64 {
+    let obj = unsafe { &*(this as *const D3D12ResourceX) };
+    obj.gpu_va
+}
+
+#[repr(C)]
+pub struct FenceVTable {
+    pub query_interface: unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> i32,
+    pub add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub release: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub get_completed_value: unsafe extern "system" fn(*mut c_void) -> u64,
+    pub signal: unsafe extern "system" fn(*mut c_void, u64) -> i32,
+}
+
+#[repr(C)]
+pub struct D3D12FenceX {
+    pub header: ComHeader<FenceVTable>,
+    pub value: std::sync::atomic::AtomicU64,
+}
+
+static FENCE_VTABLE: FenceVTable = FenceVTable {
+    query_interface: fence_qi,
+    add_ref: fence_add_ref,
+    release: fence_release,
+    get_completed_value: fence_get_completed,
+    signal: fence_signal,
+};
+
+impl D3D12FenceX {
+    pub fn new_boxed(initial_value: u64) -> *mut Self {
+        Box::into_raw(Box::new(Self {
+            header: ComHeader {
+                vtable: &FENCE_VTABLE,
+                ref_count: AtomicU32::new(1),
+            },
+            value: std::sync::atomic::AtomicU64::new(initial_value),
+        }))
+    }
+}
+
+unsafe extern "system" fn fence_qi(this: *mut c_void, _riid: *const c_void, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        return E_NOINTERFACE;
+    }
+    unsafe {
+        fence_add_ref(this);
+        *out = this;
+    }
+    S_OK
+}
+
+unsafe extern "system" fn fence_add_ref(this: *mut c_void) -> u32 {
+    let obj = unsafe { &*(this as *const D3D12FenceX) };
+    obj.header.ref_count.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn fence_release(this: *mut c_void) -> u32 {
+    let obj = unsafe { &*(this as *const D3D12FenceX) };
+    let prev = obj.header.ref_count.fetch_sub(1, Ordering::Release);
+    if prev == 1 {
+        std::sync::atomic::fence(Ordering::Acquire);
+        unsafe { drop(Box::from_raw(this as *mut D3D12FenceX)) };
+        0
+    } else {
+        prev - 1
+    }
+}
+
+unsafe extern "system" fn fence_get_completed(this: *mut c_void) -> u64 {
+    let obj = unsafe { &*(this as *const D3D12FenceX) };
+    obj.value.load(Ordering::Acquire)
+}
+
+unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> i32 {
+    let obj = unsafe { &*(this as *const D3D12FenceX) };
+    obj.value.store(value, Ordering::Release);
+    S_OK
+}
 
 /// Shared `IUnknown` header layout for all Strata COM objects.
 #[repr(C)]
@@ -32,10 +200,16 @@ pub struct CommandListVTable {
     pub add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
     pub release: unsafe extern "system" fn(*mut c_void) -> u32,
     pub close: unsafe extern "system" fn(*mut c_void) -> i32,
+    pub reset: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32,
     pub set_pipeline_state: unsafe extern "system" fn(*mut c_void, u64),
     pub set_compute_root_32bit_constants: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32),
     pub dispatch: unsafe extern "system" fn(*mut c_void, u32, u32, u32),
+    pub draw_instanced: unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32),
+    pub draw_indexed_instanced: unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32),
     pub draw_indirect: unsafe extern "system" fn(*mut c_void, u64, u32, u32),
+    pub om_set_render_targets: unsafe extern "system" fn(*mut c_void, u32, *const RenderTargetDesc),
+    pub resource_barrier: unsafe extern "system" fn(*mut c_void, u64, u32, u32),
+    pub copy_buffer_region: unsafe extern "system" fn(*mut c_void, u64, u64, u64, u64, u64),
 }
 
 #[repr(C)]
@@ -50,10 +224,16 @@ static CMD_LIST_VTABLE: CommandListVTable = CommandListVTable {
     add_ref: list_add_ref,
     release: list_release,
     close: list_close,
+    reset: list_reset,
     set_pipeline_state: list_set_pipeline_state,
     set_compute_root_32bit_constants: list_set_compute_root_32bit_constants,
     dispatch: list_dispatch,
+    draw_instanced: list_draw_instanced,
+    draw_indexed_instanced: list_draw_indexed_instanced,
     draw_indirect: list_draw_indirect,
+    om_set_render_targets: list_om_set_render_targets,
+    resource_barrier: list_resource_barrier,
+    copy_buffer_region: list_copy_buffer_region,
 };
 
 impl D3D12CommandListX {
@@ -103,6 +283,13 @@ unsafe extern "system" fn list_close(this: *mut c_void) -> i32 {
     S_OK
 }
 
+unsafe extern "system" fn list_reset(this: *mut c_void, _alloc: *mut c_void, _pso: *mut c_void) -> i32 {
+    let obj = unsafe { &*(this as *const D3D12CommandListX) };
+    obj.list.lock().unwrap().reset();
+    obj.closed.store(0, Ordering::Release);
+    S_OK
+}
+
 unsafe extern "system" fn list_set_pipeline_state(this: *mut c_void, pso_key: u64) {
     let obj = unsafe { &*(this as *const D3D12CommandListX) };
     obj.list.lock().unwrap().bind_pipeline(PipelineKey(pso_key));
@@ -131,9 +318,82 @@ unsafe extern "system" fn list_dispatch(this: *mut c_void, x: u32, y: u32, z: u3
     obj.list.lock().unwrap().dispatch(x, y, z, [64, 1, 1], false);
 }
 
+unsafe extern "system" fn list_draw_instanced(
+    this: *mut c_void,
+    vertex_count: u32,
+    instance_count: u32,
+    start_vertex: u32,
+    start_instance: u32,
+) {
+    let obj = unsafe { &*(this as *const D3D12CommandListX) };
+    obj.list
+        .lock()
+        .unwrap()
+        .draw_instanced(vertex_count, instance_count, start_vertex, start_instance);
+}
+
+unsafe extern "system" fn list_draw_indexed_instanced(
+    this: *mut c_void,
+    index_count: u32,
+    instance_count: u32,
+    start_index: u32,
+    base_vertex: i32,
+    start_instance: u32,
+) {
+    let obj = unsafe { &*(this as *const D3D12CommandListX) };
+    obj.list.lock().unwrap().draw_indexed_instanced(
+        index_count,
+        instance_count,
+        start_index,
+        base_vertex,
+        start_instance,
+    );
+}
+
 unsafe extern "system" fn list_draw_indirect(this: *mut c_void, args_bda: u64, max_verts: u32, max_inst: u32) {
     let obj = unsafe { &*(this as *const D3D12CommandListX) };
     obj.list.lock().unwrap().draw_indirect(args_bda, max_verts, max_inst);
+}
+
+unsafe extern "system" fn list_om_set_render_targets(
+    this: *mut c_void,
+    num_rts: u32,
+    rts: *const RenderTargetDesc,
+) {
+    if rts.is_null() || num_rts == 0 {
+        return;
+    }
+    let obj = unsafe { &*(this as *const D3D12CommandListX) };
+    let slice = unsafe { std::slice::from_raw_parts(rts, num_rts as usize) };
+    obj.list.lock().unwrap().set_render_targets(slice);
+}
+
+unsafe extern "system" fn list_resource_barrier(
+    this: *mut c_void,
+    resource_va: u64,
+    state_before: u32,
+    state_after: u32,
+) {
+    let obj = unsafe { &*(this as *const D3D12CommandListX) };
+    obj.list
+        .lock()
+        .unwrap()
+        .resource_barrier(resource_va, state_before, state_after);
+}
+
+unsafe extern "system" fn list_copy_buffer_region(
+    this: *mut c_void,
+    dst_va: u64,
+    dst_offset: u64,
+    src_va: u64,
+    src_offset: u64,
+    num_bytes: u64,
+) {
+    let obj = unsafe { &*(this as *const D3D12CommandListX) };
+    obj.list
+        .lock()
+        .unwrap()
+        .copy_buffer_region(dst_va, dst_offset, src_va, src_offset, num_bytes);
 }
 
 // ============================================================================
@@ -329,6 +589,8 @@ pub struct DeviceVTable {
     pub release: unsafe extern "system" fn(*mut c_void) -> u32,
     pub create_command_queue: unsafe extern "system" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> i32,
     pub create_command_list: unsafe extern "system" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> i32,
+    pub create_committed_resource: unsafe extern "system" fn(*mut c_void, u64, *const c_void, *mut *mut c_void) -> i32,
+    pub create_fence: unsafe extern "system" fn(*mut c_void, u64, u32, *const c_void, *mut *mut c_void) -> i32,
 }
 
 #[repr(C)]
@@ -342,6 +604,8 @@ static DEVICE_VTABLE: DeviceVTable = DeviceVTable {
     release: dev_release,
     create_command_queue: dev_create_command_queue,
     create_command_list: dev_create_command_list,
+    create_committed_resource: dev_create_committed_resource,
+    create_fence: dev_create_fence,
 };
 
 impl D3D12DeviceX {
@@ -409,6 +673,33 @@ unsafe extern "system" fn dev_create_command_list(
         return E_NOINTERFACE;
     }
     unsafe { *out_list = D3D12CommandListX::new_boxed() as *mut c_void };
+    S_OK
+}
+
+unsafe extern "system" fn dev_create_committed_resource(
+    _this: *mut c_void,
+    size_bytes: u64,
+    _riid: *const c_void,
+    out_res: *mut *mut c_void,
+) -> i32 {
+    if out_res.is_null() {
+        return E_NOINTERFACE;
+    }
+    unsafe { *out_res = D3D12ResourceX::new_boxed(size_bytes as usize, 0) as *mut c_void };
+    S_OK
+}
+
+unsafe extern "system" fn dev_create_fence(
+    _this: *mut c_void,
+    initial_value: u64,
+    _flags: u32,
+    _riid: *const c_void,
+    out_fence: *mut *mut c_void,
+) -> i32 {
+    if out_fence.is_null() {
+        return E_NOINTERFACE;
+    }
+    unsafe { *out_fence = D3D12FenceX::new_boxed(initial_value) as *mut c_void };
     S_OK
 }
 

@@ -74,12 +74,7 @@ impl UmaManager {
     ) -> Result<&UmaAllocation, GpuError> {
         let aligned_size = size.max(4096).next_multiple_of(runner.min_host_pointer_alignment.max(4096));
         unsafe {
-            let raw = VirtualAlloc(
-                std::ptr::null_mut(),
-                aligned_size as usize,
-                MEM_COMMIT_RESERVE,
-                PAGE_READWRITE,
-            ) as *mut u8;
+            let raw = os_alloc_host_pages(aligned_size as usize);
             if raw.is_null() {
                 return Err(GpuError::NoDevice);
             }
@@ -155,16 +150,77 @@ impl UmaManager {
         self.address_space.translate(console_va)
     }
 
-    /// Free all tracked Vulkan buffers and `VirtualAlloc` blocks cleanly.
+    /// Free a single tracked allocation by console VA or host CPU pointer (`XMemFree`).
+    pub fn free_allocation(&mut self, runner: &ComputeRunner, addr: u64) -> bool {
+        let key = if self.allocations.contains_key(&addr) {
+            Some(addr)
+        } else {
+            self.allocations
+                .iter()
+                .find(|(_, a)| a.raw_host_ptr.map(|p| p as u64) == Some(addr))
+                .map(|(&k, _)| k)
+        };
+        if let Some(k) = key {
+            if let Some(alloc) = self.allocations.remove(&k) {
+                runner.free_bda_buffer(alloc.buffer);
+                if let Some(raw) = alloc.raw_host_ptr {
+                    os_free_host_pages(raw, alloc.size as usize);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Free all tracked Vulkan buffers and host virtual memory blocks cleanly.
     pub fn destroy_all(&mut self, runner: &ComputeRunner) {
         for (_, alloc) in self.allocations.drain() {
             runner.free_bda_buffer(alloc.buffer);
             if let Some(raw) = alloc.raw_host_ptr {
-                unsafe {
-                    VirtualFree(raw as *mut core::ffi::c_void, 0, MEM_RELEASE);
-                }
+                os_free_host_pages(raw, alloc.size as usize);
             }
         }
+    }
+}
+
+fn os_alloc_host_pages(size: usize) -> *mut u8 {
+    #[cfg(windows)]
+    unsafe {
+        VirtualAlloc(std::ptr::null_mut(), size, MEM_COMMIT_RESERVE, PAGE_READWRITE) as *mut u8
+    }
+    #[cfg(unix)]
+    unsafe {
+        unsafe extern "C" {
+            fn mmap(
+                addr: *mut core::ffi::c_void,
+                length: usize,
+                prot: i32,
+                flags: i32,
+                fd: i32,
+                offset: isize,
+            ) -> *mut core::ffi::c_void;
+        }
+        const PROT_READ_WRITE: i32 = 0x1 | 0x2;
+        #[cfg(target_os = "linux")]
+        const MAP_PRIVATE_ANON: i32 = 0x02 | 0x20;
+        #[cfg(not(target_os = "linux"))]
+        const MAP_PRIVATE_ANON: i32 = 0x02 | 0x1000;
+        let p = mmap(std::ptr::null_mut(), size, PROT_READ_WRITE, MAP_PRIVATE_ANON, -1, 0);
+        if p as isize == -1 { std::ptr::null_mut() } else { p as *mut u8 }
+    }
+}
+
+fn os_free_host_pages(ptr: *mut u8, _size: usize) {
+    #[cfg(windows)]
+    unsafe {
+        VirtualFree(ptr as *mut core::ffi::c_void, 0, MEM_RELEASE);
+    }
+    #[cfg(unix)]
+    unsafe {
+        unsafe extern "C" {
+            fn munmap(addr: *mut core::ffi::c_void, length: usize) -> i32;
+        }
+        munmap(ptr as *mut core::ffi::c_void, _size);
     }
 }
 
