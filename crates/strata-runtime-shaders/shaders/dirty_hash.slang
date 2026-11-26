@@ -7,7 +7,8 @@
 [[vk::push_constant]]
 ConstantBuffer<DirtyHashPush> pc;
 
-groupshared uint32_t s_partial[2];
+// Supports any hardware subgroup size >= 4 (Intel SIMD8/16, NVIDIA Wave32, AMD Wave32/64).
+groupshared uint32_t s_partial[16];
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -34,9 +35,10 @@ void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     GroupMemoryBarrierWithGroupSync();
 
     if (tid == 0u) {
-        uint32_t final_h = s_partial[0];
-        if (lane_count < 64u) {
-            final_h ^= s_partial[1];
+        uint32_t wave_count = 64u / lane_count;
+        uint32_t final_h = 0u;
+        for (uint32_t w = 0u; w < wave_count; ++w) {
+            final_h ^= s_partial[w];
         }
         uint32_t *dst = (uint32_t *)pc.dst_hash_addr;
         dst[block_idx] = final_h;

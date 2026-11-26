@@ -45,6 +45,11 @@ pub struct ComputeRunner {
     cmd_pool: vk::CommandPool,
     pipe_layout: vk::PipelineLayout,
     pub device_name: String,
+    pub subgroup_size: u32,
+    pub min_subgroup_size: u32,
+    pub max_subgroup_size: u32,
+    pub native_wave64: bool,
+    pub subgroup_size_control: bool,
 }
 
 impl ComputeRunner {
@@ -99,11 +104,24 @@ impl ComputeRunner {
             });
 
             let mut host_mem_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+            let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::default();
+            let mut subgroup_size_props = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default()
+                .push_next(&mut subgroup_props)
+                .push_next(&mut subgroup_size_props);
             if has_ext_host {
-                let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut host_mem_props);
-                instance.get_physical_device_properties2(pdev, &mut props2);
+                props2 = props2.push_next(&mut host_mem_props);
             }
+            instance.get_physical_device_properties2(pdev, &mut props2);
             let min_host_pointer_alignment = host_mem_props.min_imported_host_pointer_alignment;
+
+            let mut avail_f13 = vk::PhysicalDeviceVulkan13Features::default();
+            let mut avail_feats2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut avail_f13);
+            instance.get_physical_device_features2(pdev, &mut avail_feats2);
+            let subgroup_size_control = avail_f13.subgroup_size_control == vk::TRUE
+                && subgroup_size_props
+                    .required_subgroup_size_stages
+                    .contains(vk::ShaderStageFlags::COMPUTE);
 
             let mut enabled_exts: Vec<*const i8> = Vec::new();
             if has_ext_host {
@@ -115,7 +133,8 @@ impl ComputeRunner {
                 .scalar_block_layout(true);
             let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
                 .synchronization2(true)
-                .dynamic_rendering(true);
+                .dynamic_rendering(true)
+                .subgroup_size_control(subgroup_size_control);
             let core_feats = vk::PhysicalDeviceFeatures::default()
                 .shader_int64(true)
                 .sparse_binding(true)
@@ -145,6 +164,11 @@ impl ComputeRunner {
             let layout_ci = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_range);
             let pipe_layout = device.create_pipeline_layout(&layout_ci, None)?;
 
+            let subgroup_size = subgroup_props.subgroup_size;
+            let min_subgroup_size = subgroup_size_props.min_subgroup_size;
+            let max_subgroup_size = subgroup_size_props.max_subgroup_size;
+            let native_wave64 = max_subgroup_size >= 64;
+
             Ok(Self {
                 _entry: entry,
                 instance,
@@ -156,6 +180,11 @@ impl ComputeRunner {
                 cmd_pool,
                 pipe_layout,
                 device_name,
+                subgroup_size,
+                min_subgroup_size,
+                max_subgroup_size,
+                native_wave64,
+                subgroup_size_control,
             })
         }
     }
@@ -744,14 +773,36 @@ impl ComputeRunner {
         push_bytes: &[u8],
         groups: [u32; 3],
     ) -> Result<(), GpuError> {
+        self.dispatch_spirv_with_subgroup_size(spirv_words, push_bytes, groups, None)
+    }
+
+    /// Dispatch a SPIR-V 1.6 compute shader, optionally requesting a specific hardware
+    /// subgroup size (e.g. 32 or 64) when `subgroupSizeControl` is supported.
+    pub fn dispatch_spirv_with_subgroup_size(
+        &self,
+        spirv_words: &[u32],
+        push_bytes: &[u8],
+        groups: [u32; 3],
+        required_subgroup_size: Option<u32>,
+    ) -> Result<(), GpuError> {
         unsafe {
             let sm_ci = vk::ShaderModuleCreateInfo::default().code(spirv_words);
             let module = self.device.create_shader_module(&sm_ci, None)?;
             let entry_name = CString::new("main").unwrap();
-            let stage = vk::PipelineShaderStageCreateInfo::default()
+            let mut req_sg_info = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default();
+            let mut stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(module)
                 .name(&entry_name);
+            if let Some(req_size) = required_subgroup_size {
+                if self.subgroup_size_control
+                    && req_size >= self.min_subgroup_size
+                    && req_size <= self.max_subgroup_size
+                {
+                    req_sg_info = req_sg_info.required_subgroup_size(req_size);
+                    stage = stage.push_next(&mut req_sg_info);
+                }
+            }
             let pipe_ci = [vk::ComputePipelineCreateInfo::default()
                 .stage(stage)
                 .layout(self.pipe_layout)];

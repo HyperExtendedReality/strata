@@ -5,6 +5,7 @@
 <p align="center">
   <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-7c5cff?style=for-the-badge">
   <img alt="Windows 10 / 11 x64" src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-2f80ed?style=for-the-badge">
+  <img alt="NVIDIA · AMD · Intel Arc" src="https://img.shields.io/badge/GPUs-NVIDIA%20%C2%B7%20AMD%20%C2%B7%20Intel%20Arc-00b894?style=for-the-badge">
   <img alt="Vulkan 1.3+ No-API" src="https://img.shields.io/badge/Vulkan-1.3%2B%20No--API-e0405a?style=for-the-badge">
   <img alt="Slang + SPIR-V 1.6" src="https://img.shields.io/badge/Shaders-Slang%20%2B%20SPIR--V%201.6-1fb9d8?style=for-the-badge">
   <img alt="Rust 2024" src="https://img.shields.io/badge/Rust-Edition%202024-f74c00?style=for-the-badge">
@@ -23,9 +24,9 @@
 
 # Strata — No-API Vulkan & Slang Console Compatibility Layer
 
-**Strata** is an experimental, clean-room, open-source compatibility layer written in **Rust** for running unpacked x86-64 console software natively on Windows PCs—in the spirit of Wine and Proton—without CPU emulation.
+**Strata** is an experimental, clean-room, open-source compatibility layer written in **Rust** for running unpacked x86-64 console software natively on Windows PCs across **NVIDIA, AMD, and Intel Arc** GPUs—in the spirit of Wine and Proton—without CPU emulation.
 
-Instead of rebuilding legacy Direct3D 12 abstractions on top of console hardware primitives, Strata takes a **"No-API" Vulkan 1.3+ (`ash`)** approach paired with a **pure-Rust Direct RDNA2 → SPIR-V 1.6** shader compiler and **build-time Slang** runtime shaders.
+Instead of rebuilding legacy Direct3D 12 abstractions on top of console hardware primitives, Strata takes a vendor-agnostic **"No-API" Vulkan 1.3+ (`ash`)** approach paired with a **pure-Rust Direct RDNA2 → SPIR-V 1.6** shader compiler, **subgroup-size-aware Wave64 support** (SIMD8 / SIMD16 / Wave32 / Wave64), and **build-time Slang** runtime shaders.
 
 ---
 
@@ -65,8 +66,8 @@ Instead of rebuilding legacy Direct3D 12 abstractions on top of console hardware
       Zero runtime HLSL text generation, zero DXC compile stalls, and zero <code>dxil.dll</code> signing. Includes SSA optimization (bitcast cancellation, CSE, DCE, <b>128-bit BDA load coalescing</b>), structured CFG (<code>OpSelectionMerge</code>/<code>OpPhi</code>), and atomic disk caching.
     </td>
     <td width="33%" valign="top">
-      <b>Wave64-on-Wave32 Emulation</b><br><br>
-      Backward whole-live mask liveness keeps lane-local masks in registers while cooperating across 32-lane hardware subgroups via <code>Workgroup</code> memory and <code>OpGroupNonUniformBallot</code> on Wave32 GPUs (e.g., NVIDIA RTX).
+      <b>Multi-Vendor Wave64 Support (NVIDIA · AMD · Intel Arc)</b><br><br>
+      Backward whole-live mask liveness keeps lane-local masks in registers while subgroup-size-aware ballots (<code>OpGroupNonUniformBallot</code>, <code>OpAtomicOr</code>, <code>subgroupSizeControl</code>) handle <b>Intel Arc SIMD8/16</b>, <b>NVIDIA &amp; AMD RDNA Wave32</b>, and <b>AMD native Wave64</b> seamlessly.
     </td>
     <td width="33%" valign="top">
       <b>Build-Time Slang Runtime Shaders</b><br><br>
@@ -136,7 +137,7 @@ All implemented subsystems are covered by automated unit tests, `spirv-val --tar
 | Direct RDNA2 → SSA → SPIR-V 1.6 (BDA) | ✅ | `spirv-val` + live GPU execution (64/64 lanes bit-exact) |
 | 128-bit BDA load coalescing & bitcast/CSE/DCE opt | ✅ | Unit test + live GPU execution |
 | Structured CFG (`OpSelectionMerge` + `OpPhi`) | ✅ | `spirv-val` + live GPU divergent-lane execution |
-| Wave64-on-Wave32 (`OpGroupNonUniformBallot` + `Workgroup` barrier) | ✅ | `spirv-val` + live RTX 4070 Wave32 → 64-bit mask (`0x5555555555555555`) |
+| Subgroup-agnostic Wave64 ballot (`OpGroupNonUniformBallot` + `Workgroup` atomic merge + `subgroupSizeControl`) | ✅ | `spirv-val` + live GPU test across SIMD8/16, Wave32 & native Wave64 (`0x5555555555555555`) |
 | Exact RDNA2 `v_log_f32` (`Log2`), `v_mul_legacy_f32`, quad-safe `OpGroupNonUniformQuadSwap` | ✅ | Compiler unit tests |
 | `DXBC` / `XDAT` / `XBCH` (pure-Rust RFC 1950/1951 zlib) / `FSSM` parser | ✅ | Unit tests on synthetic containers & streams |
 | Atomic content-addressed SPIR-V disk cache | ✅ | Roundtrip unit test |
@@ -182,7 +183,7 @@ All implemented subsystems are covered by automated unit tests, `spirv-val --tar
 - **OS:** Windows 10 / 11 x64
 - **Toolchain:** Rust (Edition 2024, MSVC target) + Visual Studio C++ Build Tools
 - **SDK:** [Vulkan SDK](https://vulkan.lunarg.com/) 1.3+ (provides `slangc.exe` for build-time Slang compilation and `spirv-val.exe` for shader validation tests)
-- **GPU:** Vulkan 1.3+ GPU supporting `bufferDeviceAddress`, `descriptorIndexing`, `dynamicRendering`, `sparseResidencyImage2D`, and `VK_EXT_external_memory_host`
+- **GPU:** **NVIDIA**, **AMD**, or **Intel Arc** Vulkan 1.3+ GPU supporting `bufferDeviceAddress`, `descriptorIndexing`, `dynamicRendering`, `sparseResidencyImage2D`, and `VK_EXT_external_memory_host` (SIMD8 / SIMD16 / Wave32 / Wave64 supported)
 
 ### Build & Run Tests
 

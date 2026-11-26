@@ -266,15 +266,50 @@ fn cmd_gpu_test() {
     println!("[PASS] Direct SPIR-V Structured CFG (OpSelectionMerge + OpPhi + BDA): 64/64 divergent lanes exact on GPU");
     runner.free_bda_buffer(cfg_out);
 
-    // 9. LIVE WAVE64-ON-WAVE32 BALLOT EXCHANGE ON NVIDIA RTX 4070 (32-lane hardware -> 64-bit console mask):
+    // 9. LIVE WAVE64 BALLOT EXCHANGE (works across Intel SIMD8/16, NVIDIA Wave32, AMD Wave32/64):
     let w64_spv = strata_shader::spirv::emit_wave64_on_wave32_ballot_kernel();
     let w64_out = runner.alloc_bda_buffer(16).unwrap();
     runner
         .dispatch_spirv(&w64_spv, &w64_out.bda.to_le_bytes(), [1, 1, 1])
-        .expect("Wave64-on-Wave32 SPIR-V dispatch failed");
+        .expect("Wave64 ballot SPIR-V dispatch failed");
     let mask = unsafe { w64_out.as_slice::<u64>(1)[0] };
     assert_eq!(mask, 0x5555_5555_5555_5555, "unexpected Wave64 mask: 0x{mask:016x}");
-    println!("[PASS] Wave64-on-Wave32 (2x Wave32 + Workgroup barrier -> 64-bit console EXEC/ballot): 0x{mask:016x}");
+    let tested_sizes: Vec<u32> = if runner.subgroup_size_control {
+        [8u32, 16, 32, 64]
+            .into_iter()
+            .filter(|&sz| sz >= runner.min_subgroup_size && sz <= runner.max_subgroup_size)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if tested_sizes.len() > 1 {
+        for &req_sg in &tested_sizes {
+            runner
+                .dispatch_spirv_with_subgroup_size(
+                    &w64_spv,
+                    &w64_out.bda.to_le_bytes(),
+                    [1, 1, 1],
+                    Some(req_sg),
+                )
+                .unwrap_or_else(|e| panic!("Wave64 ballot dispatch failed at Wave{req_sg}: {e}"));
+            let req_mask = unsafe { w64_out.as_slice::<u64>(1)[0] };
+            assert_eq!(
+                req_mask, 0x5555_5555_5555_5555,
+                "unexpected Wave64 mask at Wave{req_sg}: 0x{req_mask:016x}"
+            );
+        }
+        println!(
+            "[PASS] Wave64 Ballot (verified subgroup sizes {:?} -> 64-bit console EXEC/ballot): 0x{mask:016x}",
+            tested_sizes
+        );
+    } else if runner.native_wave64 {
+        println!("[PASS] Wave64 Ballot (native Wave64 -> 64-bit console EXEC/ballot): 0x{mask:016x}");
+    } else {
+        println!(
+            "[PASS] Wave64 Ballot (Wave{} + Workgroup atomic merge -> 64-bit console EXEC/ballot): 0x{mask:016x}",
+            runner.subgroup_size
+        );
+    }
     runner.free_bda_buffer(w64_out);
 }
 

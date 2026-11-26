@@ -597,13 +597,23 @@ pub fn emit_structured_select_kernel(workgroup_size: [u32; 3]) -> Vec<u32> {
     w.finish()
 }
 
-/// Emit a **Wave64-on-Wave32** SPIR-V 1.6 compute shader that combines two 32-lane
-/// hardware subgroups (NVIDIA RTX 4070) via `Workgroup` (`groupshared`) memory and
-/// `OpGroupNonUniformBallot` + `OpControlBarrier` into one exact 64-bit console wave mask.
+/// Emit a **Wave64-compatible** SPIR-V 1.6 compute shader that produces a 64-bit
+/// console wave mask across any hardware subgroup size (Intel Arc SIMD8/16,
+/// NVIDIA / AMD RDNA Wave32, and AMD GCN / RDNA native Wave64) using
+/// `BuiltIn SubgroupSize`, `OpGroupNonUniformBallot`, `Workgroup` `OpAtomicOr`,
+/// and `OpControlBarrier`.
 pub fn emit_wave64_on_wave32_ballot_kernel() -> Vec<u32> {
+    const OP_I_SUB: u16 = 130;
+    const OP_LOGICAL_AND: u16 = 167;
+    const OP_I_NOT_EQUAL: u16 = 171;
+    const OP_U_GREATER_THAN_EQUAL: u16 = 175;
+    const OP_BITWISE_AND: u16 = 199;
+    const OP_NOT: u16 = 200;
     const OP_CONTROL_BARRIER: u16 = 224;
+    const OP_ATOMIC_OR: u16 = 241;
     const OP_GROUP_NON_UNIFORM_BALLOT: u16 = 339;
     const SC_WORKGROUP: u32 = 4;
+    const BUILTIN_SUBGROUP_SIZE: u32 = 36;
 
     let mut w = Writer::new();
     w.inst(OP_CAPABILITY, &[CAP_SHADER]);
@@ -615,12 +625,14 @@ pub fn emit_wave64_on_wave32_ballot_kernel() -> Vec<u32> {
 
     let main_fn = w.id();
     let local_idx_var = w.id();
+    let sg_size_var = w.id();
     let push_var = w.id();
     let shared_var = w.id();
 
     let mut ep = vec![5, main_fn];
     encode_str(&mut ep, "main");
     ep.push(local_idx_var);
+    ep.push(sg_size_var);
     ep.push(push_var);
     ep.push(shared_var);
     w.inst(OP_ENTRY_POINT, &ep);
@@ -647,8 +659,9 @@ pub fn emit_wave64_on_wave32_ballot_kernel() -> Vec<u32> {
     let t_bda_u64_ptr = w.id();
     let t_bda_u64_field = w.id();
 
-    // BuiltIn LocalInvocationIndex = 29
+    // BuiltIn LocalInvocationIndex = 29, SubgroupSize = 36
     w.inst(OP_DECORATE, &[local_idx_var, DEC_BUILTIN, 29]);
+    w.inst(OP_DECORATE, &[sg_size_var, DEC_BUILTIN, BUILTIN_SUBGROUP_SIZE]);
     w.inst(OP_DECORATE, &[t_push_struct, DEC_BLOCK]);
     w.inst(OP_MEMBER_DECORATE, &[t_push_struct, 0, DEC_OFFSET, 0]);
     w.inst(OP_DECORATE, &[t_bda_u64_struct, DEC_BLOCK]);
@@ -678,6 +691,8 @@ pub fn emit_wave64_on_wave32_ballot_kernel() -> Vec<u32> {
     let c0 = w.id();
     let c1 = w.id();
     let c5 = w.id();
+    let c31 = w.id();
+    let c64 = w.id();
     let c_scope_wg = w.id();
     let c_scope_sg = w.id();
     let c_sem_wg = w.id();
@@ -685,12 +700,15 @@ pub fn emit_wave64_on_wave32_ballot_kernel() -> Vec<u32> {
     w.inst(OP_CONSTANT, &[t_u32, c0, 0]);
     w.inst(OP_CONSTANT, &[t_u32, c1, 1]);
     w.inst(OP_CONSTANT, &[t_u32, c5, 5]);
+    w.inst(OP_CONSTANT, &[t_u32, c31, 31]);
+    w.inst(OP_CONSTANT, &[t_u32, c64, 64]);
     w.inst(OP_CONSTANT, &[t_u32, c_scope_wg, 2]); // Scope::Workgroup = 2
     w.inst(OP_CONSTANT, &[t_u32, c_scope_sg, 3]); // Scope::Subgroup = 3
     w.inst(OP_CONSTANT, &[t_u32, c_sem_wg, 0x108]); // AcquireRelease | WorkgroupMemory
     w.inst(OP_CONSTANT, &[t_u64, c32_u64, 32, 0]);
 
     w.inst(OP_VARIABLE, &[t_ptr_in_u32, local_idx_var, SC_INPUT]);
+    w.inst(OP_VARIABLE, &[t_ptr_in_u32, sg_size_var, SC_INPUT]);
     w.inst(OP_VARIABLE, &[t_ptr_push, push_var, SC_PUSH_CONSTANT]);
     w.inst(OP_VARIABLE, &[t_ptr_wg_arr, shared_var, SC_WORKGROUP]);
 
@@ -701,6 +719,11 @@ pub fn emit_wave64_on_wave32_ballot_kernel() -> Vec<u32> {
     // Predicate: even lanes are active (`(tid & 1) == 0`) -> expected 64-bit mask 0x5555_5555_5555_5555
     let tid = w.id();
     w.inst(OP_LOAD, &[t_u32, tid, local_idx_var]);
+    let sg_size = w.id();
+    w.inst(OP_LOAD, &[t_u32, sg_size, sg_size_var]);
+    let is_w64 = w.id();
+    w.inst(OP_U_GREATER_THAN_EQUAL, &[t_bool, is_w64, sg_size, c64]);
+
     let lsb = w.id();
     // OpBitwiseAnd = 199
     w.inst(199, &[t_u32, lsb, tid, c1]);
@@ -708,19 +731,46 @@ pub fn emit_wave64_on_wave32_ballot_kernel() -> Vec<u32> {
     // OpIEqual = 170
     w.inst(170, &[t_bool, is_even, lsb, c0]);
 
-    // Each hardware wave32 computes its 32-bit half ballot and stores into shared[tid >> 5]
-    let ballot_v4 = w.id();
-    w.inst(OP_GROUP_NON_UNIFORM_BALLOT, &[t_uvec4, ballot_v4, c_scope_sg, is_even]);
-    let half_mask = w.id();
-    w.inst(OP_COMPOSITE_EXTRACT, &[t_u32, half_mask, ballot_v4, 0]);
+    // Compute subgroup ballot for any subgroup size (SIMD8/16, Wave32, Wave64):
+    // - Clear shared[0..2] before atomic merge.
+    // - On Wave64, lanes 0..31 take ballot.x and lanes 32..63 take ballot.y (bit shift = 0).
+    // - On SIMD8/16/32, each subgroup shifts ballot.x by ((tid & 31) & ~(sg_size - 1))
+    //   and atomically ORs it into shared[tid >> 5].
     let half_idx = w.id();
     // OpShiftRightLogical = 194
     w.inst(194, &[t_u32, half_idx, tid, c5]);
     let p_slot = w.id();
     w.inst(OP_ACCESS_CHAIN, &[t_ptr_wg_u32, p_slot, shared_var, half_idx]);
-    w.inst(OP_STORE, &[p_slot, half_mask]);
+    w.inst(OP_STORE, &[p_slot, c0]);
+    w.inst(OP_CONTROL_BARRIER, &[c_scope_wg, c_scope_wg, c_sem_wg]);
 
-    // Synchronize both wave32 halves
+    let ballot_v4 = w.id();
+    w.inst(OP_GROUP_NON_UNIFORM_BALLOT, &[t_uvec4, ballot_v4, c_scope_sg, is_even]);
+    let ballot_lo = w.id();
+    w.inst(OP_COMPOSITE_EXTRACT, &[t_u32, ballot_lo, ballot_v4, 0]);
+    let ballot_hi = w.id();
+    w.inst(OP_COMPOSITE_EXTRACT, &[t_u32, ballot_hi, ballot_v4, 1]);
+    let is_hi_half = w.id();
+    w.inst(OP_I_NOT_EQUAL, &[t_bool, is_hi_half, half_idx, c0]);
+    let use_hi = w.id();
+    w.inst(OP_LOGICAL_AND, &[t_bool, use_hi, is_w64, is_hi_half]);
+    let half_mask = w.id();
+    w.inst(OP_SELECT, &[t_u32, half_mask, use_hi, ballot_hi, ballot_lo]);
+
+    let sg_m1 = w.id();
+    w.inst(OP_I_SUB, &[t_u32, sg_m1, sg_size, c1]);
+    let sg_align_mask = w.id();
+    w.inst(OP_NOT, &[t_u32, sg_align_mask, sg_m1]);
+    let tid_in_half = w.id();
+    w.inst(OP_BITWISE_AND, &[t_u32, tid_in_half, tid, c31]);
+    let sub_shift = w.id();
+    w.inst(OP_BITWISE_AND, &[t_u32, sub_shift, tid_in_half, sg_align_mask]);
+    let shifted_mask = w.id();
+    w.inst(OP_SHIFT_LEFT_LOGICAL, &[t_u32, shifted_mask, half_mask, sub_shift]);
+    let atomic_old = w.id();
+    w.inst(OP_ATOMIC_OR, &[t_u32, atomic_old, p_slot, c_scope_wg, c0, shifted_mask]);
+
+    // Synchronize all subgroups before reading combined 64-bit mask
     w.inst(OP_CONTROL_BARRIER, &[c_scope_wg, c_scope_wg, c_sem_wg]);
 
     // Combine low32 | (high32 << 32) into the full 64-bit console wave mask and store to BDA
