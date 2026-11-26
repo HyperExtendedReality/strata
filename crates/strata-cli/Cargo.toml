@@ -1,0 +1,11 @@
+[package]
+name = "strata-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+strata-shader = { path = "../strata-shader" }
+strata-runtime-shaders = { path = "../strata-runtime-shaders" }
+strata-gpu = { path = "../strata-gpu" }
+strata-hle = { path = "../strata-hle" }
