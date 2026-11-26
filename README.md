@@ -1,4 +1,8 @@
 <p align="center">
+  <img src="assets/readme/banner.svg" width="100%" alt="Strata – No-API Vulkan 1.3+ and Slang console compatibility layer: native x86-64, direct RDNA2 to SPIR-V 1.6, 64-bit BDA, 3-Tier Hybrid UMA">
+</p>
+
+<p align="center">
   <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-7c5cff?style=for-the-badge">
   <img alt="Windows 10 / 11 x64" src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-2f80ed?style=for-the-badge">
   <img alt="Vulkan 1.3+ No-API" src="https://img.shields.io/badge/Vulkan-1.3%2B%20No--API-e0405a?style=for-the-badge">
