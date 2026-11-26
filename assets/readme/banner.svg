@@ -1,109 +1,305 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 380" role="img" aria-labelledby="t d">
-  <title id="t">Strata</title>
-  <desc id="d">No-API Vulkan 1.3+ and Slang console compatibility layer written in Rust: native x86-64 execution, direct RDNA2 to SPIR-V 1.6, 64-bit BDA, and 3-tier hybrid UMA</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 400" role="img" aria-labelledby="t d">
+  <title id="t">STRATA — No-API Vulkan 1.3+ &amp; Slang Compatibility Layer</title>
+  <desc id="d">Clean-room Rust compatibility layer for unpacked x86-64 console software on Windows using No-API Vulkan 1.3+, direct RDNA2 to SPIR-V 1.6 compilation, 64-bit BDA, and 3-tier hybrid UMA</desc>
   <defs>
+    <!-- Deep obsidian-slate background -->
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#0c0d18"/>
-      <stop offset=".52" stop-color="#241129"/>
-      <stop offset="1" stop-color="#072434"/>
+      <stop offset="0" stop-color="#05070c"/>
+      <stop offset=".48" stop-color="#0a0e18"/>
+      <stop offset="1" stop-color="#06121a"/>
     </linearGradient>
-    <linearGradient id="ink" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#f76b45"/>
-      <stop offset=".38" stop-color="#e04068"/>
-      <stop offset=".72" stop-color="#8f78ff"/>
-      <stop offset="1" stop-color="#35d6ea"/>
-    </linearGradient>
-    <linearGradient id="mark" gradientUnits="userSpaceOnUse" x1="100" y1="0" x2="620" y2="0">
-      <stop offset="0" stop-color="#ff7a52"/>
-      <stop offset=".38" stop-color="#f0557d"/>
-      <stop offset=".72" stop-color="#a88cff"/>
-      <stop offset="1" stop-color="#4fe3f2"/>
-    </linearGradient>
-    <linearGradient id="face" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#e04068" stop-opacity=".5"/>
-      <stop offset=".52" stop-color="#8f78ff" stop-opacity=".46"/>
-      <stop offset="1" stop-color="#35d6ea" stop-opacity=".4"/>
-    </linearGradient>
-    <radialGradient id="glow1" cx=".5" cy=".5" r=".5">
-      <stop offset="0" stop-color="#e0405a" stop-opacity=".46"/>
-      <stop offset="1" stop-color="#e0405a" stop-opacity="0"/>
-    </radialGradient>
-    <radialGradient id="glow2" cx=".5" cy=".5" r=".5">
-      <stop offset="0" stop-color="#1fb9d8" stop-opacity=".42"/>
-      <stop offset="1" stop-color="#1fb9d8" stop-opacity="0"/>
-    </radialGradient>
-    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
-      <path d="M40 0H0V40" fill="none" stroke="#fff" stroke-opacity=".055"/>
-    </pattern>
-    <filter id="soft" x="-20%" y="-40%" width="140%" height="180%"><feGaussianBlur stdDeviation="14"/></filter>
-    <clipPath id="card"><rect width="1280" height="380" rx="28"/></clipPath>
-  </defs>
-  <style>
-    text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif }
-    .flow { fill: none; stroke: url(#ink); stroke-width: 2; stroke-linecap: round; stroke-dasharray: 6 22; opacity: .5; animation: run 9s linear infinite }
-    .b { animation-duration: 13s; opacity: .34 }
-    .c { animation-duration: 17s; opacity: .24 }
-    .slab { animation: lift 6s ease-in-out infinite }
-    .s2 { animation-delay: -2s }
-    .s3 { animation-delay: -4s }
-    @keyframes run { to { stroke-dashoffset: -560 } }
-    @keyframes lift { 50% { transform: translateY(-7px) } }
-    @media (prefers-reduced-motion: reduce) { .flow, .slab { animation: none } }
-  </style>
-  <g clip-path="url(#card)">
-    <rect width="1280" height="380" fill="url(#bg)"/>
-    <circle cx="180" cy="360" r="340" fill="url(#glow1)"/>
-    <circle cx="1130" cy="40" r="330" fill="url(#glow2)"/>
-    <rect width="1280" height="380" fill="url(#grid)"/>
-    <path class="flow" d="M-20 70C260 10 420 150 700 90S1120 20 1300 96"/>
-    <path class="flow b" d="M-20 330C240 380 470 250 720 300S1090 380 1300 300"/>
-    <path class="flow c" d="M-20 190C300 120 520 260 760 190S1110 130 1300 200"/>
-    <path class="flow b" d="M-20 250C220 300 520 180 800 250S1130 260 1300 240"/>
 
-    <g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="20">
-      <g stroke="#e05882" opacity=".52" filter="url(#soft)">
-        <path d="M162 114C155 104 114 102 110 123C107 141 132 145 144 148C162 153 168 164 164 176C159 191 120 193 108 180"/>
-        <path d="M196 104H256M226 104V190"/>
-        <path d="M286 190V104H322A22 22 0 0 1 322 148H286M320 148 344 190"/>
-        <path d="M374 190 406 104 438 190M386 164H426"/>
-        <path d="M462 104H522M492 104V190"/>
-        <path d="M546 190 578 104 610 190M558 164H598"/>
+    <!-- Atmospheric blooms -->
+    <radialGradient id="bloomOrange" cx=".5" cy=".5" r=".5">
+      <stop offset="0" stop-color="#ff5a2c" stop-opacity=".22"/>
+      <stop offset=".55" stop-color="#e0385e" stop-opacity=".08"/>
+      <stop offset="1" stop-color="#e0385e" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="bloomCyan" cx=".5" cy=".5" r=".5">
+      <stop offset="0" stop-color="#00d8ff" stop-opacity=".22"/>
+      <stop offset=".55" stop-color="#5b6cff" stop-opacity=".09"/>
+      <stop offset="1" stop-color="#00d8ff" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Metallic futuristic title fill -->
+    <linearGradient id="titleFill" x1="0" y1="110" x2="0" y2="196" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset=".46" stop-color="#e8effc"/>
+      <stop offset=".52" stop-color="#b6c6e0"/>
+      <stop offset="1" stop-color="#d4e2f7"/>
+    </linearGradient>
+
+    <!-- Spectral strata accent gradient -->
+    <linearGradient id="spectrum" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff6b3d"/>
+      <stop offset=".35" stop-color="#f0426d"/>
+      <stop offset=".7" stop-color="#8b6eff"/>
+      <stop offset="1" stop-color="#00e5ff"/>
+    </linearGradient>
+
+    <!-- Layer top glass fills & glowing edges -->
+    <linearGradient id="l1Fill" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ff6b3d" stop-opacity=".3"/>
+      <stop offset="1" stop-color="#2a1210" stop-opacity=".78"/>
+    </linearGradient>
+    <linearGradient id="l1Edge" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff8a5c"/>
+      <stop offset="1" stop-color="#ff4d6d"/>
+    </linearGradient>
+
+    <linearGradient id="l2Fill" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f0426d" stop-opacity=".28"/>
+      <stop offset="1" stop-color="#240f24" stop-opacity=".8"/>
+    </linearGradient>
+    <linearGradient id="l2Edge" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff5783"/>
+      <stop offset="1" stop-color="#a86eff"/>
+    </linearGradient>
+
+    <linearGradient id="l3Fill" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8b6eff" stop-opacity=".28"/>
+      <stop offset="1" stop-color="#121430" stop-opacity=".82"/>
+    </linearGradient>
+    <linearGradient id="l3Edge" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#a288ff"/>
+      <stop offset="1" stop-color="#38b6ff"/>
+    </linearGradient>
+
+    <linearGradient id="l4Fill" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#00e5ff" stop-opacity=".28"/>
+      <stop offset="1" stop-color="#071f2e" stop-opacity=".88"/>
+    </linearGradient>
+    <linearGradient id="l4Edge" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2be8ff"/>
+      <stop offset="1" stop-color="#00ffa6"/>
+    </linearGradient>
+
+    <!-- Subtle dot matrix pattern -->
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1" fill="#8aa4d6" fill-opacity=".14"/>
+    </pattern>
+
+    <!-- Glow filters -->
+    <filter id="glowSoft" x="-25%" y="-40%" width="150%" height="180%">
+      <feGaussianBlur stdDeviation="8" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="glowTitle" x="-15%" y="-35%" width="130%" height="170%">
+      <feGaussianBlur stdDeviation="10"/>
+    </filter>
+
+    <clipPath id="frame"><rect width="1280" height="400" rx="20"/></clipPath>
+  </defs>
+
+  <style>
+    .sans { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif }
+    .mono { font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, "Liberation Mono", Menlo, monospace }
+    .layer { animation: hover 7s ease-in-out infinite }
+    .d2 { animation-delay: -1.6s }
+    .d3 { animation-delay: -3.2s }
+    .d4 { animation-delay: -4.8s }
+    .pulse { stroke-dasharray: 8 44; animation: conduit 3.6s linear infinite }
+    .p2 { animation-delay: -1.2s; animation-duration: 4.2s }
+    .p3 { animation-delay: -2.4s; animation-duration: 3.1s }
+    .scan { animation: scanline 6s ease-in-out infinite }
+    .blink { animation: blink 2.4s ease-in-out infinite }
+    @keyframes hover { 0%,100% { transform: translateY(0px) } 50% { transform: translateY(-4px) } }
+    @keyframes conduit { from { stroke-dashoffset: 52 } to { stroke-dashoffset: -52 } }
+    @keyframes scanline { 0%,100% { opacity: .35 } 50% { opacity: .95 } }
+    @keyframes blink { 0%,100% { opacity: .35 } 50% { opacity: 1 } }
+    @media (prefers-reduced-motion: reduce) {
+      .layer, .pulse, .scan, .blink { animation: none }
+    }
+  </style>
+
+  <g clip-path="url(#frame)">
+    <!-- Background canvas -->
+    <rect width="1280" height="400" fill="url(#bg)"/>
+    <rect width="1280" height="400" fill="url(#dots)"/>
+    <circle cx="230" cy="210" r="360" fill="url(#bloomOrange)"/>
+    <circle cx="920" cy="220" r="390" fill="url(#bloomCyan)"/>
+
+    <!-- Subtle architectural horizon & divider lines -->
+    <line x1="0" y1="48" x2="1280" y2="48" stroke="#ffffff" stroke-opacity=".06" stroke-width="1"/>
+    <line x1="0" y1="352" x2="1280" y2="352" stroke="#ffffff" stroke-opacity=".06" stroke-width="1"/>
+    <line x1="646" y1="48" x2="646" y2="352" stroke="#ffffff" stroke-opacity=".05" stroke-width="1" stroke-dasharray="4 8"/>
+
+    <!-- Top HUD telemetry header -->
+    <g class="mono" font-size="11" letter-spacing="1.6" fill="#7c8fb0">
+      <circle cx="48" cy="24" r="3.5" fill="#00e5ff" class="blink"/>
+      <text x="62" y="28" fill="#a8bddb">SYS // STRATA ENGINE</text>
+      <text x="274" y="28" fill="#5e7294">NO-API VULKAN 1.3+</text>
+      <text x="1232" y="28" text-anchor="end" fill="#6f87ad">RUST 2024  ·  ASH  ·  SLANG  ·  SPIR-V 1.6</text>
+    </g>
+
+    <!-- Corner HUD brackets -->
+    <g fill="none" stroke="url(#spectrum)" stroke-opacity=".55" stroke-width="1.5">
+      <path d="M18 36V18H36"/>
+      <path d="M1244 18H1262V36"/>
+      <path d="M18 364V382H36"/>
+      <path d="M1244 382H1262V364"/>
+    </g>
+
+    <!-- LEFT SECTION: Custom Futuristic Chamfered STRATA Wordmark -->
+    <g transform="translate(-20, 6)">
+      <!-- Glowing spectral back-halo behind title -->
+      <g fill="url(#spectrum)" opacity=".26" filter="url(#glowTitle)">
+        <path d="M88 112H148V128H92V145H136L148 157V182L136 194H76V178H132V161H88L76 149V124Z"/>
+        <path d="M166 112H238V128H210V194H194V128H166Z"/>
+        <path fill-rule="evenodd" d="M256 112H318L330 124V148L318 160H312L332 194H313L294 160H272V194H256ZM272 128H314V144H272Z"/>
+        <path d="M374 112H398L426 194H408L386 128L364 194H346ZM366 162H406V176H366Z"/>
+        <path d="M438 112H510V128H482V194H466V128H438Z"/>
+        <path d="M550 112H574L602 194H584L562 128L540 194H522ZM542 162H582V176H542Z"/>
       </g>
-      <g stroke="url(#mark)">
-        <path d="M162 114C155 104 114 102 110 123C107 141 132 145 144 148C162 153 168 164 164 176C159 191 120 193 108 180"/>
-        <path d="M196 104H256M226 104V190"/>
-        <path d="M286 190V104H322A22 22 0 0 1 322 148H286M320 148 344 190"/>
-        <path d="M374 190 406 104 438 190M386 164H426"/>
-        <path d="M462 104H522M492 104V190"/>
-        <path d="M546 190 578 104 610 190M558 164H598"/>
+
+      <!-- Crisp metallic-chamfered foreground letterforms -->
+      <g fill="url(#titleFill)">
+        <!-- S -->
+        <path d="M88 112H148V128H92V145H136L148 157V182L136 194H76V178H132V161H88L76 149V124Z"/>
+        <!-- T -->
+        <path d="M166 112H238V128H210V194H194V128H166Z"/>
+        <!-- R -->
+        <path fill-rule="evenodd" d="M256 112H318L330 124V148L318 160H312L332 194H313L294 160H272V194H256ZM272 128H314V144H272Z"/>
+        <!-- A -->
+        <path d="M374 112H398L426 194H408L386 128L364 194H346Z"/>
+        <path d="M367 163H405V176H367Z"/>
+        <!-- T -->
+        <path d="M438 112H510V128H482V194H466V128H438Z"/>
+        <!-- A -->
+        <path d="M550 112H574L602 194H584L562 128L540 194H522Z"/>
+        <path d="M543 163H581V176H543Z"/>
+      </g>
+
+      <!-- Futuristic precision strata slice line + micro accent bar -->
+      <line x1="74" y1="153" x2="604" y2="153" stroke="#05070c" stroke-width="2.2" opacity=".88"/>
+      <line x1="74" y1="153" x2="604" y2="153" stroke="url(#spectrum)" stroke-width="1.2" class="scan"/>
+      <rect x="76" y="92" width="64" height="4" rx="2" fill="url(#spectrum)"/>
+      <text x="152" y="98" class="mono" font-size="11" letter-spacing="2.4" fill="#8fa6c9">COMPATIBILITY LAYER</text>
+    </g>
+
+    <!-- Tagline -->
+    <text x="56" y="244" class="sans" font-size="22" font-weight="600" fill="#eef3ff" letter-spacing="-0.2">
+      Zero-emulation console runtime on modern Vulkan silicon
+    </text>
+
+    <!-- Futuristic glass telemetry pills -->
+    <g transform="translate(56, 266)" class="mono" font-size="12" font-weight="600">
+      <g>
+        <rect x="0" y="0" width="128" height="28" rx="6" fill="#ff6b3d" fill-opacity=".1" stroke="#ff6b3d" stroke-opacity=".45" stroke-width="1"/>
+        <circle cx="15" cy="14" r="3" fill="#ff6b3d"/>
+        <text x="27" y="18" fill="#ffd9cc">Native x86-64</text>
+      </g>
+      <g transform="translate(138, 0)">
+        <rect x="0" y="0" width="186" height="28" rx="6" fill="#f0426d" fill-opacity=".1" stroke="#f0426d" stroke-opacity=".45" stroke-width="1"/>
+        <circle cx="15" cy="14" r="3" fill="#f0426d"/>
+        <text x="27" y="18" fill="#ffd4df">RDNA2 → SPIR-V 1.6</text>
+      </g>
+      <g transform="translate(334, 0)">
+        <rect x="0" y="0" width="112" height="28" rx="6" fill="#8b6eff" fill-opacity=".1" stroke="#8b6eff" stroke-opacity=".45" stroke-width="1"/>
+        <circle cx="15" cy="14" r="3" fill="#8b6eff"/>
+        <text x="27" y="18" fill="#e2d9ff">64-bit BDA</text>
+      </g>
+      <g transform="translate(456, 0)">
+        <rect x="0" y="0" width="118" height="28" rx="6" fill="#00e5ff" fill-opacity=".1" stroke="#00e5ff" stroke-opacity=".45" stroke-width="1"/>
+        <circle cx="15" cy="14" r="3" fill="#00e5ff"/>
+        <text x="27" y="18" fill="#ccf9ff">3-Tier UMA</text>
       </g>
     </g>
-    <text x="98" y="264" font-size="28" font-weight="700" fill="#f7f5ff">No-API Vulkan 1.3+ &amp; Slang console compatibility layer</text>
-    <text x="98" y="302" font-size="18.5" fill="#c9c2e0">Native x86-64&#160;&#160;·&#160;&#160;Direct RDNA2 → SPIR-V 1.6&#160;&#160;·&#160;&#160;64-bit BDA&#160;&#160;·&#160;&#160;3-Tier Hybrid UMA</text>
 
-    <g transform="translate(1062 0)" stroke-linejoin="round">
-      <g stroke="#c69cff" stroke-opacity=".5" stroke-width="2" stroke-dasharray="3 7">
-        <path d="M0 152V196M-130 108V276M130 108V276"/>
+    <!-- Subtle horizontal data bus linking wordmark side to the 4-layer stack -->
+    <g fill="none" stroke-width="1.2">
+      <path d="M584 159 H628 L652 132 H676" stroke="url(#l1Edge)" stroke-opacity=".42"/>
+      <path d="M646 190 H676" stroke="url(#l2Edge)" stroke-opacity=".35"/>
+      <path d="M646 248 H676" stroke="url(#l3Edge)" stroke-opacity=".35"/>
+      <path d="M630 280 H650 L664 306 H676" stroke="url(#l4Edge)" stroke-opacity=".42"/>
+    </g>
+
+    <!-- RIGHT SECTION: Futuristic 4-Stratum Holographic Isometric Architecture Stack -->
+    <g transform="translate(658, 0)">
+      <!-- Vertical energy conduits piercing all 4 strata -->
+      <g fill="none" stroke-linecap="round">
+        <line x1="104" y1="88" x2="104" y2="332" stroke="#ffffff" stroke-opacity=".12" stroke-width="1.5" stroke-dasharray="3 5"/>
+        <line x1="188" y1="74" x2="188" y2="324" stroke="#ffffff" stroke-opacity=".14" stroke-width="1.5" stroke-dasharray="3 5"/>
+        <line x1="278" y1="94" x2="278" y2="330" stroke="#ffffff" stroke-opacity=".12" stroke-width="1.5" stroke-dasharray="3 5"/>
+        <!-- Animated descending signal pulses -->
+        <line x1="104" y1="88" x2="104" y2="332" stroke="#ff6b3d" stroke-width="2.5" class="pulse"/>
+        <line x1="188" y1="74" x2="188" y2="324" stroke="#00e5ff" stroke-width="2.5" class="pulse p2"/>
+        <line x1="278" y1="94" x2="278" y2="330" stroke="#a288ff" stroke-width="2.5" class="pulse p3"/>
       </g>
-      <g class="slab s3">
-        <path d="M-130 276 0 314V332L-130 294Z" fill="#321430"/>
-        <path d="M130 276 0 314V332L130 294Z" fill="#0d3a52"/>
-        <path d="M0 238 130 276 0 314-130 276Z" fill="url(#face)" stroke="url(#ink)" stroke-width="2"/>
-        <text x="0" y="283" font-size="20" font-weight="700" fill="#f7f5ff" text-anchor="middle">Vulkan 1.3+</text>
+
+      <!-- LAYER 04 (Bottom bedrock): NO-API VULKAN 1.3+ -->
+      <g class="layer d4">
+        <path d="M18 306 L180 338 L180 348 L18 316 Z" fill="#062938" stroke="#00e5ff" stroke-opacity=".45" stroke-width="1"/>
+        <path d="M180 338 L358 298 L358 308 L180 348 Z" fill="#041c29" stroke="#00ffa6" stroke-opacity=".4" stroke-width="1"/>
+        <path d="M18 306 L196 266 L358 298 L180 338 Z" fill="url(#l4Fill)" stroke="url(#l4Edge)" stroke-width="1.6"/>
+        <!-- Bindless descriptor micro-grid etched onto top face -->
+        <g stroke="#00e5ff" stroke-opacity=".24" stroke-width="1">
+          <line x1="77" y1="293" x2="239" y2="325"/>
+          <line x1="136" y1="280" x2="298" y2="312"/>
+          <line x1="99" y1="322" x2="277" y2="282"/>
+        </g>
+        <line x1="358" y1="298" x2="386" y2="298" stroke="#00e5ff" stroke-opacity=".75" stroke-width="1.2"/>
+        <circle cx="358" cy="298" r="3" fill="#00e5ff"/>
+        <text x="394" y="294" class="mono" font-size="11.5" font-weight="700" fill="#45f0ff">04  VULKAN 1.3+</text>
+        <text x="394" y="309" class="mono" font-size="9.5" fill="#7aa6b8">RAW ASH · BINDLESS · SLANG</text>
       </g>
-      <g class="slab s2">
-        <path d="M-130 190 0 228V246L-130 208Z" fill="#42183a"/>
-        <path d="M130 190 0 228V246L130 208Z" fill="#12415c"/>
-        <path d="M0 152 130 190 0 228-130 190Z" fill="url(#face)" stroke="url(#ink)" stroke-width="2"/>
-        <text x="0" y="197" font-size="18" font-weight="700" fill="#f7f5ff" text-anchor="middle">RDNA2 → SPIR-V</text>
+
+      <!-- LAYER 03: 3-TIER HYBRID UMA -->
+      <g class="layer d3">
+        <path d="M18 248 L180 280 L180 290 L18 258 Z" fill="#1b1442" stroke="#8b6eff" stroke-opacity=".45" stroke-width="1"/>
+        <path d="M180 280 L358 240 L358 250 L180 290 Z" fill="#101a3d" stroke="#38b6ff" stroke-opacity=".4" stroke-width="1"/>
+        <path d="M18 248 L196 208 L358 240 L180 280 Z" fill="url(#l3Fill)" stroke="url(#l3Edge)" stroke-width="1.6"/>
+        <!-- 3-Tier memory bus bars on face -->
+        <g stroke="#a288ff" stroke-opacity=".38" stroke-width="2" stroke-linecap="round">
+          <line x1="92" y1="244" x2="178" y2="261"/>
+          <line x1="126" y1="236" x2="212" y2="253"/>
+          <line x1="160" y1="229" x2="246" y2="246"/>
+        </g>
+        <line x1="358" y1="240" x2="386" y2="240" stroke="#8b6eff" stroke-opacity=".75" stroke-width="1.2"/>
+        <circle cx="358" cy="240" r="3" fill="#a288ff"/>
+        <text x="394" y="236" class="mono" font-size="11.5" font-weight="700" fill="#bca8ff">03  3-TIER UMA</text>
+        <text x="394" y="251" class="mono" font-size="9.5" fill="#8b88b8">64-BIT BDA · SPARSE 64K</text>
       </g>
-      <g class="slab">
-        <path d="M-130 104 0 142V160L-130 122Z" fill="#521d42"/>
-        <path d="M130 104 0 142V160L130 122Z" fill="#174a68"/>
-        <path d="M0 66 130 104 0 142-130 104Z" fill="url(#face)" stroke="url(#ink)" stroke-width="2"/>
-        <text x="0" y="111" font-size="20" font-weight="700" fill="#f7f5ff" text-anchor="middle">Native x64</text>
+
+      <!-- LAYER 02: RDNA2 -> SPIR-V 1.6 -->
+      <g class="layer d2">
+        <path d="M18 190 L180 222 L180 232 L18 200 Z" fill="#3b1026" stroke="#f0426d" stroke-opacity=".45" stroke-width="1"/>
+        <path d="M180 222 L358 182 L358 192 L180 232 Z" fill="#25133b" stroke="#a86eff" stroke-opacity=".4" stroke-width="1"/>
+        <path d="M18 190 L196 150 L358 182 L180 222 Z" fill="url(#l2Fill)" stroke="url(#l2Edge)" stroke-width="1.6"/>
+        <!-- Shader pipeline nodes on face -->
+        <g fill="#ff6b93" fill-opacity=".7">
+          <circle cx="122" cy="188" r="3"/>
+          <circle cx="188" cy="186" r="3.5"/>
+          <circle cx="254" cy="184" r="3"/>
+        </g>
+        <path d="M122 188 L188 186 L254 184" fill="none" stroke="#ff7a9e" stroke-opacity=".6" stroke-width="1.5"/>
+        <line x1="358" y1="182" x2="386" y2="182" stroke="#f0426d" stroke-opacity=".75" stroke-width="1.2"/>
+        <circle cx="358" cy="182" r="3" fill="#ff5783"/>
+        <text x="394" y="178" class="mono" font-size="11.5" font-weight="700" fill="#ff85a3">02  RDNA2 → SPV</text>
+        <text x="394" y="193" class="mono" font-size="9.5" fill="#b88496">SSA OPT · WAVE64-ON-32</text>
       </g>
+
+      <!-- LAYER 01 (Top surface): NATIVE x86-64 HLE -->
+      <g class="layer">
+        <path d="M18 132 L180 164 L180 174 L18 142 Z" fill="#471810" stroke="#ff6b3d" stroke-opacity=".5" stroke-width="1"/>
+        <path d="M180 164 L358 124 L358 134 L180 174 Z" fill="#3a1220" stroke="#ff4d6d" stroke-opacity=".45" stroke-width="1"/>
+        <path d="M18 132 L196 92 L358 124 L180 164 Z" fill="url(#l1Fill)" stroke="url(#l1Edge)" stroke-width="1.8" filter="url(#glowSoft)"/>
+        <!-- Central CPU die core outline etched on top layer -->
+        <path d="M132 128 L188 115 L242 126 L186 139 Z" fill="#ff6b3d" fill-opacity=".2" stroke="#ff9a76" stroke-opacity=".8" stroke-width="1.2"/>
+        <line x1="358" y1="124" x2="386" y2="124" stroke="#ff6b3d" stroke-opacity=".8" stroke-width="1.2"/>
+        <circle cx="358" cy="124" r="3" fill="#ff8a5c"/>
+        <text x="394" y="120" class="mono" font-size="11.5" font-weight="700" fill="#ff9e7a">01  NATIVE x64</text>
+        <text x="394" y="135" class="mono" font-size="9.5" fill="#b89384">PE32+ · ZEN 2 VEH · HLE</text>
+      </g>
+    </g>
+
+    <!-- Bottom HUD footer bar -->
+    <g class="mono" font-size="10.5" letter-spacing="1.4" fill="#647899">
+      <text x="48" y="379">CLEAN-ROOM IMPLEMENTATION  //  MIT OR APACHE-2.0  //  WINDOWS 10 / 11 x64</text>
+      <text x="1232" y="379" text-anchor="end" fill="#7c96bd">ARCHITECTURE STACK  [ 04 ACTIVE STRATA ]</text>
     </g>
   </g>
-  <rect x="1" y="1" width="1278" height="378" rx="27" fill="none" stroke="#fff" stroke-opacity=".14" stroke-width="2"/>
+
+  <!-- Crisp outer technical frame -->
+  <rect x="1" y="1" width="1278" height="398" rx="19" fill="none" stroke="#ffffff" stroke-opacity=".12" stroke-width="1.5"/>
 </svg>
