@@ -288,9 +288,9 @@ mod tests {
     }
 
     #[test]
-    fn a_break_out_of_a_loop_body_is_rejected() {
+    fn a_break_out_of_a_loop_body_compiles_and_validates_spirv() {
         use rdna2::encode::*;
-        // L: s_cbranch_scc1 EXIT(past the back edge) ; v_nop-ish ; s_cbranch_execnz L ; EXIT:
+        // L: s_cbranch_scc1 EXIT(past the back edge) ; s_cbranch_execnz L ; EXIT:
         let prog = vec![
             s_cmp_lt_u32(4, 132),
             v_add_nc_u32_imm(1, 1, 1), // pc 1: header
@@ -298,12 +298,9 @@ mod tests {
             s_cbranch_execnz(-3),      // pc 3: back to pc 1
             s_endpgm(),                // pc 4
         ];
-        assert!(matches!(
-            compile_rdna2_to_spirv(&prog, [64, 1, 1]),
-            Err(CompileError::Lower(
-                ssa::LowerError::UnsupportedBranch { .. }
-            ))
-        ));
+        let compiled = compile_rdna2_to_spirv(&prog, [64, 1, 1])
+            .expect("mid-body loop break should lower to structured SPIR-V");
+        assert_spirv_valid(&compiled.spirv, "loop_body_break");
     }
 
     #[test]
@@ -416,5 +413,70 @@ mod tests {
         )
         .expect("PS with FragCoord + FrontFacing should compile");
         assert_spirv_valid(&compiled.spirv, "ps_frag_coord_front_facing");
+    }
+
+    #[test]
+    fn scratch_spill_load_store_compiles_and_validates_spirv() {
+        use rdna2::encode::*;
+        let mut prog = Vec::new();
+        prog.push(v_add_nc_u32_imm(1, 7, 0)); // v1 = v0 + 7
+        prog.extend_from_slice(&scratch_store_dword(1, 0)); // spill v1 -> slot 0
+        prog.extend_from_slice(&scratch_load_dword(2, 0)); // reload slot 0 -> v2
+        prog.push(v_lshlrev_b32_imm(3, 2, 0)); // v3 = v0 << 2
+        prog.extend_from_slice(&global_store_dword(3, 2, 0, 0));
+        prog.push(s_endpgm());
+
+        let compiled = compile_rdna2_to_spirv(&prog, [64, 1, 1]).expect("scratch spill compile");
+        assert_spirv_valid(&compiled.spirv, "scratch_spill");
+    }
+
+    #[test]
+    fn mid_body_loop_break_compiles_and_validates_spirv() {
+        use rdna2::encode::*;
+        // Do-while loop with a mid-body conditional break past the latch:
+        // pc 0: s_movk_i32 s4, 0
+        // pc 1: s_addk_i32 s4, 1          <-- loop header
+        // pc 2: s_cmp_eq_u32 s4, 3
+        // pc 3: s_cbranch_scc1 +2         <-- mid-body break to pc 6 (past latch pc 5)
+        // pc 4: s_cmp_lt_u32 s4, 10
+        // pc 5: s_cbranch_scc1 -5         <-- back edge to pc 1
+        // pc 6: s_endpgm
+        let mut prog = Vec::new();
+        prog.push(s_movk_i32(4, 0));
+        prog.push(s_addk_i32(4, 1));
+        prog.push(s_cmp_eq_u32(4, 128 + 3));
+        prog.push(s_cbranch_scc1(2));
+        prog.push(s_cmp_lt_u32(4, 128 + 10));
+        prog.push(s_cbranch_scc1(-5));
+        prog.push(s_endpgm());
+
+        let compiled = compile_rdna2_to_spirv(&prog, [64, 1, 1]).expect("mid-body break compile");
+        assert_spirv_valid(&compiled.spirv, "mid_body_break");
+    }
+
+    #[test]
+    fn irreducible_cfg_lowers_via_structurizer_state_machine_and_validates_spirv() {
+        use rdna2::encode::*;
+        // Two back edges to the same header (pc 1), which `find_loops` rejects and
+        // hands off to `structurizer` + `build_ssa_state_machine`:
+        // pc 0: s_movk_i32 s4, 0
+        // pc 1: s_addk_i32 s4, 1
+        // pc 2: s_cmp_eq_u32 s4, 1
+        // pc 3: s_cbranch_scc1 -3         <-- back edge 1 -> pc 1
+        // pc 4: s_cmp_lt_u32 s4, 4
+        // pc 5: s_cbranch_scc1 -5         <-- back edge 2 -> pc 1
+        // pc 6: s_endpgm
+        let mut prog = Vec::new();
+        prog.push(s_movk_i32(4, 0));
+        prog.push(s_addk_i32(4, 1));
+        prog.push(s_cmp_eq_u32(4, 128 + 1));
+        prog.push(s_cbranch_scc1(-3));
+        prog.push(s_cmp_lt_u32(4, 128 + 4));
+        prog.push(s_cbranch_scc1(-5));
+        prog.push(s_endpgm());
+
+        let compiled =
+            compile_rdna2_to_spirv(&prog, [64, 1, 1]).expect("irreducible state-machine compile");
+        assert_spirv_valid(&compiled.spirv, "irreducible_state_machine");
     }
 }

@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use crate::rdna2::{CmpOp, CmpType};
+use crate::rdna2::{AtomicOp, CmpOp, CmpType};
 use crate::ssa::{ExportTarget, SsaModule, SsaOp, Stage, StageInput, Terminator, Ty, ValueId};
 
 // SPIR-V header constants
@@ -57,8 +57,12 @@ const OP_COMPOSITE_EXTRACT: u16 = 81;
 const OP_SAMPLED_IMAGE: u16 = 86;
 const OP_IMAGE_SAMPLE_IMPLICIT_LOD: u16 = 87;
 const OP_IMAGE_SAMPLE_EXPLICIT_LOD: u16 = 88;
+const OP_IMAGE_SAMPLE_DREF_IMPLICIT_LOD: u16 = 89;
+const OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD: u16 = 90;
 const OP_IMAGE_FETCH: u16 = 95;
+const OP_IMAGE_GATHER: u16 = 96;
 const OP_IMAGE_WRITE: u16 = 99;
+const OP_IMAGE_QUERY_SIZE_LOD: u16 = 103;
 
 const OP_CONVERT_F_TO_U: u16 = 109;
 const OP_CONVERT_F_TO_S: u16 = 110;
@@ -110,28 +114,41 @@ const OP_BIT_FIELD_S_EXTRACT: u16 = 202;
 const OP_BIT_FIELD_U_EXTRACT: u16 = 203;
 
 const OP_CONTROL_BARRIER: u16 = 224;
+const OP_ATOMIC_EXCHANGE: u16 = 229;
+const OP_ATOMIC_COMPARE_EXCHANGE: u16 = 230;
 const OP_ATOMIC_I_ADD: u16 = 234;
+const OP_ATOMIC_I_SUB: u16 = 235;
+const OP_ATOMIC_S_MIN: u16 = 236;
+const OP_ATOMIC_U_MIN: u16 = 237;
+const OP_ATOMIC_S_MAX: u16 = 238;
+const OP_ATOMIC_U_MAX: u16 = 239;
+const OP_ATOMIC_AND: u16 = 240;
 const OP_ATOMIC_OR: u16 = 241;
+const OP_ATOMIC_XOR: u16 = 242;
 const OP_PHI: u16 = 245;
 const OP_LOOP_MERGE: u16 = 246;
 const OP_SELECTION_MERGE: u16 = 247;
 const OP_LABEL: u16 = 248;
 const OP_BRANCH: u16 = 249;
 const OP_BRANCH_CONDITIONAL: u16 = 250;
+const OP_SWITCH: u16 = 251;
 const OP_RETURN: u16 = 253;
 
 const OP_GROUP_NON_UNIFORM_ANY: u16 = 335;
 const OP_GROUP_NON_UNIFORM_BROADCAST_FIRST: u16 = 338;
 const OP_GROUP_NON_UNIFORM_BALLOT: u16 = 339;
+const OP_GROUP_NON_UNIFORM_SHUFFLE: u16 = 345;
 const OP_GROUP_NON_UNIFORM_QUAD_BROADCAST: u16 = 365;
 const OP_GROUP_NON_UNIFORM_QUAD_SWAP: u16 = 366;
 
 // Capabilities
 const CAP_SHADER: u32 = 1;
 const CAP_INT64: u32 = 11;
+const CAP_IMAGE_QUERY: u32 = 50;
 const CAP_GROUP_NON_UNIFORM: u32 = 61;
 const CAP_GROUP_NON_UNIFORM_VOTE: u32 = 62;
 const CAP_GROUP_NON_UNIFORM_BALLOT: u32 = 64;
+const CAP_GROUP_NON_UNIFORM_SHUFFLE: u32 = 65;
 const CAP_GROUP_NON_UNIFORM_QUAD: u32 = 68;
 const CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES: u32 = 5347;
 const CAP_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT: u32 = 56;
@@ -142,6 +159,7 @@ const SC_UNIFORM_CONSTANT: u32 = 0;
 const SC_INPUT: u32 = 1;
 const SC_OUTPUT: u32 = 3;
 const SC_WORKGROUP: u32 = 4;
+const SC_FUNCTION: u32 = 7;
 const SC_PUSH_CONSTANT: u32 = 9;
 const SC_PHYSICAL_STORAGE_BUFFER: u32 = 5349;
 
@@ -203,7 +221,9 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     w.inst(OP_CAPABILITY, &[CAP_GROUP_NON_UNIFORM]);
     w.inst(OP_CAPABILITY, &[CAP_GROUP_NON_UNIFORM_VOTE]);
     w.inst(OP_CAPABILITY, &[CAP_GROUP_NON_UNIFORM_BALLOT]);
+    w.inst(OP_CAPABILITY, &[CAP_GROUP_NON_UNIFORM_SHUFFLE]);
     w.inst(OP_CAPABILITY, &[CAP_GROUP_NON_UNIFORM_QUAD]);
+    w.inst(OP_CAPABILITY, &[CAP_IMAGE_QUERY]);
     w.inst(OP_CAPABILITY, &[CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES]);
     let uses_textures = module.texture_slots > 0;
     let uses_storage = module.storage_slots > 0;
@@ -380,6 +400,13 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     let t_lds_arr = w.id();
     let t_ptr_wg_lds_arr = w.id();
 
+    let uses_spill = module.spill_dwords > 0;
+    let c_spill_len = uses_spill.then(|| w.id());
+    let t_spill_arr = uses_spill.then(|| w.id());
+    let t_ptr_func_spill_arr = uses_spill.then(|| w.id());
+    let t_ptr_func_u32 = uses_spill.then(|| w.id());
+    let spill_var = uses_spill.then(|| w.id());
+
     // PhysicalStorageBuffer pointer types (scalar u32 & 128-bit uvec4)
     let t_bda_u32_struct = w.id();
     let t_bda_u32_ptr = w.id();
@@ -503,6 +530,17 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
         OP_TYPE_POINTER,
         &[t_ptr_wg_lds_arr, SC_WORKGROUP, t_lds_arr],
     );
+
+    if uses_spill {
+        let c_len = c_spill_len.unwrap();
+        let t_arr = t_spill_arr.unwrap();
+        let t_ptr_arr = t_ptr_func_spill_arr.unwrap();
+        let t_ptr_el = t_ptr_func_u32.unwrap();
+        w.inst(OP_CONSTANT, &[t_u32, c_len, module.spill_dwords.max(1)]);
+        w.inst(OP_TYPE_ARRAY, &[t_arr, t_u32, c_len]);
+        w.inst(OP_TYPE_POINTER, &[t_ptr_arr, SC_FUNCTION, t_arr]);
+        w.inst(OP_TYPE_POINTER, &[t_ptr_el, SC_FUNCTION, t_u32]);
+    }
 
     w.inst(OP_TYPE_STRUCT, &[t_bda_u32_struct, t_u32]);
     w.inst(
@@ -635,6 +673,13 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                         id
                     });
                 }
+                SsaOp::SpillLoad { slot } | SsaOp::SpillStore { slot, .. } => {
+                    const_u32.entry(*slot).or_insert_with(|| {
+                        let id = w.id();
+                        w.inst(OP_CONSTANT, &[t_u32, id, *slot]);
+                        id
+                    });
+                }
                 SsaOp::BdaLoad { byte_offset, .. } | SsaOp::BdaStore { byte_offset, .. } => {
                     if *byte_offset != 0 {
                         let off = *byte_offset as u64;
@@ -649,6 +694,8 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                     needs_bvh_offsets = true;
                 }
                 SsaOp::ImageSample { slot, .. }
+                | SsaOp::ImageSampleDref { slot, .. }
+                | SsaOp::ImageQuerySize { slot, .. }
                 | SsaOp::ImageFetch { slot, .. }
                 | SsaOp::ImageStore { slot, .. } => {
                     const_u32.entry(*slot).or_insert_with(|| {
@@ -656,6 +703,15 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                         w.inst(OP_CONSTANT, &[t_u32, id, *slot]);
                         id
                     });
+                }
+                SsaOp::ImageGather { slot, comp, .. } => {
+                    for &k in &[*slot, *comp] {
+                        const_u32.entry(k).or_insert_with(|| {
+                            let id = w.id();
+                            w.inst(OP_CONSTANT, &[t_u32, id, k]);
+                            id
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -731,6 +787,14 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     for bi in block_order(module) {
         let block = &module.blocks[bi];
         w.inst(OP_LABEL, &[block_labels[bi]]);
+
+        // SPIR-V requires Function-storage-class OpVariable declarations at the very
+        // start of the entry block (before any other instructions).
+        if bi == 0 {
+            if let (Some(sv), Some(t_ptr_arr)) = (spill_var, t_ptr_func_spill_arr) {
+                w.inst(OP_VARIABLE, &[t_ptr_arr, sv, SC_FUNCTION]);
+            }
+        }
 
         // SPIR-V requires all OpPhi instructions at the very start of the block.
         for inst in &block.insts {
@@ -1310,6 +1374,137 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                     w.inst(OP_BITCAST, &[t_uvec4, res, texel]);
                     val_map.insert(inst.id, res);
                 }
+                SsaOp::ImageSampleDref {
+                    slot,
+                    u,
+                    v,
+                    dref,
+                    lod,
+                    implicit,
+                } => {
+                    let pi = w.id();
+                    w.inst(
+                        OP_ACCESS_CHAIN,
+                        &[t_ptr_img, pi, tex_var.unwrap(), const_u32[slot]],
+                    );
+                    let img = w.id();
+                    w.inst(OP_LOAD, &[t_img, img, pi]);
+                    let ps = w.id();
+                    w.inst(
+                        OP_ACCESS_CHAIN,
+                        &[t_ptr_sampler, ps, samp_var.unwrap(), const_u32[slot]],
+                    );
+                    let smp = w.id();
+                    w.inst(OP_LOAD, &[t_sampler, smp, ps]);
+                    let si = w.id();
+                    w.inst(OP_SAMPLED_IMAGE, &[t_sampled, si, img, smp]);
+                    let uv = w.id();
+                    w.inst(OP_COMPOSITE_CONSTRUCT, &[t_v2f, uv, val_map[u], val_map[v]]);
+                    let res = w.id();
+                    if *implicit {
+                        w.inst(
+                            OP_IMAGE_SAMPLE_DREF_IMPLICIT_LOD,
+                            &[t_f32, res, si, uv, val_map[dref]],
+                        );
+                    } else {
+                        let lod_id = lod.map_or(c_fzero, |l| val_map[&l]);
+                        w.inst(
+                            OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD,
+                            &[t_f32, res, si, uv, val_map[dref], IMG_OP_LOD, lod_id],
+                        );
+                    }
+                    val_map.insert(inst.id, res);
+                }
+                SsaOp::ImageGather { slot, u, v, comp } => {
+                    let pi = w.id();
+                    w.inst(
+                        OP_ACCESS_CHAIN,
+                        &[t_ptr_img, pi, tex_var.unwrap(), const_u32[slot]],
+                    );
+                    let img = w.id();
+                    w.inst(OP_LOAD, &[t_img, img, pi]);
+                    let ps = w.id();
+                    w.inst(
+                        OP_ACCESS_CHAIN,
+                        &[t_ptr_sampler, ps, samp_var.unwrap(), const_u32[slot]],
+                    );
+                    let smp = w.id();
+                    w.inst(OP_LOAD, &[t_sampler, smp, ps]);
+                    let si = w.id();
+                    w.inst(OP_SAMPLED_IMAGE, &[t_sampled, si, img, smp]);
+                    let uv = w.id();
+                    w.inst(OP_COMPOSITE_CONSTRUCT, &[t_v2f, uv, val_map[u], val_map[v]]);
+                    let texel = w.id();
+                    w.inst(OP_IMAGE_GATHER, &[t_v4f, texel, si, uv, const_u32[comp]]);
+                    let res = w.id();
+                    w.inst(OP_BITCAST, &[t_uvec4, res, texel]);
+                    val_map.insert(inst.id, res);
+                }
+                SsaOp::ImageQuerySize { slot, lod } => {
+                    let pi = w.id();
+                    w.inst(
+                        OP_ACCESS_CHAIN,
+                        &[t_ptr_img, pi, tex_var.unwrap(), const_u32[slot]],
+                    );
+                    let img = w.id();
+                    w.inst(OP_LOAD, &[t_img, img, pi]);
+                    let sz2 = w.id();
+                    w.inst(OP_IMAGE_QUERY_SIZE_LOD, &[t_uv2, sz2, img, val_map[lod]]);
+                    let sx = w.id();
+                    let sy = w.id();
+                    w.inst(OP_COMPOSITE_EXTRACT, &[t_u32, sx, sz2, 0]);
+                    w.inst(OP_COMPOSITE_EXTRACT, &[t_u32, sy, sz2, 1]);
+                    let res = w.id();
+                    w.inst(
+                        OP_COMPOSITE_CONSTRUCT,
+                        &[t_uvec4, res, sx, sy, c_one, c_one],
+                    );
+                    val_map.insert(inst.id, res);
+                }
+                SsaOp::BdaAtomic { op, addr, val, cmp } => {
+                    let ptr_struct = w.id();
+                    w.inst(OP_CONVERT_U_TO_PTR, &[t_bda_u32_ptr, ptr_struct, val_map[addr]]);
+                    let ptr_field = w.id();
+                    w.inst(
+                        OP_ACCESS_CHAIN,
+                        &[t_bda_u32_field_ptr, ptr_field, ptr_struct, c_zero],
+                    );
+                    let res = w.id();
+                    if *op == AtomicOp::CmpSwap {
+                        let cmp_id = cmp.map_or(c_zero, |c| val_map[&c]);
+                        w.inst(
+                            OP_ATOMIC_COMPARE_EXCHANGE,
+                            &[t_u32, res, ptr_field, c_one, c_zero, c_zero, val_map[val], cmp_id],
+                        );
+                    } else {
+                        let spv_op = match op {
+                            AtomicOp::Swap => OP_ATOMIC_EXCHANGE,
+                            AtomicOp::Add => OP_ATOMIC_I_ADD,
+                            AtomicOp::Sub => OP_ATOMIC_I_SUB,
+                            AtomicOp::SMin => OP_ATOMIC_S_MIN,
+                            AtomicOp::UMin => OP_ATOMIC_U_MIN,
+                            AtomicOp::SMax => OP_ATOMIC_S_MAX,
+                            AtomicOp::UMax => OP_ATOMIC_U_MAX,
+                            AtomicOp::And => OP_ATOMIC_AND,
+                            AtomicOp::Or => OP_ATOMIC_OR,
+                            AtomicOp::Xor => OP_ATOMIC_XOR,
+                            AtomicOp::CmpSwap => unreachable!(),
+                        };
+                        w.inst(
+                            spv_op,
+                            &[t_u32, res, ptr_field, c_one, c_zero, val_map[val]],
+                        );
+                    }
+                    val_map.insert(inst.id, res);
+                }
+                SsaOp::WaveShuffle { val, lane } => {
+                    let res = w.id();
+                    w.inst(
+                        OP_GROUP_NON_UNIFORM_SHUFFLE,
+                        &[t_u32, res, c_scope_subgroup, val_map[val], val_map[lane]],
+                    );
+                    val_map.insert(inst.id, res);
+                }
                 SsaOp::ImageFetch { slot, x, y, lod } => {
                     let pi = w.id();
                     w.inst(
@@ -1629,26 +1824,43 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                     );
                     val_map.insert(inst.id, res);
                 }
+                SsaOp::SpillLoad { slot } => {
+                    let sv = spill_var.expect("spill_var must exist for SpillLoad");
+                    let t_ptr_el = t_ptr_func_u32.expect("t_ptr_func_u32");
+                    let ptr = w.id();
+                    w.inst(OP_ACCESS_CHAIN, &[t_ptr_el, ptr, sv, const_u32[slot]]);
+                    let res = w.id();
+                    w.inst(OP_LOAD, &[t_u32, res, ptr]);
+                    val_map.insert(inst.id, res);
+                }
+                SsaOp::SpillStore { slot, val } => {
+                    let sv = spill_var.expect("spill_var must exist for SpillStore");
+                    let t_ptr_el = t_ptr_func_u32.expect("t_ptr_func_u32");
+                    let ptr = w.id();
+                    w.inst(OP_ACCESS_CHAIN, &[t_ptr_el, ptr, sv, const_u32[slot]]);
+                    w.inst(OP_STORE, &[ptr, val_map[val]]);
+                    val_map.insert(inst.id, c_zero);
+                }
             }
         }
 
         // Emit block terminator
-        match block.term {
+        match &block.term {
             Terminator::Return => w.inst(OP_RETURN, &[]),
-            Terminator::Branch(target) => w.inst(OP_BRANCH, &[block_labels[target]]),
+            Terminator::Branch(target) => w.inst(OP_BRANCH, &[block_labels[*target]]),
             Terminator::BranchCond {
                 cond,
                 true_block,
                 false_block,
                 merge_block,
             } => {
-                w.inst(OP_SELECTION_MERGE, &[block_labels[merge_block], 0]);
+                w.inst(OP_SELECTION_MERGE, &[block_labels[*merge_block], 0]);
                 w.inst(
                     OP_BRANCH_CONDITIONAL,
                     &[
-                        val_map[&cond],
-                        block_labels[true_block],
-                        block_labels[false_block],
+                        val_map[cond],
+                        block_labels[*true_block],
+                        block_labels[*false_block],
                     ],
                 );
             }
@@ -1660,23 +1872,39 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
             } => {
                 w.inst(
                     OP_LOOP_MERGE,
-                    &[block_labels[merge], block_labels[continue_block], 0],
+                    &[block_labels[*merge], block_labels[*continue_block], 0],
                 );
                 match cond {
                     Some(c) => w.inst(
                         OP_BRANCH_CONDITIONAL,
-                        &[val_map[&c], block_labels[body], block_labels[merge]],
+                        &[val_map[c], block_labels[*body], block_labels[*merge]],
                     ),
-                    None => w.inst(OP_BRANCH, &[block_labels[body]]),
+                    None => w.inst(OP_BRANCH, &[block_labels[*body]]),
                 }
             }
             Terminator::BackEdge { cond, header, exit } => match cond {
                 Some(c) => w.inst(
                     OP_BRANCH_CONDITIONAL,
-                    &[val_map[&c], block_labels[header], block_labels[exit]],
+                    &[val_map[c], block_labels[*header], block_labels[*exit]],
                 ),
-                None => w.inst(OP_BRANCH, &[block_labels[header]]),
+                None => w.inst(OP_BRANCH, &[block_labels[*header]]),
             },
+            Terminator::Switch {
+                selector,
+                default,
+                targets,
+                merge_block,
+            } => {
+                w.inst(OP_SELECTION_MERGE, &[block_labels[*merge_block], 0]);
+                let mut ops = Vec::with_capacity(2 + targets.len() * 2);
+                ops.push(val_map[selector]);
+                ops.push(block_labels[*default]);
+                for &(lit, target_blk) in targets {
+                    ops.push(lit);
+                    ops.push(block_labels[target_blk]);
+                }
+                w.inst(OP_SWITCH, &ops);
+            }
         }
     }
 

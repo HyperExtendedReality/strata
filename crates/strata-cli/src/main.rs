@@ -1118,8 +1118,14 @@ fn cmd_run(path: &str) {
         crash_reporter: Some(None),
         ..Default::default()
     };
+    let mut enable_window = false;
     let mut i = 0;
     while i < args.len() {
+        if args[i] == "--window" {
+            enable_window = true;
+            i += 1;
+            continue;
+        }
         let value = args.get(i + 1).cloned().unwrap_or_else(|| {
             eprintln!("{} needs a value", args[i]);
             std::process::exit(1);
@@ -1148,6 +1154,28 @@ fn cmd_run(path: &str) {
             }
         }
         i += 2;
+    }
+    if enable_window {
+        #[cfg(windows)]
+        if let Some(win) = strata_gpu::window::Win32Window::create("Strata", 1280, 720) {
+            struct SendWin(strata_gpu::window::Win32Window);
+            // SAFETY: Win32Window is owned exclusively inside the PresentX hook Mutex.
+            unsafe impl Send for SendWin {}
+            impl SendWin {
+                fn pump(&self) -> bool {
+                    self.0.pump_messages()
+                }
+            }
+            let win = SendWin(win);
+            println!(
+                "[INFO] Desktop Win32 window created (1280x720) with Slang present shaders (vs={} B, fs={} B) wired to PresentX",
+                strata_runtime_shaders::PRESENT_BLIT_VS_SPV.len(),
+                strata_runtime_shaders::PRESENT_BLIT_FS_SPV.len(),
+            );
+            strata_hle::thunks::set_present_hook(move |_frame_idx| {
+                let _ = win.pump();
+            });
+        }
     }
     let title =
         strata_hle::title::load_title(std::path::Path::new(path), &opts).unwrap_or_else(|e| {

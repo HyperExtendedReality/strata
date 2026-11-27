@@ -52,11 +52,7 @@ pub fn classify_dll(dll_name: &str) -> DllClass {
             DllClass::HostPassthrough
         }
 
-        s if s.contains("bvh")
-            || s.contains("fidelityfx")
-            || s.contains("bink")
-            || s.contains("chad") =>
-        {
+        s if s.contains("bvh") || s.contains("fidelityfx") || s.contains("bink") => {
             DllClass::TitleLocal
         }
 

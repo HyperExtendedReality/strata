@@ -294,8 +294,10 @@ fn has_side_effect(op: &SsaOp) -> bool {
     matches!(
         op,
         SsaOp::BdaStore { .. }
+            | SsaOp::BdaAtomic { .. }
             | SsaOp::LdsStoreU32 { .. }
             | SsaOp::LdsAtomicAddU32 { .. }
+            | SsaOp::SpillStore { .. }
             | SsaOp::ImageStore { .. }
             | SsaOp::Export { .. }
             | SsaOp::WorkgroupBarrier
@@ -319,6 +321,7 @@ fn rewrite_operands(op: &mut SsaOp, repl: &HashMap<ValueId, ValueId>) {
         | SsaOp::PushConstSgpr(_)
         | SsaOp::ThreadIdX
         | SsaOp::StageInput(_)
+        | SsaOp::SpillLoad { .. }
         | SsaOp::WorkgroupBarrier => {}
         SsaOp::Phi { incoming } => {
             for (_, v) in incoming {
@@ -347,6 +350,7 @@ fn rewrite_operands(op: &mut SsaOp, repl: &HashMap<ValueId, ValueId>) {
         | SsaOp::QuadSwap { val: a, .. }
         | SsaOp::QuadBroadcast { val: a, .. }
         | SsaOp::LdsLoadU32 { byte_addr: a }
+        | SsaOp::SpillStore { val: a, .. }
         | SsaOp::ExtractLane(a, _)
         | SsaOp::HalfToF32(a)
         | SsaOp::RoundEvenF32(a)
@@ -359,6 +363,21 @@ fn rewrite_operands(op: &mut SsaOp, repl: &HashMap<ValueId, ValueId>) {
             lod.iter_mut().for_each(&f);
             bias.iter_mut().for_each(&f);
         }
+        SsaOp::ImageSampleDref {
+            u, v, dref, lod, ..
+        } => {
+            f(u);
+            f(v);
+            f(dref);
+            lod.iter_mut().for_each(&f);
+        }
+        SsaOp::ImageGather { u, v, .. } => {
+            f(u);
+            f(v);
+        }
+        SsaOp::ImageQuerySize { lod, .. } => {
+            f(lod);
+        }
         SsaOp::ImageFetch { x, y, lod, .. } => {
             f(x);
             f(y);
@@ -368,6 +387,17 @@ fn rewrite_operands(op: &mut SsaOp, repl: &HashMap<ValueId, ValueId>) {
             f(x);
             f(y);
             values.iter_mut().for_each(&f);
+        }
+        SsaOp::BdaAtomic {
+            addr, val, cmp, ..
+        } => {
+            f(addr);
+            f(val);
+            cmp.iter_mut().for_each(&f);
+        }
+        SsaOp::WaveShuffle { val, lane } => {
+            f(val);
+            f(lane);
         }
         SsaOp::Export { values, .. } => values.iter_mut().for_each(&f),
         SsaOp::PackU64 { lo: a, hi: b }
@@ -460,6 +490,7 @@ fn for_each_operand(op: &SsaOp, mut f: impl FnMut(ValueId)) {
         | SsaOp::PushConstSgpr(_)
         | SsaOp::ThreadIdX
         | SsaOp::StageInput(_)
+        | SsaOp::SpillLoad { .. }
         | SsaOp::WorkgroupBarrier => {}
         SsaOp::Phi { incoming } => {
             for &(_, v) in incoming {
@@ -488,6 +519,7 @@ fn for_each_operand(op: &SsaOp, mut f: impl FnMut(ValueId)) {
         | SsaOp::QuadSwap { val: a, .. }
         | SsaOp::QuadBroadcast { val: a, .. }
         | SsaOp::LdsLoadU32 { byte_addr: a }
+        | SsaOp::SpillStore { val: a, .. }
         | SsaOp::ExtractLane(a, _)
         | SsaOp::HalfToF32(a)
         | SsaOp::RoundEvenF32(a)
@@ -499,6 +531,21 @@ fn for_each_operand(op: &SsaOp, mut f: impl FnMut(ValueId)) {
             f(*v);
             lod.iter().chain(bias.iter()).for_each(|&x| f(x));
         }
+        SsaOp::ImageSampleDref {
+            u, v, dref, lod, ..
+        } => {
+            f(*u);
+            f(*v);
+            f(*dref);
+            lod.iter().for_each(|&x| f(x));
+        }
+        SsaOp::ImageGather { u, v, .. } => {
+            f(*u);
+            f(*v);
+        }
+        SsaOp::ImageQuerySize { lod, .. } => {
+            f(*lod);
+        }
         SsaOp::ImageFetch { x, y, lod, .. } => {
             f(*x);
             f(*y);
@@ -508,6 +555,17 @@ fn for_each_operand(op: &SsaOp, mut f: impl FnMut(ValueId)) {
             f(*x);
             f(*y);
             values.iter().for_each(|&v| f(v));
+        }
+        SsaOp::BdaAtomic {
+            addr, val, cmp, ..
+        } => {
+            f(*addr);
+            f(*val);
+            cmp.iter().for_each(|&c| f(c));
+        }
+        SsaOp::WaveShuffle { val, lane } => {
+            f(*val);
+            f(*lane);
         }
         SsaOp::Export { values, .. } => values.iter().for_each(|&v| f(v)),
         SsaOp::PackU64 { lo: a, hi: b }

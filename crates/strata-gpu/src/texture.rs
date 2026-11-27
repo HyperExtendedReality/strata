@@ -85,13 +85,68 @@ fn swizzle(s: Select) -> vk::ComponentSwizzle {
     }
 }
 
+/// Extended Vulkan format lookup supporting BCn compressed and Depth/Stencil formats.
+pub fn vk_format_extended(dfmt: u16) -> Option<vk::Format> {
+    use vk::Format as F;
+    // GFX10 BCn compressed & depth/stencil IMG_DATA_FORMAT codes
+    match dfmt {
+        35 => Some(F::BC1_RGBA_UNORM_BLOCK),
+        36 => Some(F::BC2_UNORM_BLOCK),
+        37 => Some(F::BC3_UNORM_BLOCK),
+        38 => Some(F::BC4_UNORM_BLOCK),
+        39 => Some(F::BC5_UNORM_BLOCK),
+        40 => Some(F::BC6H_UFLOAT_BLOCK),
+        41 => Some(F::BC7_UNORM_BLOCK),
+        42 => Some(F::D16_UNORM),
+        43 => Some(F::D32_SFLOAT),
+        44 => Some(F::D24_UNORM_S8_UINT),
+        45 => Some(F::D32_SFLOAT_S8_UINT),
+        _ => gfx10_format(dfmt).and_then(|info| vk_format(&info)),
+    }
+}
+
+/// Returns `true` if `fmt` is a 4×4 BCn block-compressed format.
+pub fn is_block_compressed(fmt: vk::Format) -> bool {
+    matches!(
+        fmt,
+        vk::Format::BC1_RGBA_UNORM_BLOCK
+            | vk::Format::BC2_UNORM_BLOCK
+            | vk::Format::BC3_UNORM_BLOCK
+            | vk::Format::BC4_UNORM_BLOCK
+            | vk::Format::BC5_UNORM_BLOCK
+            | vk::Format::BC6H_UFLOAT_BLOCK
+            | vk::Format::BC7_UNORM_BLOCK
+    )
+}
+
+/// Byte size of a single 4×4 BCn block (8 for BC1/BC4, 16 for BC2/BC3/BC5/BC6H/BC7).
+pub fn bcn_block_bytes(fmt: vk::Format) -> usize {
+    match fmt {
+        vk::Format::BC1_RGBA_UNORM_BLOCK | vk::Format::BC4_UNORM_BLOCK => 8,
+        _ => 16,
+    }
+}
+
+/// Returns `true` if `fmt` is a depth or depth/stencil attachment format.
+pub fn is_depth_stencil(fmt: vk::Format) -> bool {
+    matches!(
+        fmt,
+        vk::Format::D16_UNORM
+            | vk::Format::D32_SFLOAT
+            | vk::Format::D24_UNORM_S8_UINT
+            | vk::Format::D32_SFLOAT_S8_UINT
+    )
+}
+
 /// How texels sit in title memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tiling {
     /// Rows of `pitch` bytes.
     Linear { pitch: usize },
-    /// Strata's 8×8 Morton micro-tiles (see the module docs).
+    /// Strata's 8×8 Morton micro-tiles (`4KB_S`, `4KB_D`, `64KB_S`, `64KB_D`).
     Morton,
+    /// GFX10 bank-XOR 64KB swizzle modes (`64KB_S_X` = 25, `64KB_D_X` = 26, `64KB_R_X` = 27).
+    MortonXor { mode: u8 },
 }
 
 /// The tiling and byte footprint of level 0 of `d`.
@@ -102,9 +157,11 @@ pub fn source_layout(d: &ImageDescriptor, bpp: usize) -> Result<(Tiling, usize),
             let pitch = (w * bpp).next_multiple_of(256);
             Ok((Tiling::Linear { pitch }, pitch * h))
         }
-        5 | 6 | 9 | 10 | 25 | 26 | 27 => {
-            Ok((Tiling::Morton, w.div_ceil(8) * h.div_ceil(8) * 64 * bpp))
-        }
+        5 | 6 | 9 | 10 => Ok((Tiling::Morton, w.div_ceil(8) * h.div_ceil(8) * 64 * bpp)),
+        m @ (25 | 26 | 27) => Ok((
+            Tiling::MortonXor { mode: m },
+            w.div_ceil(8) * h.div_ceil(8) * 64 * bpp,
+        )),
         m => Err(TextureError::SwizzleMode(m)),
     }
 }
@@ -153,6 +210,25 @@ fn morton_offset(x: usize, y: usize, width: usize, bpp: usize) -> usize {
     ((((y >> 3) * tiles_per_row + (x >> 3)) << 6) | morton) * bpp
 }
 
+fn morton_xor_offset(x: usize, y: usize, width: usize, bpp: usize, mode: u8) -> usize {
+    let tiles_per_row = width.div_ceil(8);
+    let (tx, ty) = (x >> 3, y >> 3);
+    let (lx, ly) = (x & 7, y & 7);
+    let bank_xor = match mode {
+        26 => (ty & 3) ^ ((tx & 3) << 1),
+        27 => (ty & 7) ^ (tx & 3),
+        _ => ty & 3, // 64KB_S_X (25)
+    };
+    let lx_sw = lx ^ (bank_xor & 7);
+    let morton = (lx_sw & 1)
+        | ((ly & 1) << 1)
+        | ((lx_sw & 2) << 1)
+        | ((ly & 2) << 2)
+        | ((lx_sw & 4) << 2)
+        | ((ly & 4) << 3);
+    (((ty * tiles_per_row + tx) << 6) | morton) * bpp
+}
+
 /// Title-memory bytes -> tightly packed rows.
 pub fn detile(d: &ImageDescriptor, bpp: usize, tiling: Tiling, src: &[u8]) -> Vec<u8> {
     let (w, h) = (d.width as usize, d.height as usize);
@@ -166,6 +242,13 @@ pub fn detile(d: &ImageDescriptor, bpp: usize, tiling: Tiling, src: &[u8]) -> Ve
             Tiling::Morton => {
                 for x in 0..w {
                     let s = morton_offset(x, y, w, bpp);
+                    let o = (y * w + x) * bpp;
+                    out[o..o + bpp].copy_from_slice(&src[s..s + bpp]);
+                }
+            }
+            Tiling::MortonXor { mode } => {
+                for x in 0..w {
+                    let s = morton_xor_offset(x, y, w, bpp, mode);
                     let o = (y * w + x) * bpp;
                     out[o..o + bpp].copy_from_slice(&src[s..s + bpp]);
                 }
@@ -188,6 +271,13 @@ pub fn retile(d: &ImageDescriptor, bpp: usize, tiling: Tiling, tight: &[u8], dst
                 for x in 0..w {
                     let s = (y * w + x) * bpp;
                     let o = morton_offset(x, y, w, bpp);
+                    dst[o..o + bpp].copy_from_slice(&tight[s..s + bpp]);
+                }
+            }
+            Tiling::MortonXor { mode } => {
+                for x in 0..w {
+                    let s = (y * w + x) * bpp;
+                    let o = morton_xor_offset(x, y, w, bpp, mode);
                     dst[o..o + bpp].copy_from_slice(&tight[s..s + bpp]);
                 }
             }
@@ -434,7 +524,7 @@ mod tests {
 
     #[test]
     fn linear_and_morton_layouts_round_trip() {
-        for mode in [0u8, 9] {
+        for mode in [0u8, 9, 25, 26, 27] {
             let d = desc(12, 5, mode);
             let (tiling, footprint) = source_layout(&d, 4).unwrap();
             let tight: Vec<u8> = (0..12 * 5 * 4).map(|i| i as u8).collect();
@@ -442,6 +532,8 @@ mod tests {
             retile(&d, 4, tiling, &tight, &mut mem);
             assert_eq!(detile(&d, 4, tiling, &mem), tight, "mode {mode}");
         }
+        assert!(is_block_compressed(vk_format_extended(41).unwrap()));
+        assert!(is_depth_stencil(vk_format_extended(43).unwrap()));
         assert_eq!(
             source_layout(&desc(8, 8, 0), 4).unwrap(),
             (Tiling::Linear { pitch: 256 }, 2048)

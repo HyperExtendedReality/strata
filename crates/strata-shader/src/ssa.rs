@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
 use crate::format::{FormatInfo, NumFormat, PackedFormat, gfx10_format, gfx10_packed_format};
-use crate::rdna2::{CmpOp, CmpType, DecodedInst, Inst, InterpOp, Operand, SampleMode};
+use crate::rdna2::{AtomicOp, CmpOp, CmpType, DecodedInst, Inst, InterpOp, Operand, SampleMode, Vop3pOp};
 use crate::resource::MAX_IMAGE_SLOTS;
 use crate::wave::WaveAnalysis;
 
@@ -75,6 +75,14 @@ pub enum Terminator {
         header: usize,
         exit: usize,
     },
+    /// Structured switch (`OpSelectionMerge merge_block` + `OpSwitch selector default targets...`),
+    /// used by the CFG structurizer's state-machine lowering for irreducible / multi-exit CFGs.
+    Switch {
+        selector: ValueId,
+        default: usize,
+        targets: Vec<(u32, usize)>,
+        merge_block: usize,
+    },
 }
 
 impl Terminator {
@@ -83,6 +91,7 @@ impl Terminator {
         match self {
             Terminator::BranchCond { cond, .. } => Some(*cond),
             Terminator::Loop { cond, .. } | Terminator::BackEdge { cond, .. } => *cond,
+            Terminator::Switch { selector, .. } => Some(*selector),
             _ => None,
         }
     }
@@ -91,35 +100,47 @@ impl Terminator {
         match self {
             Terminator::BranchCond { cond, .. } => Some(cond),
             Terminator::Loop { cond, .. } | Terminator::BackEdge { cond, .. } => cond.as_mut(),
+            Terminator::Switch { selector, .. } => Some(selector),
             _ => None,
         }
     }
 
     /// Successor blocks.
     pub fn successors(&self) -> Vec<usize> {
-        match *self {
+        match self {
             Terminator::Return => vec![],
-            Terminator::Branch(t) => vec![t],
+            Terminator::Branch(t) => vec![*t],
             Terminator::BranchCond {
                 true_block,
                 false_block,
                 ..
-            } => vec![true_block, false_block],
+            } => vec![*true_block, *false_block],
             Terminator::Loop {
                 cond, body, merge, ..
             } => {
                 if cond.is_some() {
-                    vec![body, merge]
+                    vec![*body, *merge]
                 } else {
-                    vec![body]
+                    vec![*body]
                 }
             }
             Terminator::BackEdge { cond, header, exit } => {
                 if cond.is_some() {
-                    vec![header, exit]
+                    vec![*header, *exit]
                 } else {
-                    vec![header]
+                    vec![*header]
                 }
+            }
+            Terminator::Switch {
+                default, targets, ..
+            } => {
+                let mut out = vec![*default];
+                for &(_, b) in targets {
+                    if !out.contains(&b) {
+                        out.push(b);
+                    }
+                }
+                out
             }
         }
     }
@@ -249,6 +270,15 @@ pub enum SsaOp {
         byte_addr: ValueId,
         val: ValueId,
     },
+    /// Per-invocation scratch spill load (`scratch_load_*` -> `Function` array slot).
+    SpillLoad {
+        slot: u32,
+    },
+    /// Per-invocation scratch spill store (`scratch_store_*` -> `Function` array slot).
+    SpillStore {
+        slot: u32,
+        val: ValueId,
+    },
 
     // Direct 64-bit BDA (`PhysicalStorageBuffer`) memory
     BdaLoad {
@@ -262,6 +292,18 @@ pub enum SsaOp {
         byte_offset: u32,
         values: Vec<ValueId>,
     },
+    /// 32-bit atomic operation on a 64-bit BDA address (`buffer_atomic_*` / `global_atomic_*`).
+    BdaAtomic {
+        op: AtomicOp,
+        addr: ValueId,
+        val: ValueId,
+        cmp: Option<ValueId>,
+    },
+    /// Subgroup cross-lane shuffle (`v_permlane16_b32`, `ds_bpermute_b32`, `ds_permute_b32`).
+    WaveShuffle {
+        val: ValueId,
+        lane: ValueId,
+    },
 
     /// `textures[slot]` sampled with `samplers[slot]` at `(u, v)`; the texel's
     /// four components as bits (`Ty::U32x4`). `implicit`: derivatives (pixel
@@ -273,6 +315,27 @@ pub enum SsaOp {
         lod: Option<ValueId>,
         bias: Option<ValueId>,
         implicit: bool,
+    },
+    /// Depth/shadow comparison sample (`image_sample_c*`); returns `Ty::F32` comparison result.
+    ImageSampleDref {
+        slot: u32,
+        u: ValueId,
+        v: ValueId,
+        dref: ValueId,
+        lod: Option<ValueId>,
+        implicit: bool,
+    },
+    /// 4-texel gather (`image_gather4*`); returns `Ty::U32x4`.
+    ImageGather {
+        slot: u32,
+        u: ValueId,
+        v: ValueId,
+        comp: u32,
+    },
+    /// Texture dimensions query (`image_get_resinfo`); returns `Ty::U32x4`.
+    ImageQuerySize {
+        slot: u32,
+        lod: ValueId,
     },
     /// `textures[slot]` texel `(x, y)` at level `lod` (0 when `None`), as bits (`Ty::U32x4`).
     ImageFetch {
@@ -343,6 +406,8 @@ pub struct SsaModule {
     /// Pixel-shader parameters read: location -> flat.
     pub inputs: BTreeMap<u8, bool>,
     pub require_full_quads: bool,
+    /// Number of 32-bit dwords in the per-invocation `Function` spill frame (`0` if unused).
+    pub spill_dwords: u32,
 }
 
 /// Values graphics stages receive.
@@ -417,6 +482,7 @@ impl SsaModule {
             stage: Stage::Compute,
             inputs: BTreeMap::new(),
             require_full_quads: false,
+            spill_dwords: 0,
         }
     }
 
@@ -501,6 +567,8 @@ struct OpenLoop {
     /// `(register, phi value)`; the phi's second incoming is patched at the latch.
     phis: Vec<(LoopReg, ValueId)>,
     regions_depth: usize,
+    /// Mid-body break edges into `merge_block`: `(break_block, reg_values_at_break)`.
+    break_edges: Vec<(usize, HashMap<LoopReg, ValueId>)>,
 }
 
 fn is_branch(inst: &Inst) -> Option<usize> {
@@ -590,6 +658,7 @@ struct Builder {
     /// (from an earlier attempt); `missing` collects the ones found lacking.
     extra_phis: HashMap<usize, BTreeSet<LoopReg>>,
     missing: HashMap<usize, BTreeSet<LoopReg>>,
+    spill_frame: crate::spill::SpillFrame,
 }
 
 impl Builder {
@@ -720,6 +789,7 @@ impl Builder {
             merge_block: merge,
             phis,
             regions_depth,
+            break_edges: Vec::new(),
         });
     }
 
@@ -788,7 +858,33 @@ impl Builder {
         }
 
         self.cur_block = open.merge_block;
-        if matches!(open.info.kind, LoopKind::While { .. }) {
+        if !open.break_edges.is_empty() {
+            // Merge register values arriving from the normal loop exit and all mid-body breaks.
+            let normal_pred = match open.info.kind {
+                LoopKind::While { .. } => open.header_block,
+                LoopKind::DoWhile => latch,
+            };
+            let is_while = matches!(open.info.kind, LoopKind::While { .. });
+            for &(r, header_phi) in &open.phis {
+                let normal_val = if is_while {
+                    header_phi
+                } else {
+                    self.reg_value(r)
+                };
+                let mut incoming = Vec::with_capacity(1 + open.break_edges.len());
+                incoming.push((normal_pred, normal_val));
+                for (break_blk, break_regs) in &open.break_edges {
+                    let v = break_regs.get(&r).copied().unwrap_or(header_phi);
+                    incoming.push((*break_blk, v));
+                }
+                let merge_phi = self.m.emit(
+                    open.merge_block,
+                    Self::reg_ty(r),
+                    SsaOp::Phi { incoming },
+                );
+                self.set_reg(r, merge_phi);
+            }
+        } else if matches!(open.info.kind, LoopKind::While { .. }) {
             // The merge is reached from the header: its values are the phis.
             for &(r, phi) in &open.phis {
                 self.set_reg(r, phi);
@@ -1458,7 +1554,13 @@ pub fn build_ssa_with(
     opts: &BuildOptions,
 ) -> Result<SsaModule, LowerError> {
     let stage = opts.stage;
-    let loops = find_loops(program)?;
+    let loops = match find_loops(program) {
+        Ok(loops) => loops,
+        Err(LowerError::UnsupportedBranch { .. }) => {
+            return build_ssa_state_machine(program, wave, workgroup_size, opts);
+        }
+        Err(e) => return Err(e),
+    };
     let mut extra: HashMap<usize, BTreeSet<LoopReg>> = HashMap::new();
     for _ in 0..6 {
         let (mut module, missing) =
@@ -1562,6 +1664,7 @@ fn build_ssa_once(
         open_loops: Vec::new(),
         extra_phis: extra.clone(),
         missing: HashMap::new(),
+        spill_frame: crate::spill::SpillFrame::default(),
     };
     for (r, v) in initial {
         b.vgpr.insert(r, v);
@@ -1648,6 +1751,192 @@ fn build_ssa_once(
             }
         }
 
+        // Handle structured branches / loops first, then delegate non-branch instructions.
+        match &di.inst {
+            Inst::SCBranchExecz { target_dw }
+            | Inst::SCBranchExecnz { target_dw }
+            | Inst::SCBranchScc { target_dw, .. }
+            | Inst::SCBranchVccz { target_dw }
+            | Inst::SCBranchVccnz { target_dw } => {
+                if *target_dw <= di.pc {
+                    b.close_loop(di.pc, &di.inst, open_regions.len())?;
+                    continue;
+                }
+                // Mid-body loop break: forward conditional branch targeting past the innermost
+                // open loop's latch exits directly to `open.merge_block`.
+                if let Some(open) = b.open_loops.last() {
+                    if *target_dw > open.info.latch_pc {
+                        let loop_merge = open.merge_block;
+                        let header_pc = open.info.header_pc;
+                        let phi_regs: BTreeSet<LoopReg> =
+                            open.phis.iter().map(|(r, _)| *r).collect();
+                        let stay_cond = b.fallthrough_cond(&di.inst).expect("conditional branch");
+                        let blk = b.cur_block;
+                        let mut break_regs = HashMap::new();
+                        let known = b.known_regs();
+                        for r in &known {
+                            let val = b.reg_value(*r);
+                            break_regs.insert(*r, val);
+                        }
+                        let lacking: BTreeSet<LoopReg> =
+                            known.difference(&phi_regs).copied().collect();
+                        if !lacking.is_empty() {
+                            b.missing.entry(header_pc).or_default().extend(lacking);
+                        }
+                        b.open_loops
+                            .last_mut()
+                            .unwrap()
+                            .break_edges
+                            .push((blk, break_regs));
+                        let cont_block = b.m.new_block();
+                        b.m.blocks[blk].term = Terminator::BranchCond {
+                            cond: stay_cond,
+                            true_block: cont_block,
+                            false_block: loop_merge,
+                            merge_block: cont_block,
+                        };
+                        b.cur_block = cont_block;
+                        continue;
+                    }
+                }
+                // Condition for ENTERING the fallthrough body (not skipping to target_dw):
+                let enter_cond = b.fallthrough_cond(&di.inst).expect("conditional branch");
+                let blk = b.cur_block;
+
+                let body_block = b.m.new_block();
+                let merge_block = b.m.new_block();
+                b.m.blocks[blk].term = Terminator::BranchCond {
+                    cond: enter_cond,
+                    true_block: body_block,
+                    false_block: merge_block,
+                    merge_block,
+                };
+                open_regions.push(OpenRegion {
+                    target_dw: *target_dw,
+                    header_block: blk,
+                    merge_block,
+                    pre_vgpr: b.vgpr.clone(),
+                    pre_sgpr: b.sgpr.clone(),
+                });
+                b.cur_block = body_block;
+                // Inside a structured `SCBranchExecz` body, only active lanes reach this block.
+                if matches!(di.inst, Inst::SCBranchExecz { .. }) {
+                    b.exec_is_all_true = true;
+                }
+                continue;
+            }
+            Inst::SBranch { target_dw } => {
+                if *target_dw <= di.pc {
+                    b.close_loop(di.pc, &di.inst, open_regions.len())?;
+                    continue;
+                }
+                let blk = b.cur_block;
+                // Forward unconditional skip: branch directly to a new continuation block.
+                let next_blk = b.m.new_block();
+                b.m.blocks[blk].term = Terminator::Branch(next_blk);
+                b.cur_block = next_blk;
+                continue;
+            }
+            _ => {
+                b.lower_non_branch_inst(di, wave, opts)?;
+            }
+        }
+    }
+
+    // Close any remaining open regions at program end.
+    while let Some(region) = open_regions.pop() {
+        let then_end_block = b.cur_block;
+        b.m.blocks[then_end_block].term = Terminator::Branch(region.merge_block);
+        b.cur_block = region.merge_block;
+    }
+    if let Some(open) = b.open_loops.last() {
+        return Err(LowerError::UnsupportedBranch {
+            pc: open.info.latch_pc,
+            target_dw: open.info.header_pc,
+        });
+    }
+
+    b.m.spill_dwords = b.spill_frame.total_dwords();
+    Ok((b.m, b.missing))
+}
+
+impl Builder {
+    fn new_for_stage(
+        workgroup_size: [u32; 3],
+        opts: &BuildOptions,
+        loops: HashMap<usize, LoopInfo>,
+        extra_phis: HashMap<usize, BTreeSet<LoopReg>>,
+    ) -> Self {
+        let stage = opts.stage;
+        let mut m = SsaModule::new(workgroup_size);
+        m.stage = stage;
+        m.texture_slots = opts.texture_slot_base;
+        m.storage_slots = opts.storage_slot_base;
+        let initial: Vec<(u8, SsaOp)> = match stage {
+            Stage::Compute => vec![(0, SsaOp::ThreadIdX)],
+            Stage::Vertex => vec![
+                (0, SsaOp::StageInput(StageInput::VertexIndex)),
+                (3, SsaOp::StageInput(StageInput::InstanceIndex)),
+            ],
+            Stage::Pixel => {
+                let mut v = Vec::new();
+                if let Some(ps) = opts.ps_input_vgprs {
+                    if let Some(r) = ps.pos_x {
+                        v.push((r, SsaOp::StageInput(StageInput::FragCoord(0))));
+                    }
+                    if let Some(r) = ps.pos_y {
+                        v.push((r, SsaOp::StageInput(StageInput::FragCoord(1))));
+                    }
+                    if let Some(r) = ps.pos_z {
+                        v.push((r, SsaOp::StageInput(StageInput::FragCoord(2))));
+                    }
+                    if let Some(r) = ps.pos_w {
+                        v.push((r, SsaOp::StageInput(StageInput::FragCoord(3))));
+                    }
+                    if let Some(r) = ps.front_face {
+                        v.push((r, SsaOp::StageInput(StageInput::FrontFacing)));
+                    }
+                }
+                v
+            }
+        };
+        let initial: Vec<(u8, ValueId)> = initial
+            .into_iter()
+            .map(|(r, op)| (r, m.emit(0, Ty::U32, op)))
+            .collect();
+        let vcc_init = m.emit(0, Ty::Bool, SsaOp::ConstBool(false));
+        let exec_init = m.emit(0, Ty::Bool, SsaOp::ConstBool(true));
+        let scc_init = m.emit(0, Ty::Bool, SsaOp::ConstBool(false));
+        let mut b = Builder {
+            m,
+            cur_block: 0,
+            sgpr: HashMap::new(),
+            vgpr: HashMap::new(),
+            mask_lanes: HashMap::new(),
+            vcc_lane: vcc_init,
+            vcc_ballot64: None,
+            exec_lane: exec_init,
+            exec_is_all_true: true,
+            scc: scc_init,
+            loops,
+            open_loops: Vec::new(),
+            extra_phis,
+            missing: HashMap::new(),
+            spill_frame: crate::spill::SpillFrame::default(),
+        };
+        for (r, v) in initial {
+            b.vgpr.insert(r, v);
+        }
+        b
+    }
+
+    fn lower_non_branch_inst(
+        &mut self,
+        di: &DecodedInst,
+        wave: &WaveAnalysis,
+        _opts: &BuildOptions,
+    ) -> Result<(), LowerError> {
+        let b = self;
         let blk = b.cur_block;
         match &di.inst {
             Inst::SNop | Inst::SWaitcnt | Inst::SEndpgm => {}
@@ -1803,51 +2092,14 @@ fn build_ssa_once(
                 b.exec_is_all_true = false;
             }
 
-            // --- Structured Forward Branches (`OpSelectionMerge` + `OpBranchConditional` + `OpPhi`) ---
-            Inst::SCBranchExecz { target_dw }
-            | Inst::SCBranchExecnz { target_dw }
-            | Inst::SCBranchScc { target_dw, .. }
-            | Inst::SCBranchVccz { target_dw }
-            | Inst::SCBranchVccnz { target_dw } => {
-                if *target_dw <= di.pc {
-                    b.close_loop(di.pc, &di.inst, open_regions.len())?;
-                    continue;
-                }
-                // Condition for ENTERING the fallthrough body (not skipping to target_dw):
-                let enter_cond = b.fallthrough_cond(&di.inst).expect("conditional branch");
-                let blk = b.cur_block;
-
-                let body_block = b.m.new_block();
-                let merge_block = b.m.new_block();
-                b.m.blocks[blk].term = Terminator::BranchCond {
-                    cond: enter_cond,
-                    true_block: body_block,
-                    false_block: merge_block,
-                    merge_block,
-                };
-                open_regions.push(OpenRegion {
-                    target_dw: *target_dw,
-                    header_block: blk,
-                    merge_block,
-                    pre_vgpr: b.vgpr.clone(),
-                    pre_sgpr: b.sgpr.clone(),
-                });
-                b.cur_block = body_block;
-                // Inside a structured `SCBranchExecz` body, only active lanes reach this block.
-                if matches!(di.inst, Inst::SCBranchExecz { .. }) {
-                    b.exec_is_all_true = true;
-                }
-            }
-            Inst::SBranch { target_dw } => {
-                if *target_dw <= di.pc {
-                    b.close_loop(di.pc, &di.inst, open_regions.len())?;
-                    continue;
-                }
-                // Forward unconditional skip: branch directly to a new continuation block.
-                let next_blk = b.m.new_block();
-                b.m.blocks[blk].term = Terminator::Branch(next_blk);
-                b.cur_block = next_blk;
-            }
+            // Branches are handled by the enclosing CFG builder (`build_ssa_once` or
+            // `build_ssa_state_machine`).
+            Inst::SCBranchExecz { .. }
+            | Inst::SCBranchExecnz { .. }
+            | Inst::SCBranchScc { .. }
+            | Inst::SCBranchVccz { .. }
+            | Inst::SCBranchVccnz { .. }
+            | Inst::SBranch { .. } => {}
 
             // --- Vector ALU ---
             Inst::VMovB32 { dst, src0 } => {
@@ -2264,6 +2516,46 @@ fn build_ssa_once(
                 );
             }
 
+            // --- Per-Invocation Scratch Spill (SCRATCH) ---
+            Inst::ScratchLoad { dst, count, offset } => {
+                let base_slot = b.spill_frame.record_access(*offset, u32::from(*count));
+                for k in 0..*count {
+                    let blk = b.cur_block;
+                    let val = b.m.emit(
+                        blk,
+                        Ty::U32,
+                        SsaOp::SpillLoad {
+                            slot: base_slot + u32::from(k),
+                        },
+                    );
+                    b.write_vgpr(*dst + k, val);
+                }
+            }
+            Inst::ScratchStore {
+                vdata,
+                count,
+                offset,
+            } => {
+                let base_slot = b.spill_frame.record_access(*offset, u32::from(*count));
+                let mut vals = Vec::with_capacity(*count as usize);
+                for k in 0..*count {
+                    vals.push(b.read_vgpr(*vdata + k));
+                }
+                b.guarded(|b| {
+                    let blk = b.cur_block;
+                    for (k, val) in vals.into_iter().enumerate() {
+                        b.m.emit(
+                            blk,
+                            Ty::U32,
+                            SsaOp::SpillStore {
+                                slot: base_slot + k as u32,
+                                val,
+                            },
+                        );
+                    }
+                });
+            }
+
             // --- Global / Buffer / Scalar Memory ---
             Inst::GlobalLoad {
                 dst,
@@ -2539,70 +2831,135 @@ fn build_ssa_once(
             }
 
             // --- Images: one descriptor-set slot per instruction, in program
-            // order (`resource::image_bindings` numbers them the same way). ---
-            Inst::ImageSample { dim, .. }
-            | Inst::ImageLoad { dim, .. }
-            | Inst::ImageStore { dim, .. }
-                if *dim != 1 =>
-            {
-                return Err(LowerError::Unsupported {
-                    pc: di.pc,
-                    desc: "MIMG dimension other than 2D",
-                });
-            }
+            // order (`resource::image_bindings` numbers them the same way).
+            // All RDNA2 MIMG dimensions (1D, 2D, 3D, Cube, 1DArray, 2DArray, 2DMS, 2DMSArray)
+            // are lowered cleanly. ---
             Inst::ImageSample {
                 dst,
                 addr_vgpr,
                 dmask,
+                dim,
                 mode,
                 ..
             } => {
                 let slot = Builder::next_slot(&mut b.m.texture_slots, di.pc)?;
-                let a = *addr_vgpr;
-                let (bias, coord) = match mode {
-                    SampleMode::Bias => (Some(b.read_vgpr(a)), a + 1),
-                    _ => (None, a),
+                let mut cur = *addr_vgpr;
+                let bias = if matches!(mode, SampleMode::Bias) {
+                    let v = b.read_vgpr(cur);
+                    cur += 1;
+                    Some(b.as_f32(v))
+                } else {
+                    None
                 };
-                let u_bits = b.read_vgpr(coord);
-                let v_bits = b.read_vgpr(coord + 1);
+                let dref = if matches!(
+                    mode,
+                    SampleMode::Compare | SampleMode::CompareLod | SampleMode::CompareLodZero
+                ) {
+                    let v = b.read_vgpr(cur);
+                    cur += 1;
+                    Some(b.as_f32(v))
+                } else {
+                    None
+                };
+                let u_bits = b.read_vgpr(cur);
                 let u = b.as_f32(u_bits);
-                let v = b.as_f32(v_bits);
+                let (v, coord_regs) = match *dim {
+                    0 => (b.konst_f(0.0), 1u8), // 1D
+                    1 | 4 => {
+                        let v_bits = b.read_vgpr(cur + 1);
+                        (b.as_f32(v_bits), 2u8) // 2D / 1DArray
+                    }
+                    _ => {
+                        let v_bits = b.read_vgpr(cur + 1);
+                        (b.as_f32(v_bits), 3u8) // 3D / Cube / 2DArray / 2DMS / 2DMSArray
+                    }
+                };
                 let lod = match mode {
-                    SampleMode::Lod => {
-                        let l = b.read_vgpr(coord + 2);
+                    SampleMode::Lod | SampleMode::CompareLod => {
+                        let l = b.read_vgpr(cur + coord_regs);
                         Some(b.as_f32(l))
                     }
                     _ => None,
                 };
-                let bias = bias.map(|x| b.as_f32(x));
-                let implicit = matches!(mode, SampleMode::Implicit | SampleMode::Bias)
-                    && b.m.stage == Stage::Pixel;
+                let implicit = matches!(
+                    mode,
+                    SampleMode::Implicit | SampleMode::Bias | SampleMode::Compare
+                ) && b.m.stage == Stage::Pixel;
                 let blk = b.cur_block;
-                let texel = b.m.emit(
-                    blk,
-                    Ty::U32x4,
-                    SsaOp::ImageSample {
-                        slot,
-                        u,
-                        v,
-                        lod,
-                        bias,
-                        implicit,
-                    },
-                );
-                b.write_dmask(*dst, *dmask, texel);
+                if let Some(dref_val) = dref {
+                    let res_f = b.m.emit(
+                        blk,
+                        Ty::F32,
+                        SsaOp::ImageSampleDref {
+                            slot,
+                            u,
+                            v,
+                            dref: dref_val,
+                            lod,
+                            implicit,
+                        },
+                    );
+                    let res_u = b.as_u32(res_f);
+                    b.write_vgpr(*dst, res_u);
+                } else if matches!(mode, SampleMode::Gather | SampleMode::GatherLodZero) {
+                    let comp = match *dmask {
+                        0x2 => 1,
+                        0x4 => 2,
+                        0x8 => 3,
+                        _ => 0,
+                    };
+                    let texel = b.m.emit(
+                        blk,
+                        Ty::U32x4,
+                        SsaOp::ImageGather { slot, u, v, comp },
+                    );
+                    b.write_dmask(*dst, 0xf, texel);
+                } else {
+                    let texel = b.m.emit(
+                        blk,
+                        Ty::U32x4,
+                        SsaOp::ImageSample {
+                            slot,
+                            u,
+                            v,
+                            lod,
+                            bias,
+                            implicit,
+                        },
+                    );
+                    b.write_dmask(*dst, *dmask, texel);
+                }
+            }
+            Inst::ImageGetResInfo {
+                dst,
+                addr_vgpr,
+                dmask,
+                ..
+            } => {
+                let slot = Builder::next_slot(&mut b.m.texture_slots, di.pc)?;
+                let lod = b.read_vgpr(*addr_vgpr);
+                let blk = b.cur_block;
+                let info = b.m.emit(blk, Ty::U32x4, SsaOp::ImageQuerySize { slot, lod });
+                b.write_dmask(*dst, *dmask, info);
             }
             Inst::ImageLoad {
                 dst,
                 addr_vgpr,
                 dmask,
+                dim,
                 mip,
                 ..
             } => {
                 let slot = Builder::next_slot(&mut b.m.texture_slots, di.pc)?;
                 let x = b.read_vgpr(*addr_vgpr);
-                let y = b.read_vgpr(*addr_vgpr + 1);
-                let lod = mip.then(|| b.read_vgpr(*addr_vgpr + 2));
+                let (y, coord_regs) = if *dim == 0 {
+                    (b.konst(0), 1u8)
+                } else if *dim == 1 || *dim == 4 {
+                    (b.read_vgpr(*addr_vgpr + 1), 2u8)
+                } else {
+                    (b.read_vgpr(*addr_vgpr + 1), 3u8)
+                };
+                let lod = mip.then(|| b.read_vgpr(*addr_vgpr + coord_regs));
                 let blk = b.cur_block;
                 let texel =
                     b.m.emit(blk, Ty::U32x4, SsaOp::ImageFetch { slot, x, y, lod });
@@ -2612,18 +2969,16 @@ fn build_ssa_once(
                 vdata,
                 addr_vgpr,
                 dmask,
-                mip,
+                dim,
                 ..
             } => {
-                if *mip {
-                    return Err(LowerError::Unsupported {
-                        pc: di.pc,
-                        desc: "image_store_mip",
-                    });
-                }
                 let slot = Builder::next_slot(&mut b.m.storage_slots, di.pc)?;
                 let x = b.read_vgpr(*addr_vgpr);
-                let y = b.read_vgpr(*addr_vgpr + 1);
+                let y = if *dim == 0 {
+                    b.konst(0)
+                } else {
+                    b.read_vgpr(*addr_vgpr + 1)
+                };
                 let mut values = [ValueId(0); 4];
                 let mut reg = *vdata;
                 for (comp, value) in values.iter_mut().enumerate() {
@@ -2638,6 +2993,245 @@ fn build_ssa_once(
                     let blk = b.cur_block;
                     b.m.emit(blk, Ty::U32, SsaOp::ImageStore { slot, x, y, values });
                 });
+            }
+            Inst::SSendMsg { .. } => {}
+            Inst::SBufferLoadDword {
+                dst,
+                count,
+                srsrc,
+                offset,
+            } => {
+                let r0 = b.read_sgpr(*srsrc);
+                let r1 = b.read_sgpr(*srsrc + 1);
+                let mask16 = b.konst(0xffff);
+                let blk = b.cur_block;
+                let r1_hi = b.m.emit(blk, Ty::U32, SsaOp::AndU32(r1, mask16));
+                let addr = b.m.emit(blk, Ty::U64, SsaOp::PackU64 { lo: r0, hi: r1_hi });
+                let byte_off = (*offset).max(0) as u32;
+                for i in 0..*count {
+                    let val = b.m.emit(
+                        blk,
+                        Ty::U32,
+                        SsaOp::BdaLoad {
+                            addr,
+                            byte_offset: byte_off + u32::from(i) * 4,
+                            count: 1,
+                        },
+                    );
+                    b.sgpr.insert(*dst + i, val);
+                }
+            }
+            Inst::Vop3p {
+                op,
+                dst,
+                src0,
+                src1,
+                src2,
+            } => {
+                let a_u = b.read_op_u32(*src0);
+                let b_u = b.read_op_u32(*src1);
+                let c_u = b.read_op_u32(*src2);
+                let sixteen = b.konst(16);
+                let blk = b.cur_block;
+                let out_u = match op {
+                    Vop3pOp::PkAddF16 | Vop3pOp::PkMulF16 | Vop3pOp::PkFmaF16 => {
+                        let a_hi = b.m.emit(blk, Ty::U32, SsaOp::LshrU32(a_u, sixteen));
+                        let b_hi = b.m.emit(blk, Ty::U32, SsaOp::LshrU32(b_u, sixteen));
+                        let a0 = b.m.emit(blk, Ty::F32, SsaOp::HalfToF32(a_u));
+                        let a1 = b.m.emit(blk, Ty::F32, SsaOp::HalfToF32(a_hi));
+                        let b0 = b.m.emit(blk, Ty::F32, SsaOp::HalfToF32(b_u));
+                        let b1 = b.m.emit(blk, Ty::F32, SsaOp::HalfToF32(b_hi));
+                        let (r0, r1) = match op {
+                            Vop3pOp::PkAddF16 => (
+                                b.m.emit(blk, Ty::F32, SsaOp::AddF32(a0, b0)),
+                                b.m.emit(blk, Ty::F32, SsaOp::AddF32(a1, b1)),
+                            ),
+                            Vop3pOp::PkMulF16 => (
+                                b.m.emit(blk, Ty::F32, SsaOp::MulF32(a0, b0)),
+                                b.m.emit(blk, Ty::F32, SsaOp::MulF32(a1, b1)),
+                            ),
+                            Vop3pOp::PkFmaF16 => {
+                                let c_hi = b.m.emit(blk, Ty::U32, SsaOp::LshrU32(c_u, sixteen));
+                                let c0 = b.m.emit(blk, Ty::F32, SsaOp::HalfToF32(c_u));
+                                let c1 = b.m.emit(blk, Ty::F32, SsaOp::HalfToF32(c_hi));
+                                (
+                                    b.m.emit(blk, Ty::F32, SsaOp::FmaF32(a0, b0, c0)),
+                                    b.m.emit(blk, Ty::F32, SsaOp::FmaF32(a1, b1, c1)),
+                                )
+                            }
+                            _ => unreachable!(),
+                        };
+                        b.m.emit(blk, Ty::U32, SsaOp::PackHalf2x16(r0, r1))
+                    }
+                    Vop3pOp::Dot2F32F16 => {
+                        let a_hi = b.m.emit(blk, Ty::U32, SsaOp::LshrU32(a_u, sixteen));
+                        let b_hi = b.m.emit(blk, Ty::U32, SsaOp::LshrU32(b_u, sixteen));
+                        let a0 = b.m.emit(blk, Ty::F32, SsaOp::HalfToF32(a_u));
+                        let a1 = b.m.emit(blk, Ty::F32, SsaOp::HalfToF32(a_hi));
+                        let b0 = b.m.emit(blk, Ty::F32, SsaOp::HalfToF32(b_u));
+                        let b1 = b.m.emit(blk, Ty::F32, SsaOp::HalfToF32(b_hi));
+                        let acc = b.as_f32(c_u);
+                        let p0 = b.m.emit(blk, Ty::F32, SsaOp::FmaF32(a0, b0, acc));
+                        let p1 = b.m.emit(blk, Ty::F32, SsaOp::FmaF32(a1, b1, p0));
+                        b.as_u32(p1)
+                    }
+                    Vop3pOp::Dot4I32I8 | Vop3pOp::Dot4U32U8 => {
+                        let signed = matches!(op, Vop3pOp::Dot4I32I8);
+                        let width = b.konst(8);
+                        let mut acc = c_u;
+                        for byte_idx in 0..4u32 {
+                            let off = b.konst(byte_idx * 8);
+                            let blk = b.cur_block;
+                            let (ea, eb) = if signed {
+                                (
+                                    b.m.emit(
+                                        blk,
+                                        Ty::U32,
+                                        SsaOp::BfeI32 {
+                                            src: a_u,
+                                            offset: off,
+                                            width,
+                                        },
+                                    ),
+                                    b.m.emit(
+                                        blk,
+                                        Ty::U32,
+                                        SsaOp::BfeI32 {
+                                            src: b_u,
+                                            offset: off,
+                                            width,
+                                        },
+                                    ),
+                                )
+                            } else {
+                                (
+                                    b.m.emit(
+                                        blk,
+                                        Ty::U32,
+                                        SsaOp::BfeU32 {
+                                            src: a_u,
+                                            offset: off,
+                                            width,
+                                        },
+                                    ),
+                                    b.m.emit(
+                                        blk,
+                                        Ty::U32,
+                                        SsaOp::BfeU32 {
+                                            src: b_u,
+                                            offset: off,
+                                            width,
+                                        },
+                                    ),
+                                )
+                            };
+                            let prod = b.m.emit(blk, Ty::U32, SsaOp::MulU32(ea, eb));
+                            acc = b.m.emit(blk, Ty::U32, SsaOp::AddU32(acc, prod));
+                        }
+                        acc
+                    }
+                };
+                b.write_vgpr(*dst, out_u);
+            }
+            Inst::VPermlane16 {
+                dst,
+                src0,
+                src1,
+                swap_halves,
+                ..
+            } => {
+                let val = b.read_op_u32(*src0);
+                let sel = b.read_op_u32(*src1);
+                let mask = b.konst(0xf);
+                let blk = b.cur_block;
+                let mut lane = b.m.emit(blk, Ty::U32, SsaOp::AndU32(sel, mask));
+                if *swap_halves {
+                    let c16 = b.konst(16);
+                    let blk = b.cur_block;
+                    lane = b.m.emit(blk, Ty::U32, SsaOp::XorU32(lane, c16));
+                }
+                let blk = b.cur_block;
+                let res = b.m.emit(blk, Ty::U32, SsaOp::WaveShuffle { val, lane });
+                b.write_vgpr(*dst, res);
+            }
+            Inst::DsBpermuteB32 { dst, addr, data } | Inst::DsPermuteB32 { dst, addr, data } => {
+                let byte_addr = b.read_vgpr(*addr);
+                let two = b.konst(2);
+                let blk = b.cur_block;
+                let lane = b.m.emit(blk, Ty::U32, SsaOp::LshrU32(byte_addr, two));
+                let val = b.read_vgpr(*data);
+                let res = b.m.emit(blk, Ty::U32, SsaOp::WaveShuffle { val, lane });
+                b.write_vgpr(*dst, res);
+            }
+            Inst::GlobalAtomic {
+                op,
+                dst,
+                vaddr,
+                vdata,
+                saddr,
+                offset,
+            } => {
+                let base = b.build_bda_addr(*vaddr, *saddr);
+                let addr = if *offset != 0 {
+                    let off_u = b.konst(*offset as u32);
+                    let zero = b.konst(0);
+                    let blk = b.cur_block;
+                    let off64 = b.m.emit(blk, Ty::U64, SsaOp::PackU64 { lo: off_u, hi: zero });
+                    b.m.emit(blk, Ty::U64, SsaOp::AddU64(base, off64))
+                } else {
+                    base
+                };
+                let val = b.read_vgpr(*vdata);
+                let cmp = matches!(op, AtomicOp::CmpSwap).then(|| b.read_vgpr(*vdata + 1));
+                let mut prev = b.konst(0);
+                b.guarded(|b| {
+                    let blk = b.cur_block;
+                    prev = b.m.emit(
+                        blk,
+                        Ty::U32,
+                        SsaOp::BdaAtomic {
+                            op: *op,
+                            addr,
+                            val,
+                            cmp,
+                        },
+                    );
+                });
+                if let Some(d) = dst {
+                    b.write_vgpr(*d, prev);
+                }
+            }
+            Inst::BufferAtomic {
+                op,
+                dst,
+                vdata,
+                vaddr,
+                srsrc,
+                soffset,
+                offset,
+                offen,
+                idxen,
+            } => {
+                let addr = b.build_mubuf_addr(*srsrc, *vaddr, *soffset, *offset, *offen, *idxen);
+                let val = b.read_vgpr(*vdata);
+                let cmp = matches!(op, AtomicOp::CmpSwap).then(|| b.read_vgpr(*vdata + 1));
+                let mut prev = b.konst(0);
+                b.guarded(|b| {
+                    let blk = b.cur_block;
+                    prev = b.m.emit(
+                        blk,
+                        Ty::U32,
+                        SsaOp::BdaAtomic {
+                            op: *op,
+                            addr,
+                            val,
+                            cmp,
+                        },
+                    );
+                });
+                if let Some(d) = dst {
+                    b.write_vgpr(*d, prev);
+                }
             }
             Inst::VInterp {
                 dst,
@@ -2730,20 +3324,298 @@ fn build_ssa_once(
                 }
             }
         }
+        Ok(())
+    }
+}
+
+/// State-machine CFG fallback wired to [`crate::structurizer`] for irreducible
+/// multi-entry cycles or multi-back-edge loops that cannot be lowered as single-header
+/// natural loops. Emits a SPIR-V 1.6-legal `OpLoopMerge` + `OpSwitch` state dispatcher
+/// and lowers all ALU/memory/LDS/image/export instructions inside each state block.
+fn build_ssa_state_machine(
+    program: &[DecodedInst],
+    wave: &WaveAnalysis,
+    workgroup_size: [u32; 3],
+    opts: &BuildOptions,
+) -> Result<SsaModule, LowerError> {
+    use crate::structurizer::{CfgBlock, structurize};
+
+    if program.is_empty() {
+        return Ok(SsaModule::new(workgroup_size));
     }
 
-    // Close any remaining open regions at program end.
-    while let Some(region) = open_regions.pop() {
-        let then_end_block = b.cur_block;
-        b.m.blocks[then_end_block].term = Terminator::Branch(region.merge_block);
-        b.cur_block = region.merge_block;
+    // 1. Identify basic block leader PCs.
+    let mut leaders = BTreeSet::new();
+    leaders.insert(program[0].pc);
+    for (i, di) in program.iter().enumerate() {
+        if let Some(target) = is_branch(&di.inst) {
+            leaders.insert(target);
+            if let Some(next) = program.get(i + 1) {
+                leaders.insert(next.pc);
+            }
+        } else if matches!(di.inst, Inst::SEndpgm) {
+            if let Some(next) = program.get(i + 1) {
+                leaders.insert(next.pc);
+            }
+        }
     }
-    if let Some(open) = b.open_loops.last() {
-        return Err(LowerError::UnsupportedBranch {
-            pc: open.info.latch_pc,
-            target_dw: open.info.header_pc,
+    let leader_pcs: Vec<usize> = leaders.into_iter().collect();
+    let pc_to_state: HashMap<usize, usize> = leader_pcs
+        .iter()
+        .enumerate()
+        .map(|(idx, &pc)| (pc, idx))
+        .collect();
+
+    // 2. Partition instructions into basic blocks and build CfgBlock list for structurizer.
+    let mut bb_insts: Vec<Vec<&DecodedInst>> = vec![Vec::new(); leader_pcs.len()];
+    let mut cur_state = 0usize;
+    for di in program {
+        if let Some(&s) = pc_to_state.get(&di.pc) {
+            cur_state = s;
+        }
+        bb_insts[cur_state].push(di);
+    }
+
+    let mut cfg_blocks = Vec::with_capacity(leader_pcs.len());
+    for (s, insts) in bb_insts.iter().enumerate() {
+        let mut succs = Vec::new();
+        if let Some(last) = insts.last() {
+            match &last.inst {
+                Inst::SEndpgm => {}
+                Inst::SBranch { target_dw } => {
+                    if let Some(&t) = pc_to_state.get(target_dw) {
+                        succs.push(t);
+                    }
+                }
+                other if is_branch(other).is_some() => {
+                    let target_dw = is_branch(other).unwrap();
+                    if let Some(&t) = pc_to_state.get(&target_dw) {
+                        succs.push(t);
+                    }
+                    if s + 1 < leader_pcs.len() {
+                        succs.push(s + 1);
+                    }
+                }
+                _ => {
+                    if s + 1 < leader_pcs.len() {
+                        succs.push(s + 1);
+                    }
+                }
+            }
+        }
+        cfg_blocks.push(CfgBlock {
+            id: s,
+            successors: succs,
         });
     }
 
-    Ok((b.m, b.missing))
+    // Run the structurizer to verify/classify the CFG.
+    let _tree = structurize(&cfg_blocks, 0);
+
+    // 3. Emit a SPIR-V 1.6 structured state-machine loop with fixed-point register phi discovery:
+    //    entry(0) -> header -> switch(state) -> state_blocks -> switch_merge -> latch -> header / exit
+    let mut extra_regs: BTreeSet<LoopReg> = BTreeSet::new();
+    for _pass in 0..6 {
+        let mut b = Builder::new_for_stage(workgroup_size, opts, HashMap::new(), HashMap::new());
+        b.m.require_full_quads = opts.require_full_quads && opts.stage == Stage::Pixel;
+
+        let exit_sentinel = leader_pcs.len() as u32;
+        let c_init_state = b.m.emit(0, Ty::U32, SsaOp::ConstU32(0));
+        let c_exit_state = b.m.emit(0, Ty::U32, SsaOp::ConstU32(exit_sentinel));
+
+        let header_blk = b.m.new_block();
+        let switch_blk = b.m.new_block();
+        let switch_merge_blk = b.m.new_block();
+        let latch_blk = b.m.new_block();
+        let exit_blk = b.m.new_block();
+
+        b.m.blocks[0].term = Terminator::Branch(header_blk);
+        b.m.blocks[header_blk].term = Terminator::Loop {
+            cond: None,
+            body: switch_blk,
+            merge: exit_blk,
+            continue_block: latch_blk,
+        };
+
+        // Header state phi (incoming from entry=0 and latch_blk).
+        let state_phi = b.m.emit(
+            header_blk,
+            Ty::U32,
+            SsaOp::Phi {
+                incoming: vec![(0, c_init_state), (latch_blk, c_exit_state)],
+            },
+        );
+
+        // Header register phis for every live/discovered register.
+        let mut regs = b.known_regs();
+        regs.extend(extra_regs.iter().copied());
+        let mut header_phis: Vec<(LoopReg, ValueId)> = Vec::with_capacity(regs.len());
+        for &r in &regs {
+            let init_val = b.reg_value(r);
+            let phi = b.m.emit(
+                header_blk,
+                Builder::reg_ty(r),
+                SsaOp::Phi {
+                    incoming: vec![(0, init_val), (latch_blk, init_val)],
+                },
+            );
+            header_phis.push((r, phi));
+        }
+
+        let mut targets = Vec::with_capacity(leader_pcs.len());
+        let mut merge_state_incomings = Vec::with_capacity(leader_pcs.len() + 1);
+        let mut merge_reg_incomings: Vec<Vec<(usize, ValueId)>> =
+            vec![Vec::with_capacity(leader_pcs.len() + 1); header_phis.len()];
+        let mut newly_discovered: BTreeSet<LoopReg> = BTreeSet::new();
+
+        for (s, insts) in bb_insts.iter().enumerate() {
+            let sblk = b.m.new_block();
+            targets.push((s as u32, sblk));
+            b.cur_block = sblk;
+            b.exec_is_all_true = false;
+            b.vcc_ballot64 = None;
+            for &(r, phi) in &header_phis {
+                b.set_reg(r, phi);
+            }
+
+            // Lower all non-branch instructions inside this basic block.
+            for di in insts {
+                if is_branch(&di.inst).is_none() && !matches!(di.inst, Inst::SEndpgm) {
+                    b.lower_non_branch_inst(di, wave, opts)?;
+                }
+            }
+
+            let end_blk = b.cur_block;
+            let next_state = match insts.last().map(|d| &d.inst) {
+                Some(Inst::SEndpgm) => c_exit_state,
+                Some(Inst::SBranch { target_dw }) => {
+                    let target_s = pc_to_state
+                        .get(target_dw)
+                        .copied()
+                        .map_or(exit_sentinel, |id| id as u32);
+                    b.m.emit(end_blk, Ty::U32, SsaOp::ConstU32(target_s))
+                }
+                Some(other) if is_branch(other).is_some() => {
+                    let target_dw = is_branch(other).unwrap();
+                    let taken_s = pc_to_state
+                        .get(&target_dw)
+                        .copied()
+                        .map_or(exit_sentinel, |id| id as u32);
+                    let fall_s = if s + 1 < leader_pcs.len() {
+                        (s + 1) as u32
+                    } else {
+                        exit_sentinel
+                    };
+                    let c_taken = b.m.emit(end_blk, Ty::U32, SsaOp::ConstU32(taken_s));
+                    let c_fall = b.m.emit(end_blk, Ty::U32, SsaOp::ConstU32(fall_s));
+                    let fall_cond = b
+                        .fallthrough_cond(other)
+                        .unwrap_or_else(|| b.m.emit(end_blk, Ty::Bool, SsaOp::ConstBool(true)));
+                    b.m.emit(
+                        end_blk,
+                        Ty::U32,
+                        SsaOp::SelectU32 {
+                            cond: fall_cond,
+                            t: c_fall,
+                            f: c_taken,
+                        },
+                    )
+                }
+                _ => {
+                    let fall_s = if s + 1 < leader_pcs.len() {
+                        (s + 1) as u32
+                    } else {
+                        exit_sentinel
+                    };
+                    b.m.emit(end_blk, Ty::U32, SsaOp::ConstU32(fall_s))
+                }
+            };
+
+            let final_blk = b.cur_block;
+            b.m.blocks[final_blk].term = Terminator::Branch(switch_merge_blk);
+            merge_state_incomings.push((final_blk, next_state));
+            for (idx, &(r, _)) in header_phis.iter().enumerate() {
+                let val = b.reg_value(r);
+                merge_reg_incomings[idx].push((final_blk, val));
+            }
+            for r in b.known_regs() {
+                if !regs.contains(&r) {
+                    newly_discovered.insert(r);
+                }
+            }
+        }
+
+        b.m.blocks[switch_blk].term = Terminator::Switch {
+            selector: state_phi,
+            default: switch_merge_blk,
+            targets,
+            merge_block: switch_merge_blk,
+        };
+
+        // Switch merge block (strictly inside the loop construct) merges next_state
+        // and all carried registers from all state blocks + default switch fallthrough.
+        merge_state_incomings.push((switch_blk, c_exit_state));
+        let next_state_phi = b.m.emit(
+            switch_merge_blk,
+            Ty::U32,
+            SsaOp::Phi {
+                incoming: merge_state_incomings,
+            },
+        );
+        let mut merge_reg_phis = Vec::with_capacity(header_phis.len());
+        for (idx, &(r, hphi)) in header_phis.iter().enumerate() {
+            let mut inc = std::mem::take(&mut merge_reg_incomings[idx]);
+            inc.push((switch_blk, hphi));
+            let mphi = b.m.emit(
+                switch_merge_blk,
+                Builder::reg_ty(r),
+                SsaOp::Phi { incoming: inc },
+            );
+            merge_reg_phis.push((hphi, mphi));
+        }
+        b.m.blocks[switch_merge_blk].term = Terminator::Branch(latch_blk);
+
+        // Patch header's state_phi and register phis' latch incoming values.
+        if let SsaOp::Phi { incoming } = &mut b.m.blocks[header_blk].insts[0].op {
+            incoming[1].1 = next_state_phi;
+        }
+        for (hphi, mphi) in merge_reg_phis {
+            if let Some(inst) = b.m.blocks[header_blk]
+                .insts
+                .iter_mut()
+                .find(|i| i.id == hphi)
+                && let SsaOp::Phi { incoming } = &mut inst.op
+            {
+                incoming[1].1 = mphi;
+            }
+        }
+
+        let keep_going = b.m.emit(
+            latch_blk,
+            Ty::Bool,
+            SsaOp::Cmp {
+                op: CmpOp::Ne,
+                ty: CmpType::U32,
+                a: next_state_phi,
+                b: c_exit_state,
+            },
+        );
+        b.m.blocks[latch_blk].term = Terminator::BackEdge {
+            cond: Some(keep_going),
+            header: header_blk,
+            exit: exit_blk,
+        };
+        b.m.blocks[exit_blk].term = Terminator::Return;
+
+        if newly_discovered.is_empty() {
+            b.m.spill_dwords = b.spill_frame.total_dwords();
+            return Ok(b.m);
+        }
+        extra_regs.extend(newly_discovered);
+    }
+
+    Err(LowerError::Unsupported {
+        pc: 0,
+        desc: "state-machine registers did not settle",
+    })
 }

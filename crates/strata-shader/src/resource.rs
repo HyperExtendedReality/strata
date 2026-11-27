@@ -221,7 +221,10 @@ pub fn trace_descriptors(program: &[DecodedInst]) -> Vec<DescriptorUse> {
             }
 
             // --- resource uses ---
-            Inst::BufferLoad { srsrc, .. } | Inst::BufferStore { srsrc, .. } => {
+            Inst::BufferLoad { srsrc, .. }
+            | Inst::BufferStore { srsrc, .. }
+            | Inst::BufferAtomic { srsrc, .. }
+            | Inst::SBufferLoadDword { srsrc, .. } => {
                 uses.push(describe(
                     &sgpr,
                     di.pc,
@@ -245,7 +248,7 @@ pub fn trace_descriptors(program: &[DecodedInst]) -> Vec<DescriptorUse> {
                     Some(*samp_sgpr),
                 ));
             }
-            Inst::ImageLoad { rsrc_sgpr, .. } => {
+            Inst::ImageLoad { rsrc_sgpr, .. } | Inst::ImageGetResInfo { rsrc_sgpr, .. } => {
                 uses.push(describe(
                     &sgpr,
                     di.pc,

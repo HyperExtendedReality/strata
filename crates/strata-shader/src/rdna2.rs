@@ -109,7 +109,7 @@ pub enum InterpOp {
     Mov,
 }
 
-/// How `image_sample*` picks its mip level.
+/// How `image_sample*` picks its mip level / mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SampleMode {
     /// `image_sample`: from screen-space derivatives (pixel shaders).
@@ -120,6 +120,43 @@ pub enum SampleMode {
     Bias,
     /// `image_sample_lz`: level 0.
     LodZero,
+    /// `image_sample_c`: depth/shadow comparison with implicit LOD.
+    Compare,
+    /// `image_sample_c_l`: depth/shadow comparison with explicit LOD.
+    CompareLod,
+    /// `image_sample_c_lz`: depth/shadow comparison at level 0.
+    CompareLodZero,
+    /// `image_gather4`: 4-texel gather.
+    Gather,
+    /// `image_gather4_lz`: 4-texel gather at level 0.
+    GatherLodZero,
+}
+
+/// Atomic memory operation kind for `buffer_atomic_*` and `global_atomic_*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AtomicOp {
+    Swap,
+    CmpSwap,
+    Add,
+    Sub,
+    SMin,
+    UMin,
+    SMax,
+    UMax,
+    And,
+    Or,
+    Xor,
+}
+
+/// VOP3P packed FP16 / dot-product operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Vop3pOp {
+    PkAddF16,
+    PkMulF16,
+    PkFmaF16,
+    Dot2F32F16,
+    Dot4I32I8,
+    Dot4U32U8,
 }
 
 /// Decoded RDNA2 instruction.
@@ -254,12 +291,23 @@ pub enum Inst {
         on_one: bool,
         target_dw: usize,
     },
+    /// `s_sendmsg` (GS / GS_CUT / GS_DONE / etc.).
+    SSendMsg {
+        msg: u16,
+    },
 
     // --- Scalar Memory (SMEM) ---
     SLoadDword {
         dst: u8,
         count: u8,
         sbase: u8,
+        offset: i32,
+    },
+    /// `s_buffer_load_dword{,x2,x4,x8}` using a 4-SGPR `V#` buffer descriptor.
+    SBufferLoadDword {
+        dst: u8,
+        count: u8,
+        srsrc: u8,
         offset: i32,
     },
 
@@ -474,6 +522,16 @@ pub enum Inst {
         saddr: Option<u8>,
         offset: i32,
     },
+    ScratchLoad {
+        dst: u8,
+        count: u8,
+        offset: i32,
+    },
+    ScratchStore {
+        vdata: u8,
+        count: u8,
+        offset: i32,
+    },
 
     // --- Buffer Memory (MUBUF / MTBUF) ---
     BufferLoad {
@@ -533,6 +591,63 @@ pub enum Inst {
         addr_vgpr: u8,
         rsrc_sgpr: u8,
     },
+    /// `image_get_resinfo` — query texture dimensions & mip count.
+    ImageGetResInfo {
+        dst: u8,
+        addr_vgpr: u8,
+        rsrc_sgpr: u8,
+        dmask: u8,
+        dim: u8,
+    },
+
+    // --- VOP3P (Packed FP16 & Dot Products) ---
+    Vop3p {
+        op: Vop3pOp,
+        dst: u8,
+        src0: Operand,
+        src1: Operand,
+        src2: Operand,
+    },
+
+    // --- Wave64 Cross-Lane Permutes ---
+    VPermlane16 {
+        dst: u8,
+        src0: Operand,
+        src1: Operand,
+        src2: Operand,
+        swap_halves: bool,
+    },
+    DsBpermuteB32 {
+        dst: u8,
+        addr: u8,
+        data: u8,
+    },
+    DsPermuteB32 {
+        dst: u8,
+        addr: u8,
+        data: u8,
+    },
+
+    // --- Global & Buffer Atomics ---
+    GlobalAtomic {
+        op: AtomicOp,
+        dst: Option<u8>,
+        vaddr: u8,
+        vdata: u8,
+        saddr: Option<u8>,
+        offset: i32,
+    },
+    BufferAtomic {
+        op: AtomicOp,
+        dst: Option<u8>,
+        vdata: u8,
+        vaddr: u8,
+        srsrc: u8,
+        soffset: Operand,
+        offset: u16,
+        offen: bool,
+        idxen: bool,
+    },
 
     // --- Parameter interpolation (VINTRP, pixel shaders) ---
     VInterp {
@@ -568,6 +683,23 @@ pub struct DecodedInst {
 /// - 32-bit vector: VOP1 (`0111111`) -> VOPC (`0111110`) -> VOP2 (`0`)
 /// - 64-bit encodings: VOP3 (`110101`), DS (`110110`), FLAT/GLOBAL (`110111`),
 ///   MUBUF (`111000`), MTBUF (`111010`), MIMG (`111100`), SMEM (`111101`), EXP (`111110`)
+fn decode_atomic_op(op: u32) -> Result<AtomicOp, DecodeError> {
+    Ok(match op {
+        0x30 => AtomicOp::Swap,
+        0x31 => AtomicOp::CmpSwap,
+        0x32 => AtomicOp::Add,
+        0x33 => AtomicOp::Sub,
+        0x34 => AtomicOp::SMin,
+        0x35 => AtomicOp::UMin,
+        0x36 => AtomicOp::SMax,
+        0x37 => AtomicOp::UMax,
+        0x38 => AtomicOp::And,
+        0x39 => AtomicOp::Or,
+        0x3a => AtomicOp::Xor,
+        _ => return Err(DecodeError::Unsupported { word: op, offset: 0 }),
+    })
+}
+
 pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
     let mut out = Vec::new();
     let mut pc = 0usize;
@@ -585,6 +717,9 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
                 0x00 => Inst::SNop,
                 0x01 => Inst::SEndpgm,
                 0x02 => Inst::SBranch { target_dw },
+                0x10 => Inst::SSendMsg {
+                    msg: (w & 0xffff) as u16,
+                },
                 0x04 => Inst::SCBranchScc {
                     on_one: false,
                     target_dw,
@@ -889,6 +1024,20 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
                         shift: src1,
                         src2,
                     }, // v_lshl_add_u32
+                    0x377 => Inst::VPermlane16 {
+                        dst,
+                        src0,
+                        src1,
+                        src2,
+                        swap_halves: false,
+                    },
+                    0x378 => Inst::VPermlane16 {
+                        dst,
+                        src0,
+                        src1,
+                        src2,
+                        swap_halves: true,
+                    },
                     _ => {
                         return Err(DecodeError::Unsupported {
                             word: w,
@@ -896,6 +1045,47 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
                         });
                     }
                 }
+            }
+        } else if (w >> 26) == 0b1100_11 {
+            // VOP3P (64-bit packed FP16 / dot-product encoding)
+            len = 2;
+            let w1 = *words
+                .get(pc + 1)
+                .ok_or(DecodeError::Truncated { offset: pc })?;
+            let op = (w >> 16) & 0x7f;
+            let dst = (w & 0xff) as u8;
+            let s0 = (w1 & 0x1ff) as u16;
+            let s1 = ((w1 >> 9) & 0x1ff) as u16;
+            let s2 = ((w1 >> 18) & 0x1ff) as u16;
+            let lit = if s0 == 255 || s1 == 255 || s2 == 255 {
+                len = 3;
+                Some(*words.get(pc + 2).ok_or(DecodeError::Truncated { offset: pc })?)
+            } else {
+                None
+            };
+            let src0 = Operand::from_src9(s0, lit);
+            let src1 = Operand::from_src9(s1, lit);
+            let src2 = Operand::from_src9(s2, lit);
+            let vop3p_op = match op {
+                0x02 => Vop3pOp::PkAddF16,
+                0x03 => Vop3pOp::PkMulF16,
+                0x0e => Vop3pOp::PkFmaF16,
+                0x13 => Vop3pOp::Dot2F32F16,
+                0x18 => Vop3pOp::Dot4I32I8,
+                0x19 => Vop3pOp::Dot4U32U8,
+                _ => {
+                    return Err(DecodeError::Unsupported {
+                        word: w,
+                        offset: pc,
+                    });
+                }
+            };
+            Inst::Vop3p {
+                op: vop3p_op,
+                dst,
+                src0,
+                src1,
+                src2,
             }
         } else if (w >> 26) == 0b1101_10 {
             // DS (LDS / Workgroup shared memory, 64-bit encoding)
@@ -972,6 +1162,16 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
                         }
                     }
                 }
+                0xb0 => Inst::DsPermuteB32 {
+                    dst: vdst,
+                    addr,
+                    data: data0,
+                },
+                0xb1 => Inst::DsBpermuteB32 {
+                    dst: vdst,
+                    addr,
+                    data: data0,
+                },
                 _ => {
                     return Err(DecodeError::Unsupported {
                         word: w,
@@ -980,11 +1180,12 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
                 }
             }
         } else if (w >> 26) == 0b1101_11 {
-            // FLAT / GLOBAL (64-bit encoding)
+            // FLAT / SCRATCH (seg=1) / GLOBAL (seg=2) (64-bit encoding)
             len = 2;
             let w1 = *words
                 .get(pc + 1)
                 .ok_or(DecodeError::Truncated { offset: pc })?;
+            let seg = (w >> 14) & 0x3;
             let op = (w >> 18) & 0x7f;
             let offset = (w & 0xfff) as i32;
             let vaddr = (w1 & 0xff) as u8;
@@ -996,54 +1197,107 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
                 Some(saddr_raw)
             };
             let vdst = ((w1 >> 24) & 0xff) as u8;
-            match op {
-                0x0c => Inst::GlobalLoad {
-                    dst: vdst,
-                    count: 1,
-                    vaddr,
-                    saddr,
-                    offset,
-                },
-                0x0d => Inst::GlobalLoad {
-                    dst: vdst,
-                    count: 2,
-                    vaddr,
-                    saddr,
-                    offset,
-                },
-                0x0e => Inst::GlobalLoad {
-                    dst: vdst,
-                    count: 4,
-                    vaddr,
-                    saddr,
-                    offset,
-                },
-                0x1c => Inst::GlobalStore {
-                    vaddr,
-                    vdata,
-                    count: 1,
-                    saddr,
-                    offset,
-                },
-                0x1d => Inst::GlobalStore {
-                    vaddr,
-                    vdata,
-                    count: 2,
-                    saddr,
-                    offset,
-                },
-                0x1e => Inst::GlobalStore {
-                    vaddr,
-                    vdata,
-                    count: 4,
-                    saddr,
-                    offset,
-                },
-                _ => {
-                    return Err(DecodeError::Unsupported {
-                        word: w,
-                        offset: pc,
-                    });
+            if seg == 1 {
+                match op {
+                    0x0c => Inst::ScratchLoad {
+                        dst: vdst,
+                        count: 1,
+                        offset,
+                    },
+                    0x0d => Inst::ScratchLoad {
+                        dst: vdst,
+                        count: 2,
+                        offset,
+                    },
+                    0x0e => Inst::ScratchLoad {
+                        dst: vdst,
+                        count: 4,
+                        offset,
+                    },
+                    0x1c => Inst::ScratchStore {
+                        vdata,
+                        count: 1,
+                        offset,
+                    },
+                    0x1d => Inst::ScratchStore {
+                        vdata,
+                        count: 2,
+                        offset,
+                    },
+                    0x1e => Inst::ScratchStore {
+                        vdata,
+                        count: 4,
+                        offset,
+                    },
+                    _ => {
+                        return Err(DecodeError::Unsupported {
+                            word: w,
+                            offset: pc,
+                        });
+                    }
+                }
+            } else {
+                match op {
+                    0x0c => Inst::GlobalLoad {
+                        dst: vdst,
+                        count: 1,
+                        vaddr,
+                        saddr,
+                        offset,
+                    },
+                    0x0d => Inst::GlobalLoad {
+                        dst: vdst,
+                        count: 2,
+                        vaddr,
+                        saddr,
+                        offset,
+                    },
+                    0x0e => Inst::GlobalLoad {
+                        dst: vdst,
+                        count: 4,
+                        vaddr,
+                        saddr,
+                        offset,
+                    },
+                    0x1c => Inst::GlobalStore {
+                        vaddr,
+                        vdata,
+                        count: 1,
+                        saddr,
+                        offset,
+                    },
+                    0x1d => Inst::GlobalStore {
+                        vaddr,
+                        vdata,
+                        count: 2,
+                        saddr,
+                        offset,
+                    },
+                    0x1e => Inst::GlobalStore {
+                        vaddr,
+                        vdata,
+                        count: 4,
+                        saddr,
+                        offset,
+                    },
+                    0x30..=0x3a => {
+                        let aop = decode_atomic_op(op)?;
+                        let glc = ((w >> 16) & 1) != 0;
+                        Inst::GlobalAtomic {
+                            op: aop,
+                            dst: glc.then_some(vdst),
+                            vaddr,
+                            vdata,
+                            saddr,
+                            offset,
+                        }
+                    }
+                    _ => {
+                        return Err(DecodeError::Unsupported {
+                            word: w,
+                            offset: pc,
+                        });
+                    }
                 }
             }
         } else if (w >> 26) == 0b1110_00 {
@@ -1128,6 +1382,21 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
                     idxen,
                     typed_format: None,
                 },
+                0x30..=0x3a => {
+                    let aop = decode_atomic_op(op)?;
+                    let glc = ((w >> 14) & 1) != 0;
+                    Inst::BufferAtomic {
+                        op: aop,
+                        dst: glc.then_some(vdata),
+                        vdata,
+                        vaddr,
+                        srsrc,
+                        soffset,
+                        offset,
+                        offen,
+                        idxen,
+                    }
+                }
                 _ => {
                     return Err(DecodeError::Unsupported {
                         word: w,
@@ -1300,6 +1569,13 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
                     dim,
                     mip: true,
                 },
+                0x0e => Inst::ImageGetResInfo {
+                    dst,
+                    addr_vgpr,
+                    rsrc_sgpr,
+                    dmask,
+                    dim,
+                },
                 0x20 => Inst::ImageSample {
                     dst,
                     addr_vgpr,
@@ -1336,6 +1612,51 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
                     dim,
                     mode: SampleMode::LodZero,
                 },
+                0x28 => Inst::ImageSample {
+                    dst,
+                    addr_vgpr,
+                    rsrc_sgpr,
+                    samp_sgpr,
+                    dmask,
+                    dim,
+                    mode: SampleMode::Compare,
+                },
+                0x2c => Inst::ImageSample {
+                    dst,
+                    addr_vgpr,
+                    rsrc_sgpr,
+                    samp_sgpr,
+                    dmask,
+                    dim,
+                    mode: SampleMode::CompareLod,
+                },
+                0x2f => Inst::ImageSample {
+                    dst,
+                    addr_vgpr,
+                    rsrc_sgpr,
+                    samp_sgpr,
+                    dmask,
+                    dim,
+                    mode: SampleMode::CompareLodZero,
+                },
+                0x40 => Inst::ImageSample {
+                    dst,
+                    addr_vgpr,
+                    rsrc_sgpr,
+                    samp_sgpr,
+                    dmask,
+                    dim,
+                    mode: SampleMode::Gather,
+                },
+                0x47 => Inst::ImageSample {
+                    dst,
+                    addr_vgpr,
+                    rsrc_sgpr,
+                    samp_sgpr,
+                    dmask,
+                    dim,
+                    mode: SampleMode::GatherLodZero,
+                },
                 0x66 => Inst::ImageBvh64IntersectRay {
                     dst,
                     addr_vgpr,
@@ -1358,23 +1679,21 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
             let sbase = ((w & 0x3f) << 1) as u8;
             let dst = ((w >> 6) & 0x7f) as u8;
             let offset = (w1 & 0x1f_ffff) as i32;
-            let count = match op {
-                0x00 => 1,
-                0x01 => 2,
-                0x02 => 4,
-                0x03 => 8,
+            match op {
+                0x00 => Inst::SLoadDword { dst, count: 1, sbase, offset },
+                0x01 => Inst::SLoadDword { dst, count: 2, sbase, offset },
+                0x02 => Inst::SLoadDword { dst, count: 4, sbase, offset },
+                0x03 => Inst::SLoadDword { dst, count: 8, sbase, offset },
+                0x08 => Inst::SBufferLoadDword { dst, count: 1, srsrc: sbase, offset },
+                0x09 => Inst::SBufferLoadDword { dst, count: 2, srsrc: sbase, offset },
+                0x0a => Inst::SBufferLoadDword { dst, count: 4, srsrc: sbase, offset },
+                0x0b => Inst::SBufferLoadDword { dst, count: 8, srsrc: sbase, offset },
                 _ => {
                     return Err(DecodeError::Unsupported {
                         word: w,
                         offset: pc,
                     });
                 }
-            };
-            Inst::SLoadDword {
-                dst,
-                count,
-                sbase,
-                offset,
             }
         } else if (w >> 26) == 0b1111_10 {
             // EXP (graphics shader export, 64-bit encoding)
@@ -1909,6 +2228,20 @@ pub mod encode {
             | ((vsrc[2] as u32) << 16)
             | ((vsrc[1] as u32) << 8)
             | (vsrc[0] as u32);
+        [w0, w1]
+    }
+
+    /// `scratch_load_dword v[dst], off, off offset:<offset>` (FLAT seg=1, op=0x0c).
+    pub fn scratch_load_dword(dst: u8, offset: u16) -> [u32; 2] {
+        let w0 = (0b1101_11 << 26) | (0x0c << 18) | (1 << 14) | u32::from(offset & 0xfff);
+        let w1 = ((dst as u32) << 24) | (0x7f << 16);
+        [w0, w1]
+    }
+
+    /// `scratch_store_dword off, v[vdata], off offset:<offset>` (FLAT seg=1, op=0x1c).
+    pub fn scratch_store_dword(vdata: u8, offset: u16) -> [u32; 2] {
+        let w0 = (0b1101_11 << 26) | (0x1c << 18) | (1 << 14) | u32::from(offset & 0xfff);
+        let w1 = (0x7f << 16) | ((vdata as u32) << 8);
         [w0, w1]
     }
 }
