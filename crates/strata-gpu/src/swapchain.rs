@@ -110,6 +110,42 @@ impl SwapchainPresenter {
         })
     }
 
+    /// Acquire the next presentable swapchain image index.
+    pub unsafe fn acquire_next_image(
+        &self,
+        timeout_ns: u64,
+        semaphore: vk::Semaphore,
+        fence: vk::Fence,
+    ) -> Result<(u32, bool), GpuError> {
+        let res = unsafe {
+            self.swapchain_loader.acquire_next_image(
+                self.swapchain,
+                timeout_ns,
+                semaphore,
+                fence,
+            )?
+        };
+        Ok(res)
+    }
+
+    /// Present `image_index` on `queue`, advancing the `FramePacingClock`.
+    pub unsafe fn present_image(
+        &mut self,
+        queue: vk::Queue,
+        image_index: u32,
+        wait_semaphores: &[vk::Semaphore],
+    ) -> Result<bool, GpuError> {
+        let swapchains = [self.swapchain];
+        let indices = [image_index];
+        let info = vk::PresentInfoKHR::default()
+            .wait_semaphores(wait_semaphores)
+            .swapchains(&swapchains)
+            .image_indices(&indices);
+        let suboptimal = unsafe { self.swapchain_loader.queue_present(queue, &info)? };
+        self.clock.record_present_x();
+        Ok(suboptimal)
+    }
+
     pub unsafe fn destroy(self, device: &ash::Device) {
         unsafe {
             for v in self.views {

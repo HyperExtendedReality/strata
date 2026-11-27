@@ -7,6 +7,7 @@ use std::sync::{Mutex, OnceLock};
 
 use strata_gpu::runner::ComputeRunner;
 
+use crate::audio::{XAudio2Engine, XapuHal};
 use crate::runtime::HleRuntime;
 use crate::xg::{SwizzleMode, TextureLayout};
 use crate::xmem_phys::XMEM_PAGE_BYTES;
@@ -17,12 +18,29 @@ struct GlobalHle {
     runtime: HleRuntime,
 }
 
+/// Global Audio HLE state (`XAudio2Engine` + `XapuHal`) independent of Vulkan initialization.
+struct GlobalAudio {
+    xaudio2: XAudio2Engine,
+    xapu: XapuHal,
+}
+
 // SAFETY: GlobalHle is exclusively accessed behind a Mutex.
 unsafe impl Send for GlobalHle {}
 
 static GLOBAL_HLE: OnceLock<Mutex<GlobalHle>> = OnceLock::new();
+static GLOBAL_AUDIO: OnceLock<Mutex<GlobalAudio>> = OnceLock::new();
 static AUDIO_STUB_CALLS: AtomicU64 = AtomicU64::new(0);
 static UNIMPLEMENTED_STUB_CALLS: AtomicU64 = AtomicU64::new(0);
+
+fn with_audio<R>(f: impl FnOnce(&mut GlobalAudio) -> R) -> R {
+    let lock = GLOBAL_AUDIO.get_or_init(|| {
+        Mutex::new(GlobalAudio {
+            xaudio2: XAudio2Engine::new(48_000),
+            xapu: XapuHal::new(),
+        })
+    });
+    f(&mut lock.lock().unwrap())
+}
 
 fn with_hle<R>(f: impl FnOnce(&mut GlobalHle) -> R) -> Option<R> {
     let lock = GLOBAL_HLE.get_or_init(|| {
@@ -236,20 +254,84 @@ unsafe extern "system" fn xg_get_offset(
 // xmem.dll
 // ============================================================================
 
+const MEM_LARGE_PAGES: u32 = 0x2000_0000;
+const MEM_RELEASE: u32 = 0x8000;
+
 unsafe extern "system" fn xmem_virtual_alloc(
     address: *mut c_void,
     size: usize,
-    _alloc_type: u32,
+    alloc_type: u32,
     _protect: u32,
 ) -> *mut c_void {
+    let aligned_size = if (alloc_type & MEM_LARGE_PAGES) != 0 {
+        size.max(XMEM_PAGE_BYTES).next_multiple_of(XMEM_PAGE_BYTES)
+    } else {
+        size.max(64)
+    };
     with_hle(|g| {
         let req_va = address as u64;
-        if let Ok((va, _bda)) = g.runtime.xmem_virtual_alloc(&g.runner, req_va, size as u64) {
+        if let Ok((va, _bda)) = g
+            .runtime
+            .xmem_virtual_alloc(&g.runner, req_va, aligned_size as u64)
+        {
             return va as *mut c_void;
         }
         std::ptr::null_mut()
     })
     .unwrap_or(std::ptr::null_mut())
+}
+
+unsafe extern "system" fn xmem_virtual_free(
+    address: *mut c_void,
+    _size: usize,
+    free_type: u32,
+) -> i32 {
+    if address.is_null() {
+        return 0;
+    }
+    if (free_type & MEM_RELEASE) != 0 {
+        return with_hle(|g| i32::from(g.runtime.xmem_free(&g.runner, address as u64)))
+            .unwrap_or(0);
+    }
+    // MEM_DECOMMIT keeps the virtual reservation alive.
+    1
+}
+
+unsafe extern "system" fn xmem_virtual_protect(
+    address: *mut c_void,
+    size: usize,
+    new_protect: u32,
+    old_protect: *mut u32,
+) -> i32 {
+    if address.is_null() || size == 0 || new_protect == 0 {
+        return 0;
+    }
+    if !old_protect.is_null() {
+        unsafe { *old_protect = 0x04 }; // PAGE_READWRITE
+    }
+    1
+}
+
+unsafe extern "system" fn xmem_unmap_physical_pages(
+    base_address: *mut c_void,
+    num_pages: usize,
+) -> i32 {
+    if base_address.is_null() || num_pages == 0 {
+        return 0;
+    }
+    with_hle(|g| {
+        let unmapped = g.runtime.phys_pool.unmap_range(
+            &mut g.runtime.uma.address_space,
+            base_address as u64,
+            num_pages,
+        );
+        i32::from(unmapped > 0)
+    })
+    .unwrap_or(0)
+}
+
+unsafe extern "system" fn xmem_get_physical_page_count() -> usize {
+    with_hle(|g| g.runtime.phys_pool.active_pages()).unwrap_or(0)
 }
 
 unsafe extern "system" fn xmem_alloc(size: usize, _attrs: u64) -> *mut c_void {
@@ -472,10 +554,69 @@ unsafe extern "system" fn dstorage_get_factory(
     0 // S_OK
 }
 
-/// Audio subsystem (`xapu.dll` / `AcpHal.dll`) offline/silent stub with call tracking.
+/// Audio subsystem (`xapu.dll` / `AcpHal.dll`) offline/silent fallback with call tracking.
 unsafe extern "system" fn audio_stub_silent() -> i32 {
     AUDIO_STUB_CALLS.fetch_add(1, Ordering::Relaxed);
-    0 // S_OK (silent audio device)
+    0 // S_OK
+}
+
+/// Real HLE `XAudio2Create` / `XAPUCreate` backed by `audio::XAudio2Engine`.
+unsafe extern "system" fn xaudio2_create(
+    out_engine: *mut *mut c_void,
+    _flags: u32,
+    _processor: u32,
+) -> i32 {
+    if out_engine.is_null() {
+        return 0x8007_0057u32 as i32; // E_INVALIDARG
+    }
+    let handle = with_audio(|a| {
+        let voice_id = a.xaudio2.create_submix_voice();
+        voice_id as usize
+    });
+    unsafe { *out_engine = handle as *mut c_void };
+    0 // S_OK
+}
+
+/// Real HLE `AcpHalCreate` returning a non-null handle to Strata's `XapuHal`.
+unsafe extern "system" fn acphal_create(out_hal: *mut *mut c_void) -> i32 {
+    if out_hal.is_null() {
+        return 0x8007_0057u32 as i32; // E_INVALIDARG
+    }
+    with_audio(|a| {
+        let _ = &a.xapu;
+    });
+    unsafe { *out_hal = 0x5841_5055usize as *mut c_void }; // "XAPU" sentinel handle
+    0 // S_OK
+}
+
+/// Real HLE `AcpHalAllocateShapeContexts` allocating hardware XMA2 decoder contexts in `XapuHal`.
+unsafe extern "system" fn acphal_allocate_shape_contexts(count: u32, out_ids: *mut u32) -> i32 {
+    if count == 0 || out_ids.is_null() {
+        return 0x8007_0057u32 as i32; // E_INVALIDARG
+    }
+    with_audio(|a| {
+        for i in 0..count as usize {
+            let Some(id) = a.xapu.create_xma_context(2, 48_000) else {
+                return 0x8007_000Eu32 as i32; // E_OUTOFMEMORY
+            };
+            unsafe { *out_ids.add(i) = id };
+        }
+        0 // S_OK
+    })
+}
+
+/// Real HLE `AcpHalReleaseShapeContexts` releasing allocated XMA2 contexts in `XapuHal`.
+unsafe extern "system" fn acphal_release_shape_contexts(count: u32, ids: *const u32) -> i32 {
+    if count == 0 || ids.is_null() {
+        return 0;
+    }
+    with_audio(|a| {
+        for i in 0..count as usize {
+            let id = unsafe { *ids.add(i) };
+            a.xapu.contexts.remove(&id);
+        }
+    });
+    0 // S_OK
 }
 
 /// Logged fallback stub for unimplemented console functions.
@@ -490,14 +631,18 @@ pub fn resolve_hle(dll_name: &str, func_name: &str) -> Option<usize> {
     match dll.as_str() {
         "xmem.dll" => Some(match func_name {
             "XMemVirtualAlloc" => xmem_virtual_alloc as *const () as usize,
+            "XMemVirtualFree" => xmem_virtual_free as *const () as usize,
+            "XMemVirtualProtect" => xmem_virtual_protect as *const () as usize,
             "XMemAlloc" | "XMemAllocDefault" => xmem_alloc as *const () as usize,
             "XMemFree" | "XMemFreeDefault" => xmem_free as *const () as usize,
             "XMemIsToolsMemAvailable" => xmem_is_tools_mem_available as *const () as usize,
             "XMemAllocatePhysicalPages" => xmem_allocate_physical_pages as *const () as usize,
             "XMemFreePhysicalPages" => xmem_free_physical_pages as *const () as usize,
+            "XMemGetPhysicalPageCount" => xmem_get_physical_page_count as *const () as usize,
             "XMemGetWorkingSetStatistics" => xmem_get_working_set_statistics as *const () as usize,
             "XMemMapPhysicalPages" => xmem_map_physical_pages as *const () as usize,
             "XMemMapPhysicalPagesScatter" => xmem_map_physical_pages_scatter as *const () as usize,
+            "XMemUnmapPhysicalPages" => xmem_unmap_physical_pages as *const () as usize,
             "XMemTransferMemory" => xmem_transfer_memory as *const () as usize,
             _ => return None,
         }),
@@ -534,9 +679,18 @@ pub fn resolve_hle(dll_name: &str, func_name: &str) -> Option<usize> {
             | "XAsyncGetStatus" => audio_stub_silent as *const () as usize,
             _ => logged_unimplemented_stub as *const () as usize,
         }),
-        "xaudio2_9.dll" | "xaudio2_9redist.dll" | "xapu.dll" | "acphal.dll" => {
-            Some(audio_stub_silent as *const () as usize)
-        }
+        "xaudio2_9.dll" | "xaudio2_9redist.dll" => Some(match func_name {
+            "XAudio2Create" | "XAudio2CreateWithVersionInfo" => {
+                xaudio2_create as *const () as usize
+            }
+            _ => audio_stub_silent as *const () as usize,
+        }),
+        "xapu.dll" | "acphal.dll" => Some(match func_name {
+            "AcpHalCreate" | "XAPUCreate" => acphal_create as *const () as usize,
+            "AcpHalAllocateShapeContexts" => acphal_allocate_shape_contexts as *const () as usize,
+            "AcpHalReleaseShapeContexts" => acphal_release_shape_contexts as *const () as usize,
+            _ => audio_stub_silent as *const () as usize,
+        }),
         "gameinput.dll" => Some(audio_stub_silent as *const () as usize),
         "libhttpclient.gdk.dll" | "xnetworking.dll" => {
             Some(offline_net_denied as *const () as usize)
@@ -602,6 +756,49 @@ mod tests {
                 65_536
             );
             assert_eq!(((*comp).vtable.release)(xg_ptr), 0);
+        }
+    }
+
+    #[test]
+    fn resolves_xmem_extended_and_real_audio_thunks() {
+        for (dll, func) in [
+            ("xmem.dll", "XMemVirtualFree"),
+            ("xmem.dll", "XMemVirtualProtect"),
+            ("xmem.dll", "XMemUnmapPhysicalPages"),
+            ("xmem.dll", "XMemGetPhysicalPageCount"),
+            ("xaudio2_9.dll", "XAudio2Create"),
+            ("acphal.dll", "AcpHalCreate"),
+            ("acphal.dll", "AcpHalAllocateShapeContexts"),
+            ("acphal.dll", "AcpHalReleaseShapeContexts"),
+        ] {
+            assert!(
+                resolve_hle(dll, func).is_some(),
+                "missing HLE thunk for {dll}!{func}"
+            );
+        }
+
+        unsafe {
+            let mut engine_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(xaudio2_create(&mut engine_ptr, 0, 0), 0);
+            assert!(!engine_ptr.is_null());
+
+            let mut hal_ptr: *mut c_void = std::ptr::null_mut();
+            assert_eq!(acphal_create(&mut hal_ptr), 0);
+            assert!(!hal_ptr.is_null());
+
+            let mut ctx_ids = [u32::MAX; 2];
+            assert_eq!(acphal_allocate_shape_contexts(2, ctx_ids.as_mut_ptr()), 0);
+            assert_ne!(ctx_ids[0], u32::MAX);
+            assert_ne!(ctx_ids[1], u32::MAX);
+            assert_ne!(ctx_ids[0], ctx_ids[1]);
+            assert_eq!(acphal_release_shape_contexts(2, ctx_ids.as_ptr()), 0);
+
+            let mut old_prot = 0u32;
+            assert_eq!(
+                xmem_virtual_protect(0x1000 as *mut c_void, 4096, 0x04, &mut old_prot),
+                1
+            );
+            assert_eq!(old_prot, 0x04);
         }
     }
 }

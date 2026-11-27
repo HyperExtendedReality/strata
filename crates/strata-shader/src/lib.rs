@@ -389,4 +389,32 @@ mod tests {
         );
         assert!(d(0x0041).is_err(), "bit-mask mode");
     }
+
+    #[test]
+    fn pixel_shader_frag_coord_and_front_facing_validates_spirv() {
+        use rdna2::encode::*;
+        // Enable pos_x (bit 8 -> v0), pos_y (bit 9 -> v1), front_face (bit 12 -> v2)
+        let ps_vgprs =
+            geometry::PsInputVgprs::from_spi_ps_input_ena((1 << 8) | (1 << 9) | (1 << 12));
+        assert_eq!(ps_vgprs.pos_x, Some(0));
+        assert_eq!(ps_vgprs.pos_y, Some(1));
+        assert_eq!(ps_vgprs.front_face, Some(2));
+
+        let mut prog = Vec::new();
+        // Export mrt0 = (v0=FragCoord.x, v1=FragCoord.y, v2=FrontFacing, v0)
+        prog.extend(exp(0, 0b1111, [0, 1, 2, 0], true, false));
+        prog.push(s_endpgm());
+
+        let compiled = compile_rdna2_with(
+            &prog,
+            [1, 1, 1],
+            &ssa::BuildOptions {
+                stage: ssa::Stage::Pixel,
+                ps_input_vgprs: Some(ps_vgprs),
+                ..Default::default()
+            },
+        )
+        .expect("PS with FragCoord + FrontFacing should compile");
+        assert_spirv_valid(&compiled.spirv, "ps_frag_coord_front_facing");
+    }
 }

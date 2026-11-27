@@ -71,6 +71,24 @@ impl PhysicalPagePool {
         mapped
     }
 
+    /// Unmap `num_pages` contiguous 64 KiB virtual views starting at `base_va`
+    /// (`XMemUnmapPhysicalPages`), returning how many views were removed.
+    pub fn unmap_range(
+        &self,
+        address_space: &mut AddressSpace,
+        base_va: u64,
+        num_pages: usize,
+    ) -> usize {
+        let mut unmapped = 0usize;
+        for i in 0..num_pages {
+            let va = base_va + (i as u64) * (XMEM_PAGE_BYTES as u64);
+            if address_space.unmap_physical_view(va) {
+                unmapped += 1;
+            }
+        }
+        unmapped
+    }
+
     pub fn active_pages(&self) -> usize {
         self.allocated.len()
     }
@@ -94,6 +112,8 @@ mod tests {
             space.views_of_physical_page(pfns[0]),
             &[0x1_0000_0000, 0x2_0000_0000]
         );
+        assert_eq!(pool.unmap_range(&mut space, 0x2_0000_0000, 2), 2);
+        assert_eq!(space.views_of_physical_page(pfns[0]), &[0x1_0000_0000]);
         pool.free_pages(&pfns);
         assert_eq!(pool.active_pages(), 0);
     }

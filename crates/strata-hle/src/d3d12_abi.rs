@@ -205,6 +205,124 @@ pub fn build_standard_queue_vtable(
     vt
 }
 
+/// Build a standard-ABI slot table for `ID3D12Resource` (15 slots) matching
+/// Microsoft `d3d12.h` slot indices (`IUnknown` -> `ID3D12Object` -> `ID3D12DeviceChild` -> `ID3D12Resource`).
+pub fn build_standard_resource_vtable(
+    qi: *const (),
+    add_ref: *const (),
+    release: *const (),
+    map: *const (),
+    unmap: *const (),
+    get_gpu_va: *const (),
+) -> [VTableSlot; RESOURCE_VTABLE_LEN] {
+    let mut vt = [VTableSlot(stub_ok as *const ()); RESOURCE_VTABLE_LEN];
+    vt[SLOT_QUERY_INTERFACE] = VTableSlot(qi);
+    vt[SLOT_ADD_REF] = VTableSlot(add_ref);
+    vt[SLOT_RELEASE] = VTableSlot(release);
+    vt[RESOURCE_SLOT_MAP] = VTableSlot(map);
+    vt[RESOURCE_SLOT_UNMAP] = VTableSlot(unmap);
+    vt[RESOURCE_SLOT_GET_GPU_VA] = VTableSlot(get_gpu_va);
+    vt
+}
+
+/// Callbacks wired into a standard-ABI `ID3D12GraphicsCommandList` (60-slot) vtable.
+#[derive(Clone, Copy)]
+pub struct CmdListVTableHooks {
+    pub qi: *const (),
+    pub add_ref: *const (),
+    pub release: *const (),
+    pub close: *const (),
+    pub reset: *const (),
+    pub draw_instanced: *const (),
+    pub draw_indexed_instanced: *const (),
+    pub dispatch: *const (),
+    pub copy_buffer_region: *const (),
+    pub copy_texture_region: *const (),
+    pub copy_resource: *const (),
+    pub set_pipeline_state: *const (),
+    pub resource_barrier: *const (),
+    pub set_descriptor_heaps: *const (),
+    pub set_compute_root_signature: *const (),
+    pub set_graphics_root_signature: *const (),
+    pub set_compute_root_32bit_constants: *const (),
+    pub om_set_render_targets: *const (),
+    pub execute_indirect: *const (),
+}
+
+/// Build a standard-ABI slot table for `ID3D12GraphicsCommandList` (60 slots).
+pub fn build_standard_cmdlist_vtable(
+    hooks: &CmdListVTableHooks,
+) -> [VTableSlot; CMDLIST_VTABLE_LEN] {
+    let mut vt = [VTableSlot(stub_void as *const ()); CMDLIST_VTABLE_LEN];
+    vt[SLOT_QUERY_INTERFACE] = VTableSlot(hooks.qi);
+    vt[SLOT_ADD_REF] = VTableSlot(hooks.add_ref);
+    vt[SLOT_RELEASE] = VTableSlot(hooks.release);
+    vt[SLOT_GET_PRIVATE_DATA] = VTableSlot(stub_ok as *const ());
+    vt[SLOT_SET_PRIVATE_DATA] = VTableSlot(stub_ok as *const ());
+    vt[SLOT_SET_PRIVATE_DATA_INTERFACE] = VTableSlot(stub_ok as *const ());
+    vt[SLOT_SET_NAME] = VTableSlot(stub_ok as *const ());
+    vt[SLOT_GET_DEVICE] = VTableSlot(stub_ok as *const ());
+    vt[CMDLIST_SLOT_CLOSE] = VTableSlot(hooks.close);
+    vt[CMDLIST_SLOT_RESET] = VTableSlot(hooks.reset);
+    vt[CMDLIST_SLOT_DRAW_INSTANCED] = VTableSlot(hooks.draw_instanced);
+    vt[CMDLIST_SLOT_DRAW_INDEXED_INSTANCED] = VTableSlot(hooks.draw_indexed_instanced);
+    vt[CMDLIST_SLOT_DISPATCH] = VTableSlot(hooks.dispatch);
+    vt[CMDLIST_SLOT_COPY_BUFFER_REGION] = VTableSlot(hooks.copy_buffer_region);
+    vt[CMDLIST_SLOT_COPY_TEXTURE_REGION] = VTableSlot(hooks.copy_texture_region);
+    vt[CMDLIST_SLOT_COPY_RESOURCE] = VTableSlot(hooks.copy_resource);
+    vt[CMDLIST_SLOT_SET_PIPELINE_STATE] = VTableSlot(hooks.set_pipeline_state);
+    vt[CMDLIST_SLOT_RESOURCE_BARRIER] = VTableSlot(hooks.resource_barrier);
+    vt[CMDLIST_SLOT_SET_DESCRIPTOR_HEAPS] = VTableSlot(hooks.set_descriptor_heaps);
+    vt[CMDLIST_SLOT_SET_COMPUTE_ROOT_SIGNATURE] = VTableSlot(hooks.set_compute_root_signature);
+    vt[CMDLIST_SLOT_SET_GRAPHICS_ROOT_SIGNATURE] = VTableSlot(hooks.set_graphics_root_signature);
+    vt[CMDLIST_SLOT_SET_COMPUTE_ROOT_32BIT_CONSTANTS] =
+        VTableSlot(hooks.set_compute_root_32bit_constants);
+    vt[CMDLIST_SLOT_OM_SET_RENDER_TARGETS] = VTableSlot(hooks.om_set_render_targets);
+    vt[CMDLIST_SLOT_EXECUTE_INDIRECT] = VTableSlot(hooks.execute_indirect);
+    vt
+}
+
+/// Callbacks wired into a standard-ABI `ID3D12Device` (44-slot) vtable.
+#[derive(Clone, Copy)]
+pub struct DeviceVTableHooks {
+    pub qi: *const (),
+    pub add_ref: *const (),
+    pub release: *const (),
+    pub create_command_queue: *const (),
+    pub create_command_allocator: *const (),
+    pub create_graphics_pso: *const (),
+    pub create_compute_pso: *const (),
+    pub create_command_list: *const (),
+    pub check_feature_support: *const (),
+    pub create_descriptor_heap: *const (),
+    pub get_descriptor_handle_inc: *const (),
+    pub create_root_signature: *const (),
+    pub create_committed_resource: *const (),
+    pub create_fence: *const (),
+    pub get_device_removed_reason: *const (),
+}
+
+/// Build a standard-ABI slot table for `ID3D12Device` (44 slots).
+pub fn build_standard_device_vtable(hooks: &DeviceVTableHooks) -> [VTableSlot; DEVICE_VTABLE_LEN] {
+    let mut vt = [VTableSlot(stub_ok as *const ()); DEVICE_VTABLE_LEN];
+    vt[SLOT_QUERY_INTERFACE] = VTableSlot(hooks.qi);
+    vt[SLOT_ADD_REF] = VTableSlot(hooks.add_ref);
+    vt[SLOT_RELEASE] = VTableSlot(hooks.release);
+    vt[DEVICE_SLOT_CREATE_COMMAND_QUEUE] = VTableSlot(hooks.create_command_queue);
+    vt[DEVICE_SLOT_CREATE_COMMAND_ALLOCATOR] = VTableSlot(hooks.create_command_allocator);
+    vt[DEVICE_SLOT_CREATE_GRAPHICS_PSO] = VTableSlot(hooks.create_graphics_pso);
+    vt[DEVICE_SLOT_CREATE_COMPUTE_PSO] = VTableSlot(hooks.create_compute_pso);
+    vt[DEVICE_SLOT_CREATE_COMMAND_LIST] = VTableSlot(hooks.create_command_list);
+    vt[DEVICE_SLOT_CHECK_FEATURE_SUPPORT] = VTableSlot(hooks.check_feature_support);
+    vt[DEVICE_SLOT_CREATE_DESCRIPTOR_HEAP] = VTableSlot(hooks.create_descriptor_heap);
+    vt[DEVICE_SLOT_GET_DESCRIPTOR_HANDLE_INC] = VTableSlot(hooks.get_descriptor_handle_inc);
+    vt[DEVICE_SLOT_CREATE_ROOT_SIGNATURE] = VTableSlot(hooks.create_root_signature);
+    vt[DEVICE_SLOT_CREATE_COMMITTED_RESOURCE] = VTableSlot(hooks.create_committed_resource);
+    vt[DEVICE_SLOT_CREATE_FENCE] = VTableSlot(hooks.create_fence);
+    vt[DEVICE_SLOT_GET_DEVICE_REMOVED_REASON] = VTableSlot(hooks.get_device_removed_reason);
+    vt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +344,69 @@ mod tests {
             assert_eq!(get_val(fence.cast()), 99);
             assert_eq!(release(fence.cast()), 0);
         }
+    }
+
+    #[test]
+    fn standard_resource_queue_cmdlist_device_vtables_match_d3d12_slot_layout() {
+        let ok = stub_ok as *const ();
+        let void = stub_void as *const ();
+        let res_vt = build_standard_resource_vtable(ok, ok, ok, ok, void, ok);
+        assert_eq!(res_vt.len(), RESOURCE_VTABLE_LEN);
+        assert_eq!(res_vt[RESOURCE_SLOT_MAP].0, ok);
+        assert_eq!(res_vt[RESOURCE_SLOT_UNMAP].0, void);
+        assert_eq!(res_vt[RESOURCE_SLOT_GET_GPU_VA].0, ok);
+
+        let q_vt = build_standard_queue_vtable(ok, ok, ok, void, ok);
+        assert_eq!(q_vt.len(), QUEUE_VTABLE_LEN);
+        assert_eq!(q_vt[QUEUE_SLOT_EXECUTE_COMMAND_LISTS].0, void);
+        assert_eq!(q_vt[QUEUE_SLOT_SIGNAL].0, ok);
+
+        let cl_vt = build_standard_cmdlist_vtable(&CmdListVTableHooks {
+            qi: ok,
+            add_ref: ok,
+            release: ok,
+            close: ok,
+            reset: ok,
+            draw_instanced: void,
+            draw_indexed_instanced: void,
+            dispatch: void,
+            copy_buffer_region: void,
+            copy_texture_region: void,
+            copy_resource: void,
+            set_pipeline_state: void,
+            resource_barrier: void,
+            set_descriptor_heaps: void,
+            set_compute_root_signature: void,
+            set_graphics_root_signature: void,
+            set_compute_root_32bit_constants: void,
+            om_set_render_targets: void,
+            execute_indirect: void,
+        });
+        assert_eq!(cl_vt.len(), CMDLIST_VTABLE_LEN);
+        assert_eq!(cl_vt[CMDLIST_SLOT_DISPATCH].0, void);
+        assert_eq!(cl_vt[CMDLIST_SLOT_CLOSE].0, ok);
+        assert_eq!(cl_vt[CMDLIST_SLOT_EXECUTE_INDIRECT].0, void);
+
+        let dev_vt = build_standard_device_vtable(&DeviceVTableHooks {
+            qi: ok,
+            add_ref: ok,
+            release: ok,
+            create_command_queue: ok,
+            create_command_allocator: ok,
+            create_graphics_pso: ok,
+            create_compute_pso: ok,
+            create_command_list: ok,
+            check_feature_support: ok,
+            create_descriptor_heap: ok,
+            get_descriptor_handle_inc: ok,
+            create_root_signature: ok,
+            create_committed_resource: ok,
+            create_fence: ok,
+            get_device_removed_reason: ok,
+        });
+        assert_eq!(dev_vt.len(), DEVICE_VTABLE_LEN);
+        assert_eq!(dev_vt[DEVICE_SLOT_CREATE_COMMAND_QUEUE].0, ok);
+        assert_eq!(dev_vt[DEVICE_SLOT_CREATE_COMMITTED_RESOURCE].0, ok);
+        assert_eq!(dev_vt[DEVICE_SLOT_CREATE_FENCE].0, ok);
     }
 }

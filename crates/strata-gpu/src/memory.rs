@@ -47,6 +47,20 @@ impl AddressSpace {
         }
     }
 
+    /// Remove virtual address `view_va` from every physical page mapping.
+    pub fn unmap_physical_view(&mut self, view_va: u64) -> bool {
+        let mut removed = false;
+        self.phys_views.retain(|_, views| {
+            let before = views.len();
+            views.retain(|&v| v != view_va);
+            if views.len() != before {
+                removed = true;
+            }
+            !views.is_empty()
+        });
+        removed
+    }
+
     /// Return every virtual address aliasing `phys_page` so guards apply to all views atomically.
     pub fn views_of_physical_page(&self, phys_page: u64) -> &[u64] {
         self.phys_views.get(&phys_page).map_or(&[], Vec::as_slice)

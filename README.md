@@ -117,7 +117,8 @@ Instead of rebuilding legacy Direct3D 12 abstractions on top of console hardware
 
 | Crate | Purpose |
 | :--- | :--- |
-| [`crates/strata-shader`](crates/strata-shader) | Pure-Rust RDNA2 decoder, SSA IR, optimizer (bitcast cancellation, CSE, DCE, 128-bit BDA load coalescing), Wave64 liveness, `DXBC`/`XBCH` (zlib)/`FSSM` container parser, CPU BVH reference, atomic SPIR-V disk cache, and direct SPIR-V 1.6 (`PhysicalStorageBuffer64`) emitter. |
+| [`crates/strata-shader`](crates/strata-shader) | Pure-Rust RDNA2 decoder, SSA IR, optimizer (bitcast cancellation, CSE, DCE, 128-bit BDA load coalescing), Wave64 liveness, `DXBC`/`XBCH` (zlib)/`FSSM` container parser, CPU BVH reference, atomic SPIR-V disk cache, versioned shader store, and direct SPIR-V 1.6 (`PhysicalStorageBuffer64`) emitter. |
+| [`crates/strata-formats`](crates/strata-formats) | Clean-room console asset format decoders: `SGD5` shader archives, `BCPack`, `XMA2` audio frame decoder, and console texture format/swizzle tables. |
 | [`crates/strata-runtime-shaders`](crates/strata-runtime-shaders) | Emulator-authored internal shaders written in **Slang** (`Ptr<T>`, generics, wave intrinsics) compiled offline via `slangc` in `build.rs` and embedded as SPIR-V 1.6 byte slices. |
 | [`crates/strata-gpu`](crates/strata-gpu) | Raw `ash` No-API Vulkan 1.3+ engine: capability probe, single global bindless + push-constant layout, 3-tier `UmaManager`, 64 KiB `SparseTilePool`, fence-gated `BindlessManager`, `ThinCommandList`, `FramePacingClock`, Win32 `SwapchainPresenter`, and live BDA `ComputeRunner`. |
 | [`crates/strata-hle`](crates/strata-hle) | Zero-dependency PE32+ parser/mapper (sections, DIR64 relocations, IAT, exports, static TLS), Zen 2 VEH emulator, `PhysicalPagePool` scatter mapper, VFS drive rewriter, `LoadLibrary`/`GetProcAddress` hooks, offline `DStorage`/GDK stubs, `xg_xs` swizzle layout computer, input mapper, and `d3d12_xs` COM vtables. |
@@ -134,14 +135,14 @@ Strata is an early-stage research prototype. Subsystems below are verified on sy
 
 | Component | Status | Verified By / Current Scope |
 | :--- | :---: | :--- |
-| RDNA2 decoder (`SOPP`/`SOPC`/`SOP1`/`SOPK`/`SOP2`, `VOP1`/`VOPC`/`VOP2`/`VOP3`, `SMEM`, `FLAT`/`GLOBAL`, `DS`, `MUBUF`/`MTBUF`, `MIMG`, `EXP`) | 🟡 | Unit tests; covers core compute/ALU/memory/ray-tracing encodings (not full 400+ opcode ISA yet) |
-| Direct RDNA2 → SSA → SPIR-V 1.6 (BDA, LDS incl. `ds_add_u32` atomics, VOP3, BVH64), stores predicated on EXEC | 🟡 | `spirv-val` + live GPU execution on synthetic RDNA2 kernels |
+| RDNA2 decoder (`SOPP`/`SOPC`/`SOP1`/`SOPK`/`SOP2`, `VOP1`/`VOPC`/`VOP2`/`VOP3`, `SMEM`, `FLAT`/`GLOBAL`, `DS`, `MUBUF`/`MTBUF`, `MIMG`, `EXP`) | 🟡 | Unit tests; 18-encoding opcode table (`opcodes.rs`, incl. `VOP3P`/`VINTRP`/`SCRATCH`) and core compute/ALU/memory/ray-tracing IR decoding (not full 400+ opcode ISA yet) |
+| Direct RDNA2 → SSA → SPIR-V 1.6 (BDA, LDS incl. `ds_add_u32` atomics, VOP3, BVH64), stores predicated on EXEC | 🟡 | `spirv-val` + live GPU execution on synthetic RDNA2 kernels; includes spill-frame backing (`spill.rs`) and Wave64 permutes/waterfall (`wave_ops.rs`) |
 | Typed buffers (`tbuffer_*`): GFX10 formats converted (UNORM `x/(2^n-1)`, SNORM clamped to -1, scaled, half, 32-bit), `idxen` record addressing | ✅ | `spirv-val` + live GPU results (RGBA8_UNORM, RG16_SNORM loads; RGBA8_UNORM store). Packed 10/11-bit formats and sub-dword typed stores return explicit errors |
 | Image instructions (`image_sample`/`_l`/`_b`/`_lz`, `image_load(_mip)`, `image_store`) → set-0 `textures[16]`/`samplers[16]`/`storage_images[16]`, slots in program order | ✅ | `spirv-val` + live GPU: fetch (linear and Morton), swizzled T#, point sampling, storage write-back to title memory. 2D only; integer formats refused |
-| Vertex / pixel stages: `EXP` (`pos0`, `param0..31`, `mrt0..7`, `mrtz`, compressed halves), `v_interp_p1/p2/mov`, implicit-LOD sampling, quad swizzles (`RequireFullQuadsKHR` when the device has `VK_KHR_shader_quad_control`) | 🟡 | `spirv-val` + live GPU draws through the D3D12.X queue. VS input layout is GFX10 legacy (v0 vertex id, v3 instance id); NGG primitive shaders and PS barycentric/position VGPRs are not modelled |
+| Vertex / pixel / geometry stages: `EXP` (`pos0`, `param0..31`, `mrt0..7`, `mrtz`, compressed halves), `v_interp_p1/p2/mov`, `SPI_PS_INPUT_ENA` (`FragCoord`/`FrontFacing` VGPRs), GS `OpEmitVertex`/`OpEndPrimitive`, implicit-LOD sampling, quad swizzles (`RequireFullQuadsKHR`) | 🟡 | `spirv-val` + live GPU draws through the D3D12.X queue. VS input layout is GFX10 legacy (`v0` vertex id, `v3` instance id); NGG/mesh shader SPIR-V emission in progress |
 | 128-bit BDA load coalescing & bitcast/CSE/DCE opt | ✅ | Unit test + live GPU execution |
 | RDNA2-translated Structured CFG (`s_and_saveexec_b64` + `s_cbranch_execz` → `OpSelectionMerge` + `OpPhi`) | ✅ | `spirv-val` + live GPU divergent-lane execution (forward branches) |
-| Structured loops (do-while and while forms, nested, per-lane EXEC exit → `OpLoopMerge` + header `OpPhi`) | 🟡 | `spirv-val` + live GPU results for uniform, while, nested and divergent EXEC loops; breaks out of a body / irreducible flow return explicit errors |
+| Structured loops (do-while and while forms, nested, per-lane EXEC exit → `OpLoopMerge` + header `OpPhi`) & CFG structurizer | 🟡 | `spirv-val` + live GPU results for uniform, while, nested and divergent EXEC loops; standalone `structurizer.rs` handles reducible/irreducible state-machine CFGs, while SSA lowering returns explicit errors on mid-body breaks / irreducible flow |
 | Descriptor tracing (V#/T#/S#/BVH descriptor → user SGPR, root table + offset, nested table, waterfall) | ✅ | Unit tests; reported by `strata-cli translate` |
 | Translation coverage tool (`strata-cli translate`: finds `XBCH`/`FSSM` in any file, ranks blockers by encoding/reason) | ✅ | Unit tests on raw and embedded containers |
 | RDNA2-translated Wave64 ballot (`wave.rs` whole-live analysis → `OpGroupNonUniformBallot` + Workgroup atomic merge) | ✅ | `spirv-val` + live GPU test across hardware subgroup sizes (`0x5555555555555555`) |
@@ -166,8 +167,8 @@ Strata is an early-stage research prototype. Subsystems below are verified on sy
 | Textures from T#s in title memory (GFX10 formats → Vulkan, `DST_SEL` swizzles, linear / Strata's 64KB Morton model), re-uploaded when bytes change; samplers from S#s | ✅ | Unit + live GPU tests. Other swizzle modes and mips beyond level 0 refused / not uploaded |
 | Graphics draws: dynamic rendering into render targets described like textures, D3D clip convention (flipped viewport), written back to title memory | ✅ | Live GPU draw test (`tests/draws.rs`) |
 | Shadowed Tier 2 mirrors: `MEM_WRITE_WATCH` host copy, page-exact upload of CPU writes, GPU→title read-back (`ReadbackTexture`) | ✅ | Live GPU test (dirty pages only, read-back restores VRAM bytes) |
-| Pipeline table + persistent `VkPipelineCache`, `strata-cli warm` pre-creation | 🟡 | Each pipeline created once and reused; warm-up over the SPIR-V cache (not timed on a real title yet) |
-| `FramePacingClock` + Win32 `Win32Window` / `SwapchainPresenter` + atomic `VkPipelineCache` | 🟡 | Windows x64 only today; Linux X11/Wayland surface support planned |
+| Pipeline table + persistent atomic `VkPipelineCache` (compute & graphics), `PipelineLibrary` serialization, versioned shader store, `strata-cli warm` | ✅ | Shared `VkPipelineCache` used for compute and graphics pipelines, saved atomically (`.tmp` + rename); unit tests + `strata-cli warm` / `shaders` |
+| `FramePacingClock` + Win32 `Win32Window` / `SwapchainPresenter` (`acquire_next_image` / `present_image`) | 🟡 | Windows x64 complete; Linux X11/Wayland surface support planned |
 
 </details>
 
@@ -186,9 +187,9 @@ Strata is an early-stage research prototype. Subsystems below are verified on sy
 | Console drives through the VFS for path-taking kernel32/kernelx/CRT imports (`CreateFile*`, attributes, find, directories, `fopen`, ...) | ✅ | Unit test + probe title |
 | Crash reporter (unhandled faults as `module+rva`, `.pdata` stack unwind, crash log) | ✅ | Unit tests |
 | Live Windows VEH (`clzero`, `rdpru` via QPC, `rdpid` via `GetCurrentProcessorNumber`, `monitorx`/`mwaitx`, `clwb`) | ✅ | Unit tests (note: `clwb`/`rdpid` are also present on modern Intel CPUs; VEH catches faults on older/non-AMD CPUs) |
-| `xmem.dll` (`XMemVirtualAlloc`, `XMemFree`, physical-page pool & scatter mapping, working-set stats, `XMemTransferMemory`) | 🟡 | Wired to `UmaManager` + `PhysicalPagePool`; partial console flag coverage |
-| `d3d12_xs.dll` COM vtables (`Device`, `Queue`, `CommandList`, `Resource`, `Fence`, `ID3DBlob`) & `xg_xs.dll` (`XGTextureAddressComputer`) | 🟡 | Unit tests + synthetic GPU compute dispatch; full retail vtable slot parity in progress |
-| Audio (`xapu.dll` / `AcpHal.dll`) & unimplemented console imports | 🟡 | Offline silent audio stubs; every unresolved import gets its own named stub (`--unimplemented trap` (default) / `zero` / `notimpl`) |
+| `xmem.dll` (`XMemVirtualAlloc`/`Free`/`Protect`, `XMemAlloc`/`Free`, physical-page pool, scatter map/unmap, page-count & working-set stats, `XMemTransferMemory`) | ✅ | Wired to `UmaManager` + `PhysicalPagePool` (incl. `MEM_LARGE_PAGES` alignment, `MEM_RELEASE`/`MEM_DECOMMIT`, `XMemUnmapPhysicalPages`); unit + live UMA tests |
+| `d3d12_xs.dll` COM vtables (`Device`, `Queue`, `CommandList`, `Resource`, `Fence`, `ID3DBlob`) & `xg_xs.dll` (`XGTextureAddressComputer`) | 🟡 | Exact `d3d12.h` vtable slot tables (`d3d12_abi.rs`) for Fence/Resource/Queue/CommandList/Device + unit tests + live GPU compute/draw execution; full retail method body parity in progress |
+| Audio (`xaudio2_9.dll` / `xapu.dll` / `AcpHal.dll`) & unimplemented console imports | ✅ | `XAudio2Engine` (PCM16/F32/XMA2, submix graph, DSP chain, live `winmm` `waveOut` sink) + `XapuHal` XMA2 context pool wired in `thunks.rs`; unresolved console imports get per-import named stubs (`--unimplemented trap` / `zero` / `notimpl`) |
 
 </details>
 

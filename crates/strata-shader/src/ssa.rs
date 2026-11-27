@@ -352,6 +352,10 @@ pub enum StageInput {
     VertexIndex,
     /// Vertex shaders' `v3` (`InstanceIndex`).
     InstanceIndex,
+    /// Pixel shaders: component `chan` (0=x, 1=y, 2=z, 3=w) of `BuiltIn::FragCoord`.
+    FragCoord(u8),
+    /// Pixel shaders: `BuiltIn::FrontFacing` (1u if front-facing, 0u otherwise).
+    FrontFacing,
     /// Pixel shaders: component `chan` of parameter `loc` (`Location loc`),
     /// interpolated unless `flat`.
     Attr { loc: u8, chan: u8, flat: bool },
@@ -381,6 +385,10 @@ pub struct BuildOptions {
     /// Pixel shaders with quad operations run whole quads (helper lanes take
     /// part): `RequireFullQuadsKHR`, when the device has quad control.
     pub require_full_quads: bool,
+    /// Optional pixel-shader hardware input VGPR layout (`SPI_PS_INPUT_ENA`)
+    /// mapping `pos_x`/`pos_y`/`pos_z`/`pos_w` and `front_face` VGPRs to
+    /// `BuiltIn::FragCoord` / `BuiltIn::FrontFacing`.
+    pub ps_input_vgprs: Option<crate::geometry::PsInputVgprs>,
 }
 
 /// The pipeline stage a module is built for.
@@ -1509,7 +1517,27 @@ fn build_ssa_once(
             (0, SsaOp::StageInput(StageInput::VertexIndex)),
             (3, SsaOp::StageInput(StageInput::InstanceIndex)),
         ],
-        Stage::Pixel => vec![],
+        Stage::Pixel => {
+            let mut v = Vec::new();
+            if let Some(ps) = opts.ps_input_vgprs {
+                if let Some(r) = ps.pos_x {
+                    v.push((r, SsaOp::StageInput(StageInput::FragCoord(0))));
+                }
+                if let Some(r) = ps.pos_y {
+                    v.push((r, SsaOp::StageInput(StageInput::FragCoord(1))));
+                }
+                if let Some(r) = ps.pos_z {
+                    v.push((r, SsaOp::StageInput(StageInput::FragCoord(2))));
+                }
+                if let Some(r) = ps.pos_w {
+                    v.push((r, SsaOp::StageInput(StageInput::FragCoord(3))));
+                }
+                if let Some(r) = ps.front_face {
+                    v.push((r, SsaOp::StageInput(StageInput::FrontFacing)));
+                }
+            }
+            v
+        }
     };
     let initial: Vec<(u8, ValueId)> = initial
         .into_iter()

@@ -649,6 +649,7 @@ impl D3D12CommandQueueX {
             texture_slot_base: tex_base,
             storage_slot_base: stor_base,
             require_full_quads: self.gpu_runner.as_ref().is_some_and(|r| r.quad_control),
+            ps_input_vgprs: None,
         };
         let ps = strata_shader::compile_rdna2_with(ps_words, [1, 1, 1], &ps_opts)?;
         let ps_uses = trace_descriptors(&strata_shader::rdna2::decode_program(ps_words)?);

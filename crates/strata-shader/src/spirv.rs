@@ -157,6 +157,8 @@ const DEC_OFFSET: u32 = 35;
 
 // BuiltIns
 const BUILTIN_POSITION: u32 = 0;
+const BUILTIN_FRAG_COORD: u32 = 15;
+const BUILTIN_FRONT_FACING: u32 = 17;
 const BUILTIN_FRAG_DEPTH: u32 = 22;
 const BUILTIN_VERTEX_INDEX: u32 = 42;
 const BUILTIN_INSTANCE_INDEX: u32 = 43;
@@ -228,6 +230,9 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     exports.dedup();
     let uses_vid = live().any(|i| i.op == SsaOp::StageInput(StageInput::VertexIndex));
     let uses_iid = live().any(|i| i.op == SsaOp::StageInput(StageInput::InstanceIndex));
+    let uses_frag_coord =
+        live().any(|i| matches!(i.op, SsaOp::StageInput(StageInput::FragCoord(_))));
+    let uses_front_facing = live().any(|i| i.op == SsaOp::StageInput(StageInput::FrontFacing));
     let full_quads = stage == Stage::Pixel
         && module.require_full_quads
         && live().any(|i| matches!(i.op, SsaOp::QuadSwap { .. } | SsaOp::QuadBroadcast { .. }));
@@ -272,6 +277,8 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
         .collect();
     let vid_var = uses_vid.then(|| w.id());
     let iid_var = uses_iid.then(|| w.id());
+    let frag_coord_var = uses_frag_coord.then(|| w.id());
+    let front_facing_var = uses_front_facing.then(|| w.id());
     let out_vars: Vec<(ExportTarget, u32)> = exports.iter().map(|&t| (t, w.id())).collect();
 
     // EntryPoint: GLCompute (5), Vertex (0) or Fragment (4).
@@ -287,6 +294,12 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     }
     ep.extend(attr_vars.iter().map(|a| a.2));
     ep.extend(vid_var.iter().chain(iid_var.iter()).copied());
+    ep.extend(
+        frag_coord_var
+            .iter()
+            .chain(front_facing_var.iter())
+            .copied(),
+    );
     ep.extend(out_vars.iter().map(|o| o.1));
     ep.push(push_var);
     if let Some(v) = local_idx_var {
@@ -337,6 +350,7 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     // Types
     let t_i32 = w.id();
     let t_ptr_in_i32 = w.id();
+    let t_ptr_in_bool = w.id();
     let t_ptr_in_v4f = w.id();
     let t_ptr_out_v4f = w.id();
     let t_ptr_out_f32 = w.id();
@@ -410,6 +424,12 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     }
     if let Some(v) = iid_var {
         w.inst(OP_DECORATE, &[v, DEC_BUILTIN, BUILTIN_INSTANCE_INDEX]);
+    }
+    if let Some(v) = frag_coord_var {
+        w.inst(OP_DECORATE, &[v, DEC_BUILTIN, BUILTIN_FRAG_COORD]);
+    }
+    if let Some(v) = front_facing_var {
+        w.inst(OP_DECORATE, &[v, DEC_BUILTIN, BUILTIN_FRONT_FACING]);
     }
     for &(t, var) in &out_vars {
         match t {
@@ -512,6 +532,7 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     w.inst(OP_TYPE_VECTOR, &[t_v4f, t_f32, 4]);
     w.inst(OP_TYPE_INT, &[t_i32, 32, 1]);
     w.inst(OP_TYPE_POINTER, &[t_ptr_in_i32, SC_INPUT, t_i32]);
+    w.inst(OP_TYPE_POINTER, &[t_ptr_in_bool, SC_INPUT, t_bool]);
     w.inst(OP_TYPE_POINTER, &[t_ptr_in_v4f, SC_INPUT, t_v4f]);
     w.inst(OP_TYPE_POINTER, &[t_ptr_out_v4f, SC_OUTPUT, t_v4f]);
     w.inst(OP_TYPE_POINTER, &[t_ptr_out_f32, SC_OUTPUT, t_f32]);
@@ -659,6 +680,12 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     }
     for v in vid_var.iter().chain(iid_var.iter()) {
         w.inst(OP_VARIABLE, &[t_ptr_in_i32, *v, SC_INPUT]);
+    }
+    if let Some(v) = frag_coord_var {
+        w.inst(OP_VARIABLE, &[t_ptr_in_v4f, v, SC_INPUT]);
+    }
+    if let Some(v) = front_facing_var {
+        w.inst(OP_VARIABLE, &[t_ptr_in_bool, v, SC_INPUT]);
     }
     for &(t, var) in &out_vars {
         let ty = if t == ExportTarget::Depth {
@@ -1140,6 +1167,18 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                             let i = w.id();
                             w.inst(OP_LOAD, &[t_i32, i, var.unwrap()]);
                             w.inst(OP_BITCAST, &[t_u32, res, i]);
+                        }
+                        StageInput::FragCoord(chan) => {
+                            let v4 = w.id();
+                            w.inst(OP_LOAD, &[t_v4f, v4, frag_coord_var.unwrap()]);
+                            let f = w.id();
+                            w.inst(OP_COMPOSITE_EXTRACT, &[t_f32, f, v4, u32::from(chan)]);
+                            w.inst(OP_BITCAST, &[t_u32, res, f]);
+                        }
+                        StageInput::FrontFacing => {
+                            let b = w.id();
+                            w.inst(OP_LOAD, &[t_bool, b, front_facing_var.unwrap()]);
+                            w.inst(OP_SELECT, &[t_u32, res, b, c_one, c_zero]);
                         }
                         StageInput::Attr { loc, chan, .. } => {
                             let var = attr_vars.iter().find(|a| a.0 == loc).unwrap().2;

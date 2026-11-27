@@ -882,7 +882,7 @@ impl ComputeRunner {
                 .push_next(&mut dyn_info)];
             let pipeline = self
                 .device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &pipe_ci, None)
+                .create_graphics_pipelines(self.pipeline_cache, &pipe_ci, None)
                 .map_err(|(_, e)| e)?[0];
 
             // 3. Readback buffer (1 pixel = 4 bytes, padded to 256)
