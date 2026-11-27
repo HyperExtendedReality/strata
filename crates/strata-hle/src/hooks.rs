@@ -33,6 +33,11 @@ pub fn hook_load_library(dll_name: &str) -> Option<usize> {
     Some(handle)
 }
 
+/// The console DLL a pseudo handle stands for.
+pub fn pseudo_dll(module: usize) -> Option<String> {
+    table().lock().unwrap().get(&module).cloned()
+}
+
 /// Intercept `GetProcAddress` when `module` is a Strata console pseudo-handle.
 pub fn hook_get_proc_address(module: usize, func_name: &str) -> Option<usize> {
     let dll = table().lock().unwrap().get(&module)?.clone();

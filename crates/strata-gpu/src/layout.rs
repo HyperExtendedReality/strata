@@ -1,22 +1,40 @@
-//! Single Global No-API Pipeline Layout.
+//! The one pipeline layout.
 //!
-//! Every translated console shader and Slang utility shader shares this exact
+//! Every pipeline Strata creates (translated console shaders, Slang utility
+//! compute shaders, the vertex-less present pass) uses this single
 //! `VkPipelineLayout`:
-//! - 128 bytes of Push Constants (32 x `u32` console User SGPRs)
-//! - Set 0, Binding 0: Unbounded bindless `SAMPLED_IMAGE` array
-//! - Set 0, Binding 1: Unbounded bindless `STORAGE_IMAGE` array
-//! - Set 0, Binding 2: Unbounded bindless `SAMPLER` array
+//! - 128 bytes of push constants (32 x `u32` console user SGPRs), seen by the
+//!   compute, vertex and fragment stages
+//! - Set 0, binding 0: `SAMPLED_IMAGE[IMAGE_ARRAY_LEN]`
+//! - Set 0, binding 1: `SAMPLER[IMAGE_ARRAY_LEN]`
+//! - Set 0, binding 2: `STORAGE_IMAGE[IMAGE_ARRAY_LEN]`
 //!
-//! All buffers, constant tables, and BVH nodes are accessed via 64-bit BDA
-//! pointers passed in Push Constants—eliminating root-signature translation
-//! and per-draw descriptor-table allocation.
+//! The binding numbers and array length come from the shader translator, so
+//! the layout and the SPIR-V it emits cannot drift apart. Buffers, constant
+//! tables and BVH nodes are reached through 64-bit BDA pointers in the push
+//! constants; pipelines that use no images simply leave set 0 unbound.
 
 use ash::vk;
+use strata_shader::spirv::{
+    BINDING_SAMPLERS, BINDING_STORAGE_IMAGES, BINDING_TEXTURES, IMAGE_ARRAY_LEN,
+};
 
-pub const MAX_BINDLESS_IMAGES: u32 = 65_536;
-pub const MAX_BINDLESS_STORAGE_IMAGES: u32 = 16_384;
-pub const MAX_BINDLESS_SAMPLERS: u32 = 2_048;
 pub const PUSH_CONSTANT_BYTES: u32 = 128;
+
+/// Stages that see the push constants and set 0. Every `vkCmdPushConstants`
+/// call passes exactly these flags.
+pub const PUSH_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::from_raw(
+    vk::ShaderStageFlags::COMPUTE.as_raw()
+        | vk::ShaderStageFlags::VERTEX.as_raw()
+        | vk::ShaderStageFlags::FRAGMENT.as_raw(),
+);
+
+/// Set 0's bindings, in binding order.
+pub const SET0_BINDINGS: [(u32, vk::DescriptorType); 3] = [
+    (BINDING_TEXTURES, vk::DescriptorType::SAMPLED_IMAGE),
+    (BINDING_SAMPLERS, vk::DescriptorType::SAMPLER),
+    (BINDING_STORAGE_IMAGES, vk::DescriptorType::STORAGE_IMAGE),
+];
 
 pub struct GlobalLayout {
     pub set_layout: vk::DescriptorSetLayout,
@@ -24,57 +42,47 @@ pub struct GlobalLayout {
 }
 
 impl GlobalLayout {
-    /// Create the single global bindless descriptor set layout + pipeline layout.
+    /// Creates the set-0 layout and the pipeline layout.
+    ///
+    /// # Safety
+    /// `device` is a live device; the caller destroys both handles.
     pub unsafe fn create(device: &ash::Device) -> Result<Self, vk::Result> {
-        let bindings = [
+        let bindings = SET0_BINDINGS.map(|(b, ty)| {
             vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(MAX_BINDLESS_IMAGES)
-                .stage_flags(vk::ShaderStageFlags::ALL),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(MAX_BINDLESS_STORAGE_IMAGES)
-                .stage_flags(vk::ShaderStageFlags::ALL),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(2)
-                .descriptor_type(vk::DescriptorType::SAMPLER)
-                .descriptor_count(MAX_BINDLESS_SAMPLERS)
-                .stage_flags(vk::ShaderStageFlags::ALL),
-        ];
-
-        let flags = [
-            vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-            vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-            vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-        ];
-
-        let mut ext_flags = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
-            .binding_flags(&flags);
-
-        let set_ci = vk::DescriptorSetLayoutCreateInfo::default()
-            .bindings(&bindings)
-            .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
-            .push_next(&mut ext_flags);
-
-        let set_layout = unsafe { device.create_descriptor_set_layout(&set_ci, None)? };
+                .binding(b)
+                .descriptor_type(ty)
+                .descriptor_count(IMAGE_ARRAY_LEN)
+                .stage_flags(PUSH_STAGES)
+        });
+        // SAFETY: forwarded from the caller.
+        let set_layout = unsafe {
+            device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )?
+        };
 
         let push_range = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::ALL)
+            .stage_flags(PUSH_STAGES)
             .offset(0)
             .size(PUSH_CONSTANT_BYTES)];
-
         let set_layouts = [set_layout];
         let pipe_ci = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
             .push_constant_ranges(&push_range);
+        // SAFETY: forwarded from the caller.
+        let pipeline_layout = match unsafe { device.create_pipeline_layout(&pipe_ci, None) } {
+            Ok(l) => l,
+            Err(e) => {
+                // SAFETY: created above and not used by anything yet.
+                unsafe { device.destroy_descriptor_set_layout(set_layout, None) };
+                return Err(e);
+            }
+        };
 
-        let pipeline_layout = unsafe { device.create_pipeline_layout(&pipe_ci, None)? };
-
-        Ok(Self { set_layout, pipeline_layout })
+        Ok(Self {
+            set_layout,
+            pipeline_layout,
+        })
     }
 }

@@ -38,23 +38,10 @@ pub fn classify_dll(dll_name: &str) -> DllClass {
         | "libhttpclient.gdk.dll"
         | "pixevt.dll" => DllClass::StrataHle,
 
-        "kernel32.dll"
-        | "ntdll.dll"
-        | "user32.dll"
-        | "advapi32.dll"
-        | "bcrypt.dll"
-        | "crypt32.dll"
-        | "ole32.dll"
-        | "rpcrt4.dll"
-        | "shell32.dll"
-        | "shlwapi.dll"
-        | "winhttp.dll"
-        | "ws2_32.dll"
-        | "iphlpapi.dll"
-        | "xaudio2_9.dll"
-        | "mfplat.dll"
-        | "mfreadwrite.dll"
-        | "gameinput.dll" => DllClass::HostPassthrough,
+        "kernel32.dll" | "ntdll.dll" | "user32.dll" | "advapi32.dll" | "bcrypt.dll"
+        | "crypt32.dll" | "ole32.dll" | "rpcrt4.dll" | "shell32.dll" | "shlwapi.dll"
+        | "winhttp.dll" | "ws2_32.dll" | "iphlpapi.dll" | "xaudio2_9.dll" | "mfplat.dll"
+        | "mfreadwrite.dll" | "gameinput.dll" => DllClass::HostPassthrough,
 
         s if s.starts_with("api-ms-win-")
             || s.starts_with("ext-ms-win-")
@@ -65,7 +52,11 @@ pub fn classify_dll(dll_name: &str) -> DllClass {
             DllClass::HostPassthrough
         }
 
-        s if s.contains("bvh") || s.contains("fidelityfx") || s.contains("bink") || s.contains("chad") => {
+        s if s.contains("bvh")
+            || s.contains("fidelityfx")
+            || s.contains("bink")
+            || s.contains("chad") =>
+        {
             DllClass::TitleLocal
         }
 
@@ -94,20 +85,17 @@ impl HleRuntime {
 
     /// Emulates `kernelx!XMemVirtualAlloc` using Tier 1 Zero-Copy Host UMA
     /// (`VirtualAlloc`/`mmap` + `VK_EXT_external_memory_host` -> 64-bit GPU BDA pointer).
+    ///
+    /// The title gets a real host pointer (its code dereferences it): at
+    /// `requested_va` if that range is free, else wherever Windows puts it.
     pub fn xmem_virtual_alloc(
         &mut self,
         runner: &ComputeRunner,
         requested_va: u64,
         size: u64,
     ) -> Result<(u64, u64), GpuError> {
-        let va = if requested_va != 0 {
-            requested_va
-        } else {
-            let v = self.next_console_va;
-            self.next_console_va += size.max(65_536).next_multiple_of(65_536);
-            v
-        };
-        let alloc = self.uma.xmem_virtual_alloc_zero_copy(runner, va, size)?;
+        let alloc = self.uma.xmem_alloc_identity(runner, requested_va, size)?;
+        self.next_console_va = self.next_console_va.max(alloc.console_va + alloc.size);
         Ok((alloc.console_va, alloc.host_bda))
     }
 
@@ -136,7 +124,10 @@ mod tests {
     fn classifies_console_vs_host_dlls() {
         assert_eq!(classify_dll("d3d12_xs.dll"), DllClass::StrataHle);
         assert_eq!(classify_dll("KERNELX.DLL"), DllClass::StrataHle);
-        assert_eq!(classify_dll("api-ms-win-core-synch-l1-2-0.dll"), DllClass::HostPassthrough);
+        assert_eq!(
+            classify_dll("api-ms-win-core-synch-l1-2-0.dll"),
+            DllClass::HostPassthrough
+        );
         assert_eq!(classify_dll("XboxBvhBuilder.dll"), DllClass::TitleLocal);
     }
 }

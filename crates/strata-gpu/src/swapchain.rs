@@ -46,7 +46,8 @@ impl SwapchainPresenter {
             .hwnd(hwnd as vk::HWND);
         let surface = unsafe { win32_surface.create_win32_surface(&surface_ci, None)? };
 
-        let caps = unsafe { surface_loader.get_physical_device_surface_capabilities(pdev, surface)? };
+        let caps =
+            unsafe { surface_loader.get_physical_device_surface_capabilities(pdev, surface)? };
         let extent = if caps.current_extent.width != u32::MAX {
             caps.current_extent
         } else {
@@ -114,7 +115,8 @@ impl SwapchainPresenter {
             for v in self.views {
                 device.destroy_image_view(v, None);
             }
-            self.swapchain_loader.destroy_swapchain(self.swapchain, None);
+            self.swapchain_loader
+                .destroy_swapchain(self.swapchain, None);
             self.surface_loader.destroy_surface(self.surface, None);
         }
     }

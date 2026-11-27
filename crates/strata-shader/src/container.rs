@@ -63,7 +63,9 @@ pub fn parse_dxbc(bytes: &[u8]) -> Result<ParsedContainer<'_>, ContainerError> {
         let fourcc: [u8; 4] = bytes[off..off + 4].try_into().unwrap();
         let size = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
         if off + 8 + size > bytes.len() {
-            return Err(ContainerError::OutOfBounds { offset: off + 8 + size });
+            return Err(ContainerError::OutOfBounds {
+                offset: off + 8 + size,
+            });
         }
         let data = &bytes[off + 8..off + 8 + size];
 
@@ -78,7 +80,12 @@ pub fn parse_dxbc(bytes: &[u8]) -> Result<ParsedContainer<'_>, ContainerError> {
         chunks.push(DxbcChunk { fourcc, data });
     }
 
-    Ok(ParsedContainer { digest, chunks, has_xdat, shader_model })
+    Ok(ParsedContainer {
+        digest,
+        chunks,
+        has_xdat,
+        shader_model,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,7 +114,9 @@ pub fn parse_fssm(bytes: &[u8]) -> Result<FssmProgram<'_>, ContainerError> {
     let code_size = u64::from_le_bytes(bytes[0xC8..0xD0].try_into().unwrap()) as usize;
     let code_start = 0x10usize.saturating_add(code_rel);
     if code_start + code_size > bytes.len() {
-        return Err(ContainerError::OutOfBounds { offset: code_start + code_size });
+        return Err(ContainerError::OutOfBounds {
+            offset: code_start + code_size,
+        });
     }
     // Stage descriptor byte at +0x101 (AA = API stage: 0=VS, 1=PS, 2=GS, 3=CS, 6=MS)
     let api_stage = bytes[0x101];

@@ -6,10 +6,37 @@
 //! - `VICTORY_BIND_CACHE`: skips redundant render-target & pipeline rebinds.
 //! - Integer render-target blend sanitization (console ignores blend on integer RTs,
 //!   Vulkan/D3D12 reject the pipeline).
-//! - Indirect dispatch clamping to 65,535 groups (prevents blocky patches / TDR).
+//! - Dispatches over the device's group-count limit split, not clamped (a clamp
+//!   drops the groups past 65,535: blocky patches).
 //! - Compute-written texture readback scheduling (fixes water/boat CPU physics).
 
+/// The smallest `maxComputeWorkGroupCount` Vulkan guarantees per dimension.
 pub const MAX_INDIRECT_DISPATCH_GROUPS: u32 = 65_535;
+
+/// Splits a dispatch of `groups` into `(base, count)` pieces no larger than
+/// `limit` in any dimension, covering every group exactly once (for
+/// `vkCmdDispatchBase`, which keeps each group's `WorkgroupId`).
+pub fn split_dispatch(groups: [u32; 3], limit: [u32; 3]) -> Vec<([u32; 3], [u32; 3])> {
+    let limit = limit.map(|l| l.max(1));
+    let mut out = Vec::new();
+    let mut bz = 0;
+    while bz < groups[2] {
+        let cz = limit[2].min(groups[2] - bz);
+        let mut by = 0;
+        while by < groups[1] {
+            let cy = limit[1].min(groups[1] - by);
+            let mut bx = 0;
+            while bx < groups[0] {
+                let cx = limit[0].min(groups[0] - bx);
+                out.push(([bx, by, bz], [cx, cy, cz]));
+                bx += cx;
+            }
+            by += cy;
+        }
+        bz += cz;
+    }
+    out
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PipelineKey(pub u64);
@@ -35,16 +62,56 @@ impl RenderTargetDesc {
 pub enum ThinCommand {
     BindPipeline(PipelineKey),
     SetRenderTargets(Vec<RenderTargetDesc>),
-    PushUserSgprs { offset_dw: u8, values: Vec<u32> },
-    Dispatch { x: u32, y: u32, z: u32, is_thread_count: bool },
-    DispatchIndirect { args_bda: u64, max_x: u32, max_y: u32, max_z: u32 },
-    DrawInstanced { vertex_count: u32, instance_count: u32, start_vertex: u32, start_instance: u32 },
-    DrawIndexedInstanced { index_count: u32, instance_count: u32, start_index: u32, base_vertex: i32, start_instance: u32 },
-    DrawIndirect { args_bda: u64, max_verts: u32, max_inst: u32 },
-    ResourceBarrier { resource_va: u64, state_before: u32, state_after: u32 },
-    CopyBufferRegion { dst_va: u64, dst_offset: u64, src_va: u64, src_offset: u64, num_bytes: u64 },
+    PushUserSgprs {
+        offset_dw: u8,
+        values: Vec<u32>,
+    },
+    Dispatch {
+        x: u32,
+        y: u32,
+        z: u32,
+        is_thread_count: bool,
+    },
+    /// Group counts read at execution from three dwords at `args_va` (a
+    /// console address the GPU may have written), then split like `Dispatch`.
+    DispatchIndirect {
+        args_va: u64,
+    },
+    DrawInstanced {
+        vertex_count: u32,
+        instance_count: u32,
+        start_vertex: u32,
+        start_instance: u32,
+    },
+    DrawIndexedInstanced {
+        index_count: u32,
+        instance_count: u32,
+        start_index: u32,
+        base_vertex: i32,
+        start_instance: u32,
+    },
+    DrawIndirect {
+        args_bda: u64,
+        max_verts: u32,
+        max_inst: u32,
+    },
+    ResourceBarrier {
+        resource_va: u64,
+        state_before: u32,
+        state_after: u32,
+    },
+    CopyBufferRegion {
+        dst_va: u64,
+        dst_offset: u64,
+        src_va: u64,
+        src_offset: u64,
+        num_bytes: u64,
+    },
     /// Schedule GPU -> CPU readback of a compute-written texture (e.g. ocean heightmap).
-    ReadbackTexture { console_va: u64, byte_len: u64 },
+    ReadbackTexture {
+        console_va: u64,
+        byte_len: u64,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -72,7 +139,11 @@ impl ThinCommandList {
     }
 
     pub fn set_render_targets(&mut self, rts: &[RenderTargetDesc]) {
-        let sanitized: Vec<RenderTargetDesc> = rts.iter().copied().map(RenderTargetDesc::sanitized).collect();
+        let sanitized: Vec<RenderTargetDesc> = rts
+            .iter()
+            .copied()
+            .map(RenderTargetDesc::sanitized)
+            .collect();
         if self.bound_rts == sanitized {
             self.skipped_redundant_binds += 1;
             return;
@@ -88,8 +159,8 @@ impl ThinCommandList {
         });
     }
 
-    /// Record a compute dispatch, handling console thread-count-vs-group-count flag
-    /// (DexNom / VIctory-7900XTX ray-tracing fix) and clamping to 65,535 groups.
+    /// Record a compute dispatch, handling the console thread-count-vs-group-count
+    /// flag. Counts are kept whole; execution splits them to the device limit.
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32, wg_size: [u32; 3], is_thread_count: bool) {
         let (gx, gy, gz) = if is_thread_count {
             (
@@ -101,11 +172,17 @@ impl ThinCommandList {
             (x, y, z)
         };
         self.commands.push(ThinCommand::Dispatch {
-            x: gx.min(MAX_INDIRECT_DISPATCH_GROUPS),
-            y: gy.min(MAX_INDIRECT_DISPATCH_GROUPS),
-            z: gz.min(MAX_INDIRECT_DISPATCH_GROUPS),
+            x: gx,
+            y: gy,
+            z: gz,
             is_thread_count: false,
         });
+    }
+
+    /// Record an indirect dispatch: `[x, y, z]` group counts at `args_va`.
+    pub fn dispatch_indirect(&mut self, args_va: u64) {
+        self.commands
+            .push(ThinCommand::DispatchIndirect { args_va });
     }
 
     /// Record an indirect draw and hoist its clamp entry into `hoisted_clamps`
@@ -184,7 +261,10 @@ impl ThinCommandList {
     }
 
     pub fn schedule_texture_readback(&mut self, console_va: u64, byte_len: u64) {
-        self.commands.push(ThinCommand::ReadbackTexture { console_va, byte_len });
+        self.commands.push(ThinCommand::ReadbackTexture {
+            console_va,
+            byte_len,
+        });
     }
 
     pub fn commands(&self) -> &[ThinCommand] {
@@ -223,5 +303,35 @@ mod tests {
             ThinCommand::Dispatch { x, .. } => assert_eq!(*x, 2),
             _ => panic!("expected thread-count converted dispatch"),
         }
+    }
+
+    #[test]
+    fn large_dispatches_are_split_not_clamped() {
+        let mut list = ThinCommandList::new();
+        list.dispatch(100_000, 1, 1, [1, 1, 1], false);
+        assert_eq!(
+            list.commands()[0],
+            ThinCommand::Dispatch {
+                x: 100_000,
+                y: 1,
+                z: 1,
+                is_thread_count: false
+            }
+        );
+
+        let pieces = split_dispatch([100_000, 70_000, 1], [65_535; 3]);
+        assert_eq!(pieces.len(), 4);
+        assert_eq!(pieces[1], ([65_535, 0, 0], [34_465, 65_535, 1]));
+        assert_eq!(pieces[3], ([65_535, 65_535, 0], [34_465, 4_465, 1]));
+        let covered: u64 = pieces
+            .iter()
+            .map(|(_, c)| c.iter().map(|&n| u64::from(n)).product::<u64>())
+            .sum();
+        assert_eq!(covered, 100_000 * 70_000);
+        assert_eq!(
+            split_dispatch([4, 4, 4], [65_535; 3]),
+            [([0, 0, 0], [4, 4, 4])]
+        );
+        assert!(split_dispatch([0, 1, 1], [65_535; 3]).is_empty());
     }
 }

@@ -13,7 +13,9 @@ use strata_runtime_shaders::{
 use strata_shader::{bvh, compile_rdna2_to_spirv, rdna2::encode};
 
 fn main() {
-    let cmd = std::env::args().nth(1).unwrap_or_else(|| "selftest".to_string());
+    let cmd = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "selftest".to_string());
     match cmd.as_str() {
         "probe" => cmd_probe(),
         "selftest" => cmd_selftest(),
@@ -43,19 +45,356 @@ fn main() {
         }
         "run" => {
             let path = std::env::args().nth(2).unwrap_or_else(|| {
-                eprintln!("Usage: strata-cli run <path-to-exe>");
+                eprintln!("Usage: strata-cli run <path-to-exe> [--unimplemented trap|zero|notimpl] [--mount D=C:/folder]... [--search-dir DIR] [--crash-log FILE]");
                 std::process::exit(1);
             });
             cmd_run(&path);
         }
+        "warm" => {
+            let dir = std::env::args().nth(2).unwrap_or_else(|| {
+                eprintln!("Usage: strata-cli warm <shader-cache-dir> [pipeline-cache-file]");
+                std::process::exit(1);
+            });
+            cmd_warm(&dir, std::env::args().nth(3));
+        }
+        "translate" => {
+            let path = std::env::args().nth(2).unwrap_or_else(|| {
+                eprintln!("Usage: strata-cli translate <shader-file-or-dir>");
+                std::process::exit(1);
+            });
+            cmd_translate(&path);
+        }
+        "census" => {
+            let path = std::env::args().nth(2).unwrap_or_else(|| {
+                eprintln!("Usage: strata-cli census <shader-file-or-dir>");
+                std::process::exit(1);
+            });
+            cmd_census(&path);
+        }
+        "shaders" => {
+            let path = std::env::args().nth(2).unwrap_or_else(|| {
+                eprintln!("Usage: strata-cli shaders <shader-file-or-dir> [store-dir]");
+                std::process::exit(1);
+            });
+            cmd_shaders(&path, std::env::args().nth(3));
+        }
+        "replay" => {
+            cmd_replay();
+        }
+        "config" => {
+            cmd_config();
+        }
         other => {
-            eprintln!("Unknown command '{other}'. Usage: strata-cli [probe|selftest|gpu-test|uma-test|inspect|bind-check|map-test|run]");
+            eprintln!(
+                "Unknown command '{other}'. Usage: strata-cli [probe|selftest|gpu-test|uma-test|inspect|bind-check|map-test|run|warm|translate|census|shaders|replay|config]"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+fn collect_files(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    if p.is_dir() {
+        if let Ok(rd) = std::fs::read_dir(p) {
+            let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+            entries.sort();
+            for e in entries {
+                collect_files(&e, out);
+            }
+        }
+    } else {
+        out.push(p.to_path_buf());
+    }
+}
+
+/// Scans `path` (`SGD5` archives, `XBCH`, `FSSM`, `.rdna2`, `.bin`) and prints
+/// stage distribution + top RDNA2 instruction encodings.
+fn cmd_census(path: &str) {
+    use strata_shader::coverage::{Census, extract_programs};
+    let mut files = Vec::new();
+    collect_files(std::path::Path::new(path), &mut files);
+    let mut census = Census::default();
+    for file in &files {
+        let Ok(bytes) = std::fs::read(file) else {
+            continue;
+        };
+        for prog in extract_programs(&file.display().to_string(), &bytes) {
+            census.add(&prog);
+        }
+    }
+    println!(
+        "=== Strata Shader Census: {} programs, {} dwords ({} files) ===",
+        census.programs,
+        census.total_dwords,
+        files.len()
+    );
+    for (stage, n) in &census.stages {
+        println!("  stage {:<10} {n}", stage);
+    }
+    println!("=== top 25 encodings ===");
+    for (enc, n) in census.top_encodings(25) {
+        println!("  {n:>8}  {enc}");
+    }
+}
+
+/// Ahead-of-time batch shader pre-translation into the versioned [`ShaderStore`].
+fn cmd_shaders(path: &str, store_dir: Option<String>) {
+    use strata_shader::coverage::extract_programs;
+    use strata_shader::store::ShaderStore;
+    let cfg = strata_hle::config::StrataConfig::load();
+    let dir = store_dir
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| cfg.cache_dir.join("shaders"));
+    let mut files = Vec::new();
+    collect_files(std::path::Path::new(path), &mut files);
+    let mut programs = Vec::new();
+    for file in &files {
+        let Ok(bytes) = std::fs::read(file) else {
+            continue;
+        };
+        programs.extend(extract_programs(&file.display().to_string(), &bytes));
+    }
+    let mut store = ShaderStore::open(&dir);
+    match store.ingest_programs(&programs) {
+        Ok(stats) => println!(
+            "=== ShaderStore ({}): total={}, newly_translated={}, skipped_cached={}, failed={} ===",
+            dir.display(),
+            stats.total,
+            stats.newly_translated,
+            stats.skipped_cached,
+            stats.failed
+        ),
+        Err(e) => {
+            eprintln!("ShaderStore failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Inspect or diff deterministic `.scap` frame captures.
+fn cmd_replay() {
+    use strata_gpu::replay::{FrameCapture, diff_captures};
+    let sub = std::env::args().nth(2).unwrap_or_default();
+    match sub.as_str() {
+        "inspect" => {
+            let file = std::env::args().nth(3).unwrap_or_else(|| {
+                eprintln!("Usage: strata-cli replay inspect <capture.scap>");
+                std::process::exit(1);
+            });
+            let bytes = std::fs::read(&file).unwrap_or_else(|e| {
+                eprintln!("Failed to read '{file}': {e}");
+                std::process::exit(1);
+            });
+            let cap = FrameCapture::decode(&bytes).unwrap_or_else(|| {
+                eprintln!("Invalid SCAP capture '{file}'");
+                std::process::exit(1);
+            });
+            println!("Frame {}: {} recorded ops", cap.frame_index, cap.ops.len());
+            for (i, op) in cap.ops.iter().take(40).enumerate() {
+                println!("  [{i:>4}] {op:?}");
+            }
+        }
+        "diff" => {
+            let (Some(a_path), Some(b_path)) = (std::env::args().nth(3), std::env::args().nth(4))
+            else {
+                eprintln!("Usage: strata-cli replay diff <a.scap> <b.scap>");
+                std::process::exit(1);
+            };
+            let a_bytes = std::fs::read(&a_path).unwrap_or_else(|e| {
+                eprintln!("Failed to read '{a_path}': {e}");
+                std::process::exit(1);
+            });
+            let b_bytes = std::fs::read(&b_path).unwrap_or_else(|e| {
+                eprintln!("Failed to read '{b_path}': {e}");
+                std::process::exit(1);
+            });
+            let a = FrameCapture::decode(&a_bytes).expect("invalid SCAP file A");
+            let b = FrameCapture::decode(&b_bytes).expect("invalid SCAP file B");
+            let d = diff_captures(&a, &b);
+            println!(
+                "Capture diff: ops_a={}, ops_b={}, differing_ops={}, first_divergence={:?}",
+                d.ops_a, d.ops_b, d.differing_ops, d.first_divergence
+            );
+        }
+        _ => {
+            eprintln!("Usage: strata-cli replay <inspect <a.scap> | diff <a.scap> <b.scap>>");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Print resolved `strata.toml` + `STRATA_*` configuration and policy status.
+fn cmd_config() {
+    use strata_hle::config::{StrataConfig, init_logging};
+    use strata_hle::services::{FidelityFxBridge, Fsr4KPreset};
+    let level = init_logging();
+    let cfg = StrataConfig::load();
+    println!("=== Strata Resolved Configuration ===");
+    println!("Log level:         {}", level.as_str());
+    println!(
+        "Console profile:   {:?} ({}x{} @ {} fps)",
+        cfg.console.model,
+        cfg.console.output_width,
+        cfg.console.output_height,
+        cfg.console.target_fps
+    );
+    println!("Game dir:          {:?}", cfg.game_dir);
+    println!("Cache dir:         {}", cfg.cache_dir.display());
+    println!("Data dir:          {}", cfg.data_dir.display());
+    println!("GPU adapter:       {:?}", cfg.gpu_adapter);
+    println!("Output override:   {:?}", cfg.output_override);
+    println!("Frame interval ms: {:?}", cfg.frame_interval_ms);
+    println!("Safe mode:         {}", cfg.safe_mode);
+    if let Some(preset_name) = &cfg.fsr_4k_preset {
+        if let Some(p) = Fsr4KPreset::from_name(preset_name) {
+            println!(
+                "FSR 4K preset:     {p:?} ({:?} -> {:?})",
+                p.input_size(),
+                p.output_size()
+            );
+        } else {
+            println!("FSR 4K preset:     unknown ('{preset_name}')");
+        }
+    }
+    let ffx_probe_dir = cfg.fidelityfx_dir.clone().or_else(|| {
+        std::env::var("LOCALAPPDATA").ok().map(|l| {
+            std::path::PathBuf::from(l)
+                .join("strata")
+                .join("fidelityfx")
+        })
+    });
+    if let Some(ffx_dir) = &ffx_probe_dir {
+        match FidelityFxBridge::discover(ffx_dir) {
+            Some(b) => {
+                println!(
+                    "FidelityFX DLL:    {} ({})",
+                    b.dll_path.display(),
+                    b.backend
+                );
+                #[cfg(windows)]
+                match b.load_runtime() {
+                    Ok(loaded) => println!(
+                        "FidelityFX Live:   OK (create={:#x?}, dispatch={:#x?}, query={:#x?}, destroy={:#x?})",
+                        loaded.create_context,
+                        loaded.dispatch,
+                        loaded.query,
+                        loaded.destroy_context
+                    ),
+                    Err(e) => println!("FidelityFX Live:   load error ({e})"),
+                }
+            }
+            None => println!("FidelityFX DLL:    not found in {}", ffx_dir.display()),
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        match cfg.validate_paths_outside(&cwd) {
+            Ok(()) => println!("Asset path policy: OK (all configured paths outside repo)"),
+            Err(e) => {
+                eprintln!("Asset path policy: FAIL ({e})");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// Runs every shader found under `path` through the compiler and ranks what
+/// blocks translation, with where each resource's descriptor comes from.
+fn cmd_translate(path: &str) {
+    use strata_shader::coverage::{Outcome, Summary, extract_programs, translate};
+    fn walk(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        if p.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(p) {
+                let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+                entries.sort();
+                for e in entries {
+                    walk(&e, out);
+                }
+            }
+        } else {
+            out.push(p.to_path_buf());
+        }
+    }
+    let mut files = Vec::new();
+    walk(std::path::Path::new(path), &mut files);
+    let mut summary = Summary::default();
+    for file in &files {
+        let Ok(bytes) = std::fs::read(file) else {
+            continue;
+        };
+        for program in extract_programs(&file.display().to_string(), &bytes) {
+            let report = translate(&program);
+            if let Outcome::Failed(why) = &report.outcome {
+                println!("[FAIL] {} ({} dw): {why}", report.source, report.dwords);
+            }
+            summary.add(&report);
+        }
+    }
+    println!(
+        "=== {}/{} programs translated ({} files scanned) ===",
+        summary.translated,
+        summary.programs,
+        files.len()
+    );
+    for (why, n) in summary.ranked() {
+        println!("  {n:>6}  {why}");
+    }
+    if !summary.descriptor_origins.is_empty() {
+        println!("=== descriptor origins ===");
+        for (class, n) in &summary.descriptor_origins {
+            println!("  {n:>6}  {class}");
+        }
+    }
+}
+
+/// Creates the pipeline of every cached shader ahead of play and saves the
+/// driver's pipeline cache, so the first frames do not stall on creation.
+fn cmd_warm(dir: &str, pipeline_file: Option<String>) {
+    let cache = strata_shader::cache::ShaderDiskCache::new(dir);
+    let shaders = cache.entries();
+    let file = pipeline_file
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(dir).join("pipelines.bin"));
+    let runner = ComputeRunner::new().unwrap_or_else(|e| {
+        eprintln!("Vulkan runner failed: {e}");
+        std::process::exit(1);
+    });
+    let reused = runner.load_pipeline_cache(&file).unwrap_or(false);
+    let start = std::time::Instant::now();
+    let made = runner.warm(shaders.iter().map(Vec::as_slice));
+    let elapsed = start.elapsed();
+    match runner.save_pipeline_cache(&file) {
+        Ok(bytes) => println!(
+            "[PASS] {made}/{} pipelines made in {:.1} ms (driver cache {}reused), {bytes} B saved to {}",
+            shaders.len(),
+            elapsed.as_secs_f64() * 1e3,
+            if reused { "" } else { "not " },
+            file.display()
+        ),
+        Err(e) => {
+            eprintln!("[FAIL] saving {}: {e}", file.display());
             std::process::exit(1);
         }
     }
 }
 
 fn cmd_probe() {
+    if let Ok(adapters) = strata_gpu::context::enumerate_adapters() {
+        println!("=== Vulkan Physical Devices ({}) ===", adapters.len());
+        for a in &adapters {
+            println!(
+                "  [{}] {} (vendor=0x{:04x}, device=0x{:04x}, {:?}, VRAM={} MiB, Vulkan {}.{}.{})",
+                a.index,
+                a.device_name,
+                a.vendor_id,
+                a.device_id,
+                a.device_type,
+                a.dedicated_vram_bytes / (1024 * 1024),
+                a.api_version.0,
+                a.api_version.1,
+                a.api_version.2
+            );
+        }
+    }
     match probe_capabilities() {
         Ok(caps) => {
             println!("=== Strata No-API Vulkan Capability Probe ===");
@@ -76,7 +415,10 @@ fn cmd_probe() {
             );
             println!("Sparse Image 2D:       {}", caps.sparse_image_2d);
             println!("External Memory Host:  {}", caps.external_memory_host);
-            println!("Max Push Constants:    {} bytes", caps.max_push_constants_size);
+            println!(
+                "Max Push Constants:    {} bytes",
+                caps.max_push_constants_size
+            );
         }
         Err(e) => {
             eprintln!("Vulkan probe failed: {e}");
@@ -107,7 +449,10 @@ fn cmd_selftest() {
     if let Ok(caps) = probe_capabilities() {
         println!(
             "Host GPU ready: {} (BDA={}, Bindless={}, Wave64={})",
-            caps.device_name, caps.buffer_device_address, caps.descriptor_indexing, caps.native_wave64
+            caps.device_name,
+            caps.buffer_device_address,
+            caps.descriptor_indexing,
+            caps.native_wave64
         );
     }
 }
@@ -164,12 +509,12 @@ fn cmd_gpu_test() {
     unsafe {
         let args = args_buf.as_mut_slice::<u32>(4);
         args[0] = 999_999; // over-limit vertex count
-        args[1] = 5_000;   // over-limit instance count
+        args[1] = 5_000; // over-limit instance count
         let entries = entries_buf.as_mut_slice::<u32>(4);
         entries[0] = args_buf.bda as u32;
         entries[1] = (args_buf.bda >> 32) as u32;
         entries[2] = 65_535; // max_count
-        entries[3] = 64;     // max_inst
+        entries[3] = 64; // max_inst
     }
     let mut clamp_pc = Vec::with_capacity(16);
     clamp_pc.extend_from_slice(&entries_buf.bda.to_le_bytes());
@@ -210,19 +555,33 @@ fn cmd_gpu_test() {
     runner
         .dispatch_spirv(&hash_words, &hash_pc, [2, 1, 1])
         .expect("dirty_hash.spv dispatch 1 failed");
-    let h_before = unsafe { [hashes_buf.as_slice::<u32>(2)[0], hashes_buf.as_slice::<u32>(2)[1]] };
+    let h_before = unsafe {
+        [
+            hashes_buf.as_slice::<u32>(2)[0],
+            hashes_buf.as_slice::<u32>(2)[1],
+        ]
+    };
 
     // Mutate 1 dword in page 1 only
     unsafe {
-        pages_buf.as_mut_slice::<u32>((page_bytes * 2 / 4) as usize)[(page_bytes / 4) as usize + 77] ^= 0xDEAD_BEEF;
+        pages_buf.as_mut_slice::<u32>((page_bytes * 2 / 4) as usize)
+            [(page_bytes / 4) as usize + 77] ^= 0xDEAD_BEEF;
     }
     runner
         .dispatch_spirv(&hash_words, &hash_pc, [2, 1, 1])
         .expect("dirty_hash.spv dispatch 2 failed");
-    let h_after = unsafe { [hashes_buf.as_slice::<u32>(2)[0], hashes_buf.as_slice::<u32>(2)[1]] };
+    let h_after = unsafe {
+        [
+            hashes_buf.as_slice::<u32>(2)[0],
+            hashes_buf.as_slice::<u32>(2)[1],
+        ]
+    };
 
     assert_eq!(h_before[0], h_after[0], "clean page 0 hash changed");
-    assert_ne!(h_before[1], h_after[1], "dirty page 1 hash did not detect mutation");
+    assert_ne!(
+        h_before[1], h_after[1],
+        "dirty page 1 hash did not detect mutation"
+    );
     println!(
         "[PASS] Slang dirty_hash.spv (BDA + WaveActiveBitXor): page0=0x{:08x} (clean), page1=0x{:08x}->0x{:08x} (dirty)",
         h_before[0], h_before[1], h_after[1]
@@ -246,7 +605,11 @@ fn cmd_gpu_test() {
     let px = runner
         .render_no_api_present_blit(&vs_words, &fs_words, fb.bda, 16, 16, 2.0)
         .expect("No-API dynamic rendering present_blit failed");
-    assert_eq!(px, [128, 200, 100, 255], "unexpected rendered pixel: {px:?}");
+    assert_eq!(
+        px,
+        [128, 200, 100, 255],
+        "unexpected rendered pixel: {px:?}"
+    );
     println!(
         "[PASS] No-API VK_KHR_dynamic_rendering + Slang present_blit.slang (0 RenderPasses, 0 VertexBuffers): pixel={px:?}"
     );
@@ -272,10 +635,15 @@ fn cmd_gpu_test() {
         let vals = cfg_out.as_slice::<u32>(64);
         for (i, &v) in vals.iter().enumerate() {
             let expected = if i < 32 { i as u32 + 10 } else { i as u32 + 20 };
-            assert_eq!(v, expected, "CFG lane {i} mismatch: got {v}, expected {expected}");
+            assert_eq!(
+                v, expected,
+                "CFG lane {i} mismatch: got {v}, expected {expected}"
+            );
         }
     }
-    println!("[PASS] RDNA2->SPIR-V Structured CFG (s_and_saveexec_b64 + s_cbranch_execz -> OpSelectionMerge + OpPhi): 64/64 divergent lanes exact on GPU");
+    println!(
+        "[PASS] RDNA2->SPIR-V Structured CFG (s_and_saveexec_b64 + s_cbranch_execz -> OpSelectionMerge + OpPhi): 64/64 divergent lanes exact on GPU"
+    );
     runner.free_bda_buffer(cfg_out);
 
     // 9. RDNA2-TRANSLATED WAVE64 BALLOT (`v_cmp_eq_u32` + `v_mov_b32 vcc_lo/hi` -> Wave64 ballot exchange):
@@ -293,7 +661,10 @@ fn cmd_gpu_test() {
         .dispatch_spirv(&w64_compiled.spirv, &w64_push_bytes, [1, 1, 1])
         .expect("RDNA2-translated Wave64 ballot SPIR-V dispatch failed");
     let mask = unsafe { w64_out.as_slice::<u64>(1)[0] };
-    assert_eq!(mask, 0x5555_5555_5555_5555, "unexpected Wave64 mask: 0x{mask:016x}");
+    assert_eq!(
+        mask, 0x5555_5555_5555_5555,
+        "unexpected Wave64 mask: 0x{mask:016x}"
+    );
     let tested_sizes: Vec<u32> = if runner.subgroup_size_control {
         [8u32, 16, 32, 64]
             .into_iter()
@@ -323,7 +694,9 @@ fn cmd_gpu_test() {
             tested_sizes
         );
     } else if runner.native_wave64 {
-        println!("[PASS] RDNA2->SPIR-V Wave64 Ballot (native Wave64 -> 64-bit console VCC): 0x{mask:016x}");
+        println!(
+            "[PASS] RDNA2->SPIR-V Wave64 Ballot (native Wave64 -> 64-bit console VCC): 0x{mask:016x}"
+        );
     } else {
         println!(
             "[PASS] RDNA2->SPIR-V Wave64 Ballot (Wave{} + Workgroup atomic merge -> 64-bit console VCC): 0x{mask:016x}",
@@ -371,7 +744,9 @@ fn test_gpu_detile_64ks(runner: &ComputeRunner) {
             }
         }
     }
-    println!("[PASS] Slang detile.slang (64KB_S Morton -> Linear via BDA): 256/256 texels exact on GPU");
+    println!(
+        "[PASS] Slang detile.slang (64KB_S Morton -> Linear via BDA): 256/256 texels exact on GPU"
+    );
     runner.free_bda_buffer(tiled);
     runner.free_bda_buffer(linear);
 }
@@ -417,9 +792,24 @@ fn test_gpu_bvh_oracle_parity(runner: &ComputeRunner) {
                 inv_dir: [f32::INFINITY, f32::INFINITY, 1.0],
             };
             let node = bvh::Box32Node {
-                children: [100 + i as u32, 200 + i as u32, 300 + i as u32, bvh::INVALID_NODE],
-                bounds_min: [[-1.0, -1.0, z_far], [-1.0, -1.0, z_near], [5.0, 5.0, 5.0], [0.0; 3]],
-                bounds_max: [[1.0, 1.0, z_far + 2.0], [1.0, 1.0, z_near + 2.0], [6.0, 6.0, 6.0], [0.0; 3]],
+                children: [
+                    100 + i as u32,
+                    200 + i as u32,
+                    300 + i as u32,
+                    bvh::INVALID_NODE,
+                ],
+                bounds_min: [
+                    [-1.0, -1.0, z_far],
+                    [-1.0, -1.0, z_near],
+                    [5.0, 5.0, 5.0],
+                    [0.0; 3],
+                ],
+                bounds_max: [
+                    [1.0, 1.0, z_far + 2.0],
+                    [1.0, 1.0, z_near + 2.0],
+                    [6.0, 6.0, 6.0],
+                    [0.0; 3],
+                ],
             };
             rays[i] = GpuRayData {
                 t_max: ray.t_max,
@@ -457,7 +847,9 @@ fn test_gpu_bvh_oracle_parity(runner: &ComputeRunner) {
             );
         }
     }
-    println!("[PASS] Slang bvh_oracle.slang vs Rust CPU bvh::intersect_box32: 64/64 rays bit-exact on GPU");
+    println!(
+        "[PASS] Slang bvh_oracle.slang vs Rust CPU bvh::intersect_box32: 64/64 rays bit-exact on GPU"
+    );
     runner.free_bda_buffer(rays_buf);
     runner.free_bda_buffer(nodes_buf);
     runner.free_bda_buffer(res_buf);
@@ -465,7 +857,12 @@ fn test_gpu_bvh_oracle_parity(runner: &ComputeRunner) {
 
 #[cfg(windows)]
 unsafe extern "system" {
-    fn VirtualAlloc(addr: *mut core::ffi::c_void, size: usize, alloc_type: u32, protect: u32) -> *mut core::ffi::c_void;
+    fn VirtualAlloc(
+        addr: *mut core::ffi::c_void,
+        size: usize,
+        alloc_type: u32,
+        protect: u32,
+    ) -> *mut core::ffi::c_void;
     fn VirtualFree(addr: *mut core::ffi::c_void, size: usize, free_type: u32) -> i32;
 }
 
@@ -476,7 +873,12 @@ fn test_zero_copy_virtual_alloc(runner: &ComputeRunner, compiled: &strata_shader
     const ALLOC_BYTES: usize = 64 * 1024;
 
     unsafe {
-        let raw_ptr = VirtualAlloc(std::ptr::null_mut(), ALLOC_BYTES, MEM_COMMIT_RESERVE, PAGE_READWRITE) as *mut u8;
+        let raw_ptr = VirtualAlloc(
+            std::ptr::null_mut(),
+            ALLOC_BYTES,
+            MEM_COMMIT_RESERVE,
+            PAGE_READWRITE,
+        ) as *mut u8;
         assert!(!raw_ptr.is_null(), "VirtualAlloc failed");
 
         let host_buf = runner
@@ -532,7 +934,10 @@ fn cmd_uma_test() {
     let compiled = build_sample_rdna2_kernel();
     let mut uma = UmaManager::new();
 
-    println!("=== Strata 3-Tier Hybrid UMA Live Test on {} ===", runner.device_name);
+    println!(
+        "=== Strata 3-Tier Hybrid UMA Live Test on {} ===",
+        runner.device_name
+    );
 
     // Tier 1: Console VA -> Zero-Copy Windows VirtualAlloc (VK_EXT_external_memory_host)
     let console_out_va = 0x0000_0400_1000_0000u64;
@@ -590,7 +995,9 @@ fn cmd_uma_test() {
             );
         }
     }
-    println!("[PASS] Cross-Tier GPU Execution: Tier 2 GDDR6 -> RDNA2 SPIR-V -> Tier 1 Zero-Copy CPU RAM (64/64 lanes)");
+    println!(
+        "[PASS] Cross-Tier GPU Execution: Tier 2 GDDR6 -> RDNA2 SPIR-V -> Tier 1 Zero-Copy CPU RAM (64/64 lanes)"
+    );
 
     // Tier 3: Live vkQueueBindSparse 64 KiB aliased 2D render targets
     let tiles_a = uma.acquire_sparse_target_tiles(0x0000_0400_3000_0000, 256 * 1024);
@@ -615,6 +1022,18 @@ fn cmd_inspect(path: &str) {
         eprintln!("Failed to read '{path}': {e}");
         std::process::exit(1);
     });
+    if strata_hle::implib::is_coff_archive(&bytes) {
+        let entries = strata_hle::implib::parse_implib(&bytes).unwrap_or_default();
+        println!("=== Strata COFF Import Library (.lib) Census: {path} ===");
+        println!("Short-import entries: {}", entries.len());
+        for e in entries.iter().take(40) {
+            println!(
+                "  [{}] {} (hint/ord={})",
+                e.dll, e.symbol, e.ordinal_or_hint
+            );
+        }
+        return;
+    }
     let info = parse_pe64(&bytes).unwrap_or_else(|e| {
         eprintln!("PE32+ parse failed for '{path}': {e}");
         std::process::exit(1);
@@ -652,16 +1071,18 @@ fn cmd_inspect(path: &str) {
                 "STUB "
             }
         };
-        println!("  [{tag}] {:<36} ({} imports)", dll.dll_name, dll.functions.len());
+        println!(
+            "  [{tag}] {:<36} ({} imports)",
+            dll.dll_name,
+            dll.functions.len()
+        );
         if class == DllClass::StrataHle {
             for f in &dll.functions {
                 println!("          -> {f}");
             }
         }
     }
-    println!(
-        "Summary: HLE={hle}, HostPassthrough={host}, TitleLocal={local}, NeedsStub={stub}"
-    );
+    println!("Summary: HLE={hle}, HostPassthrough={host}, TitleLocal={local}, NeedsStub={stub}");
 }
 
 fn cmd_bind_check(path: &str) {
@@ -677,48 +1098,95 @@ fn cmd_bind_check(path: &str) {
     println!("=== Strata Live IAT Bind Check: {path} ===");
     println!("Resolved via Strata HLE thunks: {}", report.resolved_hle);
     println!("Resolved via Host Windows DLLs:   {}", report.resolved_host);
-    println!("Deferred to Title-Local DLLs:     {}", report.deferred_title_local);
-    println!("Unresolved imports:               {}", report.unresolved.len());
+    println!(
+        "Deferred to Title-Local DLLs:     {}",
+        report.deferred_title_local
+    );
+    println!(
+        "Unresolved imports:               {}",
+        report.unresolved.len()
+    );
     for u in report.unresolved.iter().take(20) {
         println!("  [MISSING] {u}");
     }
 }
 
+/// `run <exe> [--unimplemented trap|zero|notimpl] [--mount D=C:\path]... [--search-dir DIR] [--crash-log FILE]`
 fn cmd_run(path: &str) {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| {
-        eprintln!("Failed to read '{path}': {e}");
-        std::process::exit(1);
-    });
-    let mapped = MappedImage::load_from_bytes(&bytes).unwrap_or_else(|e| {
-        eprintln!("PE32+ map failed for '{path}': {e}");
-        std::process::exit(1);
-    });
-    println!(
-        "[INFO] Mapped {} ({} KiB) at {:p}, Entry=0x{:x}, Relocs={}, IAT(HLE={}, Host={}, Local={}, Stubbed={})",
-        path,
-        mapped.size / 1024,
-        mapped.base,
-        mapped.entry_point,
-        mapped.relocations_applied,
-        mapped.bind_report.resolved_hle,
-        mapped.bind_report.resolved_host,
-        mapped.bind_report.deferred_title_local,
-        mapped.bind_report.unresolved.len()
-    );
-    if !mapped.bind_report.unresolved.is_empty() {
-        println!("[WARN] {} unresolved imports patched to logged E_NOTIMPL stubs", mapped.bind_report.unresolved.len());
+    let args: Vec<String> = std::env::args().skip(3).collect();
+    let mut opts = strata_hle::title::LoadOptions {
+        crash_reporter: Some(None),
+        ..Default::default()
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let value = args.get(i + 1).cloned().unwrap_or_else(|| {
+            eprintln!("{} needs a value", args[i]);
+            std::process::exit(1);
+        });
+        match args[i].as_str() {
+            "--unimplemented" => {
+                opts.unimplemented = value.parse().unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                })
+            }
+            "--mount" => {
+                let Some((drive, root)) = value.split_once('=').filter(|(d, _)| d.len() == 1)
+                else {
+                    eprintln!("--mount takes D=C:/folder");
+                    std::process::exit(1);
+                };
+                opts.mounts
+                    .push((drive.chars().next().unwrap(), root.into()));
+            }
+            "--search-dir" => opts.search_dir = Some(value.into()),
+            "--crash-log" => opts.crash_reporter = Some(Some(value.into())),
+            other => {
+                eprintln!("unknown option {other}");
+                std::process::exit(1);
+            }
+        }
+        i += 2;
     }
-    println!("[INFO] Invoking mapped PE32+ entry point 0x{:x} on guest thread...", mapped.entry_point);
-    match unsafe { mapped.execute_entry_point() } {
+    let title =
+        strata_hle::title::load_title(std::path::Path::new(path), &opts).unwrap_or_else(|e| {
+            eprintln!("Loading '{path}' failed: {e}");
+            std::process::exit(1);
+        });
+    for m in title.modules() {
+        let r = &m.image.bind_report;
+        println!(
+            "[INFO] {} at 0x{:x} ({} KiB): IAT(HLE={}, Host={}, Title={}, Stubbed={})",
+            m.name,
+            m.base(),
+            m.image.size / 1024,
+            r.resolved_hle,
+            r.resolved_host,
+            r.resolved_title,
+            r.unresolved.len() + r.deferred_title_local
+        );
+        for missing in &r.unresolved {
+            println!("[WARN]   unresolved {missing}");
+        }
+    }
+    println!(
+        "[INFO] Running {} (unimplemented imports: {:?})...",
+        title.main.name, opts.unimplemented
+    );
+    match title.run() {
         Ok(exit_code) => {
             println!(
-                "[PASS] Guest entry point exited cleanly with code {exit_code} (unimplemented_stubs={}, audio_stubs={})",
+                "[PASS] Title exited with code {exit_code} (unimplemented_stubs={}, audio_stubs={})",
                 strata_hle::thunks::unimplemented_stub_call_count(),
                 strata_hle::thunks::audio_stub_call_count(),
             );
+            for (dll, sym, n) in strata_hle::stubs::called_stubs() {
+                println!("[WARN]   {dll}!{sym} called {n}x");
+            }
         }
         Err(e) => {
-            eprintln!("[FAIL] Guest execution failed: {e}");
+            eprintln!("[FAIL] Title execution failed: {e}");
             std::process::exit(1);
         }
     }
@@ -748,20 +1216,29 @@ fn cmd_map_test(path: &str, execute: bool) {
     );
     if let Some(tls) = &mapped.tls {
         println!(
-            "[PASS] Static TLS Initialized: host_slot={}, template={} B, zero_fill={} B, callbacks={}",
-            tls.slot_index, tls.raw_template_bytes, tls.zero_fill_bytes, tls.callback_count
+            "[PASS] Static TLS Initialized: os_index={}, redirected_loads={}, template={} B, zero_fill={} B, callbacks={}",
+            tls.os_index,
+            tls.patched_loads,
+            tls.raw_template_bytes,
+            tls.zero_fill_bytes,
+            tls.callbacks.len()
         );
     }
 
     if execute {
-        println!("[INFO] Executing mapped entry point 0x{:x} (--execute)...", mapped.entry_point);
+        println!(
+            "[INFO] Executing mapped entry point 0x{:x} (--execute)...",
+            mapped.entry_point
+        );
         let code = unsafe { mapped.execute_entry_point() }.unwrap_or_else(|e| {
             eprintln!("[FAIL] Guest entry execution failed: {e}");
             std::process::exit(1);
         });
         println!("[PASS] Guest entry point returned {code}");
     } else {
-        println!("[INFO] Entry point was NOT executed (pass `--execute` or use `strata-cli run <path.exe>` to run guest code).");
+        println!(
+            "[INFO] Entry point was NOT executed (pass `--execute` or use `strata-cli run <path.exe>` to run guest code)."
+        );
     }
 
     // Separate synthetic COM vtable -> ThinCommandList -> Vulkan 1.3 BDA sanity check (independent of mapped PE)
@@ -786,7 +1263,12 @@ fn cmd_map_test(path: &str, execute: bool) {
         let lvt = (*list).header.vtable;
 
         (lvt.set_pipeline_state)(list as *mut _, 1);
-        let sgprs = [bda as u32, (bda >> 32) as u32, (bda + 4096) as u32, ((bda + 4096) >> 32) as u32];
+        let sgprs = [
+            bda as u32,
+            (bda >> 32) as u32,
+            (bda + 4096) as u32,
+            ((bda + 4096) >> 32) as u32,
+        ];
         (lvt.set_compute_root_32bit_constants)(list as *mut _, 0, 4, sgprs.as_ptr(), 0);
         (lvt.dispatch)(list as *mut _, 1, 1, 1);
         (lvt.close)(list as *mut _);
@@ -799,7 +1281,9 @@ fn cmd_map_test(path: &str, execute: bool) {
             let expected = ((i + 1) as f32).mul_add(2.0, 3.0) + 1.0;
             assert!((slot[0] - expected).abs() < 1e-5);
         }
-        println!("[PASS] Synthetic D3D12.X COM VTable -> ThinCommandList -> Vulkan BDA sanity check (64/64 lanes)");
+        println!(
+            "[PASS] Synthetic D3D12.X COM VTable -> ThinCommandList -> Vulkan BDA sanity check (64/64 lanes)"
+        );
 
         (lvt.release)(list as *mut _);
         ((*queue).header.vtable.release)(queue as *mut _);

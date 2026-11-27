@@ -85,7 +85,10 @@ impl BindlessManager {
 
     /// Advance the completed copy-queue fence and return all descriptors that
     /// just became safe to publish into the live Vulkan bindless heap.
-    pub fn publish_ready(&mut self, completed_copy_fence: u64) -> Vec<(HardwareDesc, BindlessSlot)> {
+    pub fn publish_ready(
+        &mut self,
+        completed_copy_fence: u64,
+    ) -> Vec<(HardwareDesc, BindlessSlot)> {
         let mut ready = Vec::new();
         self.pending_uploads.retain(|&(desc, fence)| {
             if completed_copy_fence >= fence {

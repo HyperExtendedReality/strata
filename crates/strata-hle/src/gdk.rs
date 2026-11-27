@@ -14,7 +14,8 @@ const S_OK: i32 = 0;
 
 #[repr(C)]
 pub struct DStorageFactoryVTable {
-    pub query_interface: unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> i32,
+    pub query_interface:
+        unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> i32,
     pub add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
     pub release: unsafe extern "system" fn(*mut c_void) -> u32,
     pub open_file: unsafe extern "system" fn(*mut c_void, *const u16, *mut *mut c_void) -> i32,
@@ -45,7 +46,11 @@ impl DStorageFactoryX {
     }
 }
 
-unsafe extern "system" fn ds_qi(this: *mut c_void, _riid: *const c_void, out: *mut *mut c_void) -> i32 {
+unsafe extern "system" fn ds_qi(
+    this: *mut c_void,
+    _riid: *const c_void,
+    out: *mut *mut c_void,
+) -> i32 {
     if !out.is_null() {
         unsafe {
             ds_add_ref(this);

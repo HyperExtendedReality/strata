@@ -1,0 +1,3 @@
+[alias]
+# `cargo xtask asset-check` / `cargo xtask install-hook`
+xtask = "run -q -p xtask --"

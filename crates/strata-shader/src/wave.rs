@@ -75,7 +75,11 @@ pub fn analyze_wave_liveness(program: &[DecodedInst]) -> WaveAnalysis {
             | Inst::SOrN2B64 { dst, src0, src1 } => {
                 result.is_wave64 = true;
                 let writes_exec = *dst == 126;
-                let is_whole = if writes_exec { exec_whole_live } else { vcc_whole_live };
+                let is_whole = if writes_exec {
+                    exec_whole_live
+                } else {
+                    vcc_whole_live
+                };
                 if is_whole {
                     result.whole_live_pcs.insert(di.pc);
                     if matches!(src0, Operand::VccLo | Operand::VccHi)

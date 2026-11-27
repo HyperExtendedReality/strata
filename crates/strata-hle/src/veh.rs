@@ -117,13 +117,19 @@ impl VehGuard {
     #[cfg(windows)]
     pub fn install() -> Option<Self> {
         let handle = unsafe { AddVectoredExceptionHandler(1, console_veh_handler) };
-        if handle.is_null() { None } else { Some(Self { handle }) }
+        if handle.is_null() {
+            None
+        } else {
+            Some(Self { handle })
+        }
     }
 
     #[cfg(not(windows))]
     pub fn install() -> Option<Self> {
         // On Unix, illegal-instruction emulation hooks SIGILL via sigaction.
-        Some(Self { handle: std::ptr::null_mut() })
+        Some(Self {
+            handle: std::ptr::null_mut(),
+        })
     }
 
     pub fn emulated_count() -> u64 {
@@ -156,7 +162,19 @@ unsafe extern "system" fn console_veh_handler(info: *mut ExceptionPointers) -> i
     };
 
     match insn {
-        ConsoleInsn::Clwb { len } | ConsoleInsn::MonitorWaitX { len } => {
+        ConsoleInsn::Clwb { len }
+        | ConsoleInsn::MonitorWaitX { len }
+        | ConsoleInsn::Wbnoinvd { len }
+        | ConsoleInsn::Prefetchw { len }
+        | ConsoleInsn::Clflushopt { len }
+        | ConsoleInsn::Mcommit { len } => {
+            ctx.rip += len as u64;
+        }
+        ConsoleInsn::Rdtscp { len } => {
+            let counter = emulate_rdpru_counter();
+            ctx.rax = counter & 0xffff_ffff;
+            ctx.rdx = counter >> 32;
+            ctx.rcx = emulate_rdpid_value() & 0xffff_ffff;
             ctx.rip += len as u64;
         }
         ConsoleInsn::Clzero { len } => {
@@ -175,10 +193,22 @@ unsafe extern "system" fn console_veh_handler(info: *mut ExceptionPointers) -> i
         ConsoleInsn::Rdpid { len, reg } => {
             let pid = emulate_rdpid_value();
             let regs = [
-                &mut ctx.rax, &mut ctx.rcx, &mut ctx.rdx, &mut ctx.rbx,
-                &mut ctx.rsp, &mut ctx.rbp, &mut ctx.rsi, &mut ctx.rdi,
-                &mut ctx.r8,  &mut ctx.r9,  &mut ctx.r10, &mut ctx.r11,
-                &mut ctx.r12, &mut ctx.r13, &mut ctx.r14, &mut ctx.r15,
+                &mut ctx.rax,
+                &mut ctx.rcx,
+                &mut ctx.rdx,
+                &mut ctx.rbx,
+                &mut ctx.rsp,
+                &mut ctx.rbp,
+                &mut ctx.rsi,
+                &mut ctx.rdi,
+                &mut ctx.r8,
+                &mut ctx.r9,
+                &mut ctx.r10,
+                &mut ctx.r11,
+                &mut ctx.r12,
+                &mut ctx.r13,
+                &mut ctx.r14,
+                &mut ctx.r15,
             ];
             if let Some(slot) = regs.into_iter().nth(reg as usize) {
                 *slot = pid;
@@ -202,6 +232,16 @@ pub enum ConsoleInsn {
     MonitorWaitX { len: usize },
     /// `rdpid r64` — reads logical processor ID (present on Zen 2 & modern Intel; emulated via OS CPU query).
     Rdpid { len: usize, reg: u8 },
+    /// `wbnoinvd` (`F3 0F 09`) — write-back without invalidate (no-op in user mode).
+    Wbnoinvd { len: usize },
+    /// `prefetchw m8` (`0F 0D /1`) — prefetch cache line for write (no-op).
+    Prefetchw { len: usize },
+    /// `clflushopt m8` (`66 0F AE /7`) — optimized cache line flush (no-op).
+    Clflushopt { len: usize },
+    /// `mcommit` (`F3 0F 01 FA`) — AMD memory commit barrier (no-op on coherent host).
+    Mcommit { len: usize },
+    /// `rdtscp` (`0F 01 F9`) — serialized TSC + processor ID into EDX:EAX and ECX.
+    Rdtscp { len: usize },
 }
 
 /// Decode an AMD/console x86-64 instruction from the faulting RIP bytes.
@@ -239,15 +279,51 @@ pub fn decode_console_insn(bytes: &[u8]) -> Option<ConsoleInsn> {
             }
         }
     }
-    // `clwb m8`: 66 [REX] 0F AE /6
+    // `rdtscp`: 0F 01 F9
+    if bytes[0] == 0x0F && bytes[1] == 0x01 && bytes[2] == 0xF9 {
+        return Some(ConsoleInsn::Rdtscp { len: 3 });
+    }
+    // `wbnoinvd`: F3 0F 09
+    if bytes[0] == 0xF3 && bytes[1] == 0x0F && bytes[2] == 0x09 {
+        return Some(ConsoleInsn::Wbnoinvd { len: 3 });
+    }
+    // `mcommit`: F3 0F 01 FA
+    if bytes.len() >= 4
+        && bytes[0] == 0xF3
+        && bytes[1] == 0x0F
+        && bytes[2] == 0x01
+        && bytes[3] == 0xFA
+    {
+        return Some(ConsoleInsn::Mcommit { len: 4 });
+    }
+    // `prefetchw m8`: [REX] 0F 0D /1
+    {
+        let off = if (bytes[0] & 0xF0) == 0x40 { 1 } else { 0 };
+        if bytes.len() >= off + 3 && bytes[off] == 0x0F && bytes[off + 1] == 0x0D {
+            let modrm = bytes[off + 2];
+            if ((modrm >> 3) & 7) == 1 && (modrm >> 6) != 3 {
+                let len = off + 3 + modrm_disp_sib_len(&bytes[off + 2..]);
+                return Some(ConsoleInsn::Prefetchw { len });
+            }
+        }
+    }
+    // `clwb m8` (/6) and `clflushopt m8` (/7): 66 [REX] 0F AE /6|/7
     if bytes[0] == 0x66 {
-        let off = if bytes.len() >= 5 && (bytes[1] & 0xF0) == 0x40 { 2 } else { 1 };
+        let off = if bytes.len() >= 5 && (bytes[1] & 0xF0) == 0x40 {
+            2
+        } else {
+            1
+        };
         if bytes.len() >= off + 3 && bytes[off] == 0x0F && bytes[off + 1] == 0xAE {
             let modrm = bytes[off + 2];
             let reg_op = (modrm >> 3) & 7;
-            if reg_op == 6 && (modrm >> 6) != 3 {
+            if (reg_op == 6 || reg_op == 7) && (modrm >> 6) != 3 {
                 let len = off + 3 + modrm_disp_sib_len(&bytes[off + 2..]);
-                return Some(ConsoleInsn::Clwb { len });
+                return Some(if reg_op == 6 {
+                    ConsoleInsn::Clwb { len }
+                } else {
+                    ConsoleInsn::Clflushopt { len }
+                });
             }
         }
     }
@@ -284,15 +360,33 @@ mod tests {
 
     #[test]
     fn decodes_console_instructions_and_emulates_real_counters() {
-        assert_eq!(decode_console_insn(&[0x0F, 0x01, 0xFC]), Some(ConsoleInsn::Clzero { len: 3 }));
-        assert_eq!(decode_console_insn(&[0x0F, 0x01, 0xFD]), Some(ConsoleInsn::Rdpru { len: 3 }));
-        assert_eq!(decode_console_insn(&[0x0F, 0x01, 0xFA]), Some(ConsoleInsn::MonitorWaitX { len: 3 }));
-        assert_eq!(decode_console_insn(&[0xF3, 0x0F, 0xC7, 0xF8]), Some(ConsoleInsn::Rdpid { len: 4, reg: 0 }));
-        assert_eq!(decode_console_insn(&[0x66, 0x0F, 0xAE, 0x70, 0x40]), Some(ConsoleInsn::Clwb { len: 5 }));
+        assert_eq!(
+            decode_console_insn(&[0x0F, 0x01, 0xFC]),
+            Some(ConsoleInsn::Clzero { len: 3 })
+        );
+        assert_eq!(
+            decode_console_insn(&[0x0F, 0x01, 0xFD]),
+            Some(ConsoleInsn::Rdpru { len: 3 })
+        );
+        assert_eq!(
+            decode_console_insn(&[0x0F, 0x01, 0xFA]),
+            Some(ConsoleInsn::MonitorWaitX { len: 3 })
+        );
+        assert_eq!(
+            decode_console_insn(&[0xF3, 0x0F, 0xC7, 0xF8]),
+            Some(ConsoleInsn::Rdpid { len: 4, reg: 0 })
+        );
+        assert_eq!(
+            decode_console_insn(&[0x66, 0x0F, 0xAE, 0x70, 0x40]),
+            Some(ConsoleInsn::Clwb { len: 5 })
+        );
 
         let t0 = emulate_rdpru_counter();
         let t1 = emulate_rdpru_counter();
-        assert!(t0 > 0, "rdpru emulation must return a real non-zero counter");
+        assert!(
+            t0 > 0,
+            "rdpru emulation must return a real non-zero counter"
+        );
         assert!(t1 >= t0, "rdpru counter must be monotonic");
         // rdpid returns a valid logical processor index
         let cpu = emulate_rdpid_value();

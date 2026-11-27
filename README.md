@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-7c5cff?style=for-the-badge">
+  <img alt="License: GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-7c5cff?style=for-the-badge">
   <img alt="Windows 10 / 11 x64" src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-2f80ed?style=for-the-badge">
   <img alt="NVIDIA · AMD · Intel Arc" src="https://img.shields.io/badge/GPUs-NVIDIA%20%C2%B7%20AMD%20%C2%B7%20Intel%20Arc-00b894?style=for-the-badge">
   <img alt="Vulkan 1.3+ No-API" src="https://img.shields.io/badge/Vulkan-1.3%2B%20No--API-e0405a?style=for-the-badge">
@@ -49,7 +49,7 @@ Instead of rebuilding legacy Direct3D 12 abstractions on top of console hardware
   <tr>
     <td width="33%" valign="top">
       <b>No-API Vulkan 1.3+ (Raw <code>ash</code>)</b><br><br>
-      No <code>wgpu</code>/<code>vulkano</code> wrappers, no <code>VkRenderPass</code>, no <code>VkFramebuffer</code>, and no vertex input layouts. Every shader shares <b>one global pipeline layout</b> (128 B push constants for User SGPRs + 1 unbounded bindless descriptor heap) with <code>VK_KHR_dynamic_rendering</code>.
+      No <code>wgpu</code>/<code>vulkano</code> wrappers, no <code>VkRenderPass</code>, no <code>VkFramebuffer</code>, and no vertex input layouts. Every shader shares <b>one global pipeline layout</b> (128 B push constants for User SGPRs + one image descriptor set: 16 sampled images, samplers and storage images) with <code>VK_KHR_dynamic_rendering</code>.
     </td>
     <td width="33%" valign="top">
       <b>Real 64-bit GPU Pointers (BDA)</b><br><br>
@@ -135,9 +135,15 @@ Strata is an early-stage research prototype. Subsystems below are verified on sy
 | Component | Status | Verified By / Current Scope |
 | :--- | :---: | :--- |
 | RDNA2 decoder (`SOPP`/`SOPC`/`SOP1`/`SOPK`/`SOP2`, `VOP1`/`VOPC`/`VOP2`/`VOP3`, `SMEM`, `FLAT`/`GLOBAL`, `DS`, `MUBUF`/`MTBUF`, `MIMG`, `EXP`) | 🟡 | Unit tests; covers core compute/ALU/memory/ray-tracing encodings (not full 400+ opcode ISA yet) |
-| Direct RDNA2 → SSA → SPIR-V 1.6 (BDA, LDS, VOP3, BVH64) | 🟡 | `spirv-val` + live GPU execution on synthetic RDNA2 compute kernels; graphics `EXP`/bindless `MIMG` return explicit errors |
+| Direct RDNA2 → SSA → SPIR-V 1.6 (BDA, LDS incl. `ds_add_u32` atomics, VOP3, BVH64), stores predicated on EXEC | 🟡 | `spirv-val` + live GPU execution on synthetic RDNA2 kernels |
+| Typed buffers (`tbuffer_*`): GFX10 formats converted (UNORM `x/(2^n-1)`, SNORM clamped to -1, scaled, half, 32-bit), `idxen` record addressing | ✅ | `spirv-val` + live GPU results (RGBA8_UNORM, RG16_SNORM loads; RGBA8_UNORM store). Packed 10/11-bit formats and sub-dword typed stores return explicit errors |
+| Image instructions (`image_sample`/`_l`/`_b`/`_lz`, `image_load(_mip)`, `image_store`) → set-0 `textures[16]`/`samplers[16]`/`storage_images[16]`, slots in program order | ✅ | `spirv-val` + live GPU: fetch (linear and Morton), swizzled T#, point sampling, storage write-back to title memory. 2D only; integer formats refused |
+| Vertex / pixel stages: `EXP` (`pos0`, `param0..31`, `mrt0..7`, `mrtz`, compressed halves), `v_interp_p1/p2/mov`, implicit-LOD sampling, quad swizzles (`RequireFullQuadsKHR` when the device has `VK_KHR_shader_quad_control`) | 🟡 | `spirv-val` + live GPU draws through the D3D12.X queue. VS input layout is GFX10 legacy (v0 vertex id, v3 instance id); NGG primitive shaders and PS barycentric/position VGPRs are not modelled |
 | 128-bit BDA load coalescing & bitcast/CSE/DCE opt | ✅ | Unit test + live GPU execution |
-| RDNA2-translated Structured CFG (`s_and_saveexec_b64` + `s_cbranch_execz` → `OpSelectionMerge` + `OpPhi`) | 🟡 | `spirv-val` + live GPU divergent-lane execution (forward branches; loops/irreducible CFG return explicit errors) |
+| RDNA2-translated Structured CFG (`s_and_saveexec_b64` + `s_cbranch_execz` → `OpSelectionMerge` + `OpPhi`) | ✅ | `spirv-val` + live GPU divergent-lane execution (forward branches) |
+| Structured loops (do-while and while forms, nested, per-lane EXEC exit → `OpLoopMerge` + header `OpPhi`) | 🟡 | `spirv-val` + live GPU results for uniform, while, nested and divergent EXEC loops; breaks out of a body / irreducible flow return explicit errors |
+| Descriptor tracing (V#/T#/S#/BVH descriptor → user SGPR, root table + offset, nested table, waterfall) | ✅ | Unit tests; reported by `strata-cli translate` |
+| Translation coverage tool (`strata-cli translate`: finds `XBCH`/`FSSM` in any file, ranks blockers by encoding/reason) | ✅ | Unit tests on raw and embedded containers |
 | RDNA2-translated Wave64 ballot (`wave.rs` whole-live analysis → `OpGroupNonUniformBallot` + Workgroup atomic merge) | ✅ | `spirv-val` + live GPU test across hardware subgroup sizes (`0x5555555555555555`) |
 | `DXBC` / `XDAT` / `XBCH` (pure-Rust RFC 1950/1951 zlib) / `FSSM` parser | ✅ | Unit tests on synthetic containers & streams |
 | Atomic content-addressed SPIR-V disk cache | ✅ | Roundtrip unit test |
@@ -156,6 +162,11 @@ Strata is an early-stage research prototype. Subsystems below are verified on sy
 | No-API `VK_KHR_dynamic_rendering` + Slang vertex-less `present_blit.slang` | ✅ | Live GPU render test (0 RenderPasses, 0 Framebuffers, 0 VertexBuffers) |
 | Fence-gated Bindless Slot Manager (`SHOW_AFTER` pattern) | ✅ | Unit test |
 | `ThinCommandList` (bind deduplication, integer-RT blend sanitization, hoisted clamps, draw/barrier/copy commands) | ✅ | Unit test + live COM → Vulkan compute execution |
+| Dispatches over `maxComputeWorkGroupCount` split into `vkCmdDispatchBase` pieces (never clamped), direct and indirect (`DispatchIndirect` reads its group counts from title memory, after mirror read-back) | ✅ | Unit test + live GPU tests (every group of split direct and indirect dispatches runs) |
+| Textures from T#s in title memory (GFX10 formats → Vulkan, `DST_SEL` swizzles, linear / Strata's 64KB Morton model), re-uploaded when bytes change; samplers from S#s | ✅ | Unit + live GPU tests. Other swizzle modes and mips beyond level 0 refused / not uploaded |
+| Graphics draws: dynamic rendering into render targets described like textures, D3D clip convention (flipped viewport), written back to title memory | ✅ | Live GPU draw test (`tests/draws.rs`) |
+| Shadowed Tier 2 mirrors: `MEM_WRITE_WATCH` host copy, page-exact upload of CPU writes, GPU→title read-back (`ReadbackTexture`) | ✅ | Live GPU test (dirty pages only, read-back restores VRAM bytes) |
+| Pipeline table + persistent `VkPipelineCache`, `strata-cli warm` pre-creation | 🟡 | Each pipeline created once and reused; warm-up over the SPIR-V cache (not timed on a real title yet) |
 | `FramePacingClock` + Win32 `Win32Window` / `SwapchainPresenter` + atomic `VkPipelineCache` | 🟡 | Windows x64 only today; Linux X11/Wayland surface support planned |
 
 </details>
@@ -165,12 +176,19 @@ Strata is an early-stage research prototype. Subsystems below are verified on sy
 
 | Component | Status | Verified By / Current Scope |
 | :--- | :---: | :--- |
-| PE32+ parser & in-memory mapper (`VirtualAlloc`, DIR64 relocations, live IAT patching, R/W/X protections, real entry-point execution) | ✅ | Unit test executes real mapped x86-64 PE32+ entry point (`strata-cli run <exe>`) |
-| Static TLS slot allocation (`TlsAlloc`) + template initialization | 🟡 | Basic slot setup; full TEB `ThreadLocalStoragePointer` multi-thread injection in progress |
+| PE32+ mapping through the Windows loader (patched copy mapped as a DLL: `.pdata` registered, relocations, protections) + Strata IAT binding | ✅ | Unit tests: entry execution, `RtlLookupFunctionEntry`/`RtlPcToFileHeader` on title code |
+| Static TLS on every thread (OS-allocated; index-0 `gs:[0x58]` loads redirected), TLS callbacks after binding | ✅ | Unit test on guest, pre-existing and new threads; probe title |
+| Title DLLs beside the executable (mapped, bound, `DllMain` in dependency order), delay-load imports bound eagerly | ✅ | Probe title (`tests/probe.rs`) |
+| Loader hooks: `LoadLibrary*`/`GetProcAddress` (console pseudo handles, title DLLs), `GetModuleHandle(NULL)`/`GetModuleFileName(NULL)` answer for the title, `exit`/`ExitProcess` end the title not Strata | ✅ | Unit tests + probe title |
+| `DLL_THREAD_ATTACH/DETACH` for every thread in the process, host-created ones included (an entry thunk in a `.strata` section the Windows loader calls) | ✅ | Unit test (a host `std::thread` reaches a title DLL's `DllMain`) + probe title |
+| `XMemVirtualAlloc` hands the title real host pointers (console address = host address) | ✅ | Live GPU UMA test |
+| `kernelx.dll` imports Strata does not implement fall back to the host's kernel exports | ✅ | Probe title |
+| Console drives through the VFS for path-taking kernel32/kernelx/CRT imports (`CreateFile*`, attributes, find, directories, `fopen`, ...) | ✅ | Unit test + probe title |
+| Crash reporter (unhandled faults as `module+rva`, `.pdata` stack unwind, crash log) | ✅ | Unit tests |
 | Live Windows VEH (`clzero`, `rdpru` via QPC, `rdpid` via `GetCurrentProcessorNumber`, `monitorx`/`mwaitx`, `clwb`) | ✅ | Unit tests (note: `clwb`/`rdpid` are also present on modern Intel CPUs; VEH catches faults on older/non-AMD CPUs) |
 | `xmem.dll` (`XMemVirtualAlloc`, `XMemFree`, physical-page pool & scatter mapping, working-set stats, `XMemTransferMemory`) | 🟡 | Wired to `UmaManager` + `PhysicalPagePool`; partial console flag coverage |
 | `d3d12_xs.dll` COM vtables (`Device`, `Queue`, `CommandList`, `Resource`, `Fence`, `ID3DBlob`) & `xg_xs.dll` (`XGTextureAddressComputer`) | 🟡 | Unit tests + synthetic GPU compute dispatch; full retail vtable slot parity in progress |
-| Audio (`xapu.dll` / `AcpHal.dll`) & unimplemented console imports | 🟡 | Offline silent audio stubs + logged `E_NOTIMPL` fallback stubs for unresolved imports |
+| Audio (`xapu.dll` / `AcpHal.dll`) & unimplemented console imports | 🟡 | Offline silent audio stubs; every unresolved import gets its own named stub (`--unimplemented trap` (default) / `zero` / `notimpl`) |
 
 </details>
 
@@ -209,10 +227,19 @@ strata-cli probe                   # Query GPU No-API Vulkan 1.3+ features & sub
 strata-cli selftest                # Verify embedded Slang SPIR-V & direct RDNA2 -> SPIR-V emitter
 strata-cli gpu-test                # Run 9 live GPU tests (RDNA2 BDA, Slang, Zero-Copy UMA, Wave64-on-32)
 strata-cli uma-test                # Run live 3-tier hybrid UMA + vkQueueBindSparse test
-strata-cli inspect <path.exe>          # Parse PE32+ headers and classify all DLL imports
+strata-cli inspect <path.exe|lib>      # Parse PE32+ headers or COFF .lib import libraries & classify imports
 strata-cli bind-check <path.exe>       # Dry-run IAT resolution against Strata HLE + Host Windows
 strata-cli map-test <path.exe> [--execute] # Map PE32+, patch IAT, init TLS (+ optional entry exec & synthetic COM check)
-strata-cli run <path.exe>              # Map PE32+, patch IAT, install VEH, and execute the entry point
+strata-cli run <path.exe> [--unimplemented trap|zero|notimpl] [--mount D=C:/folder]... [--search-dir DIR] [--crash-log FILE]
+                                       # Load the title and its DLLs, bind, attach, run; exit code of the title
+strata-cli warm <shader-cache-dir> [pipeline-cache-file]   # Create every cached shader's pipeline ahead of play
+strata-cli translate <file-or-dir>     # Compile every shader found (SGD5/XBCH/FSSM); rank what blocks translation
+strata-cli census <file-or-dir>        # Print stage distribution and top RDNA2 instruction encodings
+strata-cli shaders <file-or-dir> [store-dir]               # Batch pre-translate shaders into persistent versioned store
+strata-cli replay <inspect <a.scap> | diff <a.scap> <b.scap>> # Inspect or diff deterministic SCAP frame captures
+strata-cli config                      # Print resolved strata.toml + STRATA_* env config and verify asset-path policy
+scripts\play.ps1 -Exe <path.exe> [-Console series-x|series-s] [-Adapter <idx|name>] [-Fsr4K quality|balanced|performance]
+cargo xtask asset-check                # Refuse game/console content in the repository (install-hook: pre-commit)
 ```
 
 ---
@@ -222,12 +249,13 @@ strata-cli run <path.exe>              # Map PE32+, patch IAT, install VEH, and 
 Strata uses a **differential, hardware-in-the-loop verification strategy**:
 1. **Static SPIR-V Validation:** Every SPIR-V binary emitted by `strata-shader` is validated against Khronos `spirv-val --target-env vulkan1.3`.
 2. **Differential GPU Oracles:** Complex algorithms (such as watertight RDNA2 `image_bvh64_intersect_ray` box32 sorting and `64KB_S` Morton detiling) are implemented in both pure Rust CPU reference code and Slang GPU shaders, then executed live on the GPU and compared bit-for-bit.
-3. **Zero-Copy & Sparse Hardware Tests:** `gpu-test` and `uma-test` exercise `VK_EXT_external_memory_host`, `DEVICE_LOCAL` BDA mirrors, `VK_KHR_dynamic_rendering`, `vkQueueBindSparse`, and `Wave64-on-Wave32` directly on real Vulkan 1.3+ silicon.
+3. **A stand-in title:** `crates/strata-hle/src/bin/strata_probe.rs` is our own Rust program, built with console imports, that `tests/probe.rs` loads and runs through the title loader to check HLE imports, title DLLs, TLS on threads, unwinding, module-handle hooks, the VFS and exit handling end to end.
+4. **Zero-Copy & Sparse Hardware Tests:** `gpu-test` and `uma-test` exercise `VK_EXT_external_memory_host`, `DEVICE_LOCAL` BDA mirrors, `VK_KHR_dynamic_rendering`, `vkQueueBindSparse`, and `Wave64-on-Wave32` directly on real Vulkan 1.3+ silicon.
 
 ---
 
 ## License & Provenance
 
-Dual-licensed under **MIT OR Apache-2.0**.
+Licensed under **GPL-3.0-or-later**. See [LICENSE](LICENSE).
 
-Strata is an independent clean-room implementation. No code was copied from GPL-licensed compatibility layers or proprietary SDKs. All architectural references are strictly public specifications (Khronos Vulkan / SPIR-V, AMD RDNA2 ISA, Slang, and Microsoft PE32+/Win32 documentation).
+Strata is an independent clean-room implementation. No code was copied from proprietary SDKs or other compatibility layers. All architectural references are strictly public specifications (Khronos Vulkan / SPIR-V, AMD RDNA2 ISA, Slang, and Microsoft PE32+/Win32 documentation).

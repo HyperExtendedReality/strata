@@ -295,7 +295,7 @@
 
     <!-- Bottom HUD footer bar -->
     <g class="mono" font-size="10.5" letter-spacing="1.4" fill="#647899">
-      <text x="48" y="379">CLEAN-ROOM IMPLEMENTATION  //  MIT OR APACHE-2.0  //  WINDOWS 10 / 11 x64</text>
+      <text x="48" y="379">CLEAN-ROOM IMPLEMENTATION  //  GPL-3.0-OR-LATER  //  WINDOWS 10 / 11 x64</text>
       <text x="1232" y="379" text-anchor="end" fill="#7c96bd">ARCHITECTURE STACK  [ 04 ACTIVE STRATA ]</text>
     </g>
   </g>

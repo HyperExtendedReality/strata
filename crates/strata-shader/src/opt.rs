@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ssa::{SsaModule, SsaOp, Terminator, Ty, ValueId};
+use crate::ssa::{SsaModule, SsaOp, Ty, ValueId};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OptStats {
@@ -63,7 +63,20 @@ pub fn optimize(module: &mut SsaModule) -> OptStats {
             }
         }
 
-        if let Terminator::BranchCond { cond, .. } = &mut block.term {
+        if let Some(cond) = block.term.cond_mut() {
+            *cond = resolve(&repl, *cond);
+        }
+    }
+
+    // A loop header's phi reads values its body defines later; rewrite every
+    // operand once more now that all replacements are known.
+    for block in &mut module.blocks {
+        for inst in &mut block.insts {
+            if !inst.dead {
+                rewrite_operands(&mut inst.op, &repl);
+            }
+        }
+        if let Some(cond) = block.term.cond_mut() {
             *cond = resolve(&repl, *cond);
         }
     }
@@ -79,16 +92,14 @@ pub fn optimize(module: &mut SsaModule) -> OptStats {
     for (bi, block) in module.blocks.iter().enumerate() {
         for (ii, inst) in block.insts.iter().enumerate() {
             def_map.insert(inst.id, (bi, ii));
-            if !inst.dead && has_side_effect(&inst.op) {
-                if used.insert(inst.id) {
-                    worklist.push(inst.id);
-                }
+            if !inst.dead && has_side_effect(&inst.op) && used.insert(inst.id) {
+                worklist.push(inst.id);
             }
         }
-        if let Terminator::BranchCond { cond, .. } = block.term {
-            if used.insert(cond) {
-                worklist.push(cond);
-            }
+        if let Some(cond) = block.term.cond()
+            && used.insert(cond)
+        {
+            worklist.push(cond);
         }
     }
 
@@ -111,7 +122,11 @@ pub fn optimize(module: &mut SsaModule) -> OptStats {
     }
 
     let after = module.live_inst_count();
-    OptStats { before, after, coalesced_loads }
+    OptStats {
+        before,
+        after,
+        coalesced_loads,
+    }
 }
 
 fn coalesce_bda_loads(module: &mut SsaModule) -> usize {
@@ -127,7 +142,11 @@ fn coalesce_bda_loads(module: &mut SsaModule) -> usize {
             }
             match &inst.op {
                 SsaOp::BdaStore { .. } | SsaOp::WorkgroupBarrier => by_addr.clear(),
-                SsaOp::BdaLoad { addr, byte_offset, count: 1 } => {
+                SsaOp::BdaLoad {
+                    addr,
+                    byte_offset,
+                    count: 1,
+                } => {
                     let entry = by_addr.entry(*addr).or_default();
                     entry.insert(*byte_offset, (i, inst.id));
                     let aligned_base = byte_offset & !15;
@@ -180,7 +199,11 @@ fn coalesce_bda_loads(module: &mut SsaModule) -> usize {
             replacement_insts.push(crate::ssa::SsaInst {
                 id: vec_id,
                 ty: Ty::U32x4,
-                op: SsaOp::BdaLoad { addr, byte_offset: base_off, count: 4 },
+                op: SsaOp::BdaLoad {
+                    addr,
+                    byte_offset: base_off,
+                    count: 4,
+                },
                 dead: false,
             });
             for k in 0..4u8 {
@@ -217,6 +240,7 @@ fn is_pure(op: &SsaOp) -> bool {
             | SsaOp::ConstBool(_)
             | SsaOp::PushConstSgpr(_)
             | SsaOp::ThreadIdX
+            | SsaOp::StageInput(_)
             | SsaOp::BitcastU32ToF32(_)
             | SsaOp::BitcastF32ToU32(_)
             | SsaOp::PackU64 { .. }
@@ -226,6 +250,11 @@ fn is_pure(op: &SsaOp) -> bool {
             | SsaOp::SubU32(_, _)
             | SsaOp::MulU32(_, _)
             | SsaOp::AddU64(_, _)
+            | SsaOp::AndU64(_, _)
+            | SsaOp::BfeI32 { .. }
+            | SsaOp::HalfToF32(_)
+            | SsaOp::PackHalf2x16(_, _)
+            | SsaOp::RoundEvenF32(_)
             | SsaOp::AndU32(_, _)
             | SsaOp::OrU32(_, _)
             | SsaOp::XorU32(_, _)
@@ -266,6 +295,9 @@ fn has_side_effect(op: &SsaOp) -> bool {
         op,
         SsaOp::BdaStore { .. }
             | SsaOp::LdsStoreU32 { .. }
+            | SsaOp::LdsAtomicAddU32 { .. }
+            | SsaOp::ImageStore { .. }
+            | SsaOp::Export { .. }
             | SsaOp::WorkgroupBarrier
             | SsaOp::WaveBallot64(_)
     )
@@ -286,6 +318,7 @@ fn rewrite_operands(op: &mut SsaOp, repl: &HashMap<ValueId, ValueId>) {
         | SsaOp::ConstBool(_)
         | SsaOp::PushConstSgpr(_)
         | SsaOp::ThreadIdX
+        | SsaOp::StageInput(_)
         | SsaOp::WorkgroupBarrier => {}
         SsaOp::Phi { incoming } => {
             for (_, v) in incoming {
@@ -310,15 +343,40 @@ fn rewrite_operands(op: &mut SsaOp, repl: &HashMap<ValueId, ValueId>) {
         | SsaOp::LogicalNot(a)
         | SsaOp::WaveReadFirstLane(a)
         | SsaOp::WaveBallot64(a)
+        | SsaOp::WaveAny(a)
         | SsaOp::QuadSwap { val: a, .. }
+        | SsaOp::QuadBroadcast { val: a, .. }
         | SsaOp::LdsLoadU32 { byte_addr: a }
         | SsaOp::ExtractLane(a, _)
+        | SsaOp::HalfToF32(a)
+        | SsaOp::RoundEvenF32(a)
         | SsaOp::BdaLoad { addr: a, .. } => f(a),
+        SsaOp::ImageSample {
+            u, v, lod, bias, ..
+        } => {
+            f(u);
+            f(v);
+            lod.iter_mut().for_each(&f);
+            bias.iter_mut().for_each(&f);
+        }
+        SsaOp::ImageFetch { x, y, lod, .. } => {
+            f(x);
+            f(y);
+            lod.iter_mut().for_each(&f);
+        }
+        SsaOp::ImageStore { x, y, values, .. } => {
+            f(x);
+            f(y);
+            values.iter_mut().for_each(&f);
+        }
+        SsaOp::Export { values, .. } => values.iter_mut().for_each(&f),
         SsaOp::PackU64 { lo: a, hi: b }
         | SsaOp::AddU32(a, b)
         | SsaOp::SubU32(a, b)
         | SsaOp::MulU32(a, b)
         | SsaOp::AddU64(a, b)
+        | SsaOp::AndU64(a, b)
+        | SsaOp::PackHalf2x16(a, b)
         | SsaOp::AndU32(a, b)
         | SsaOp::OrU32(a, b)
         | SsaOp::XorU32(a, b)
@@ -335,13 +393,33 @@ fn rewrite_operands(op: &mut SsaOp, repl: &HashMap<ValueId, ValueId>) {
         | SsaOp::LogicalAnd(a, b)
         | SsaOp::LogicalOr(a, b)
         | SsaOp::LogicalXor(a, b)
-        | SsaOp::LdsStoreU32 { byte_addr: a, val: b } => {
+        | SsaOp::LdsStoreU32 {
+            byte_addr: a,
+            val: b,
+        }
+        | SsaOp::LdsAtomicAddU32 {
+            byte_addr: a,
+            val: b,
+        } => {
             f(a);
             f(b);
         }
         SsaOp::FmaF32(a, b, c)
-        | SsaOp::BfeU32 { src: a, offset: b, width: c }
-        | SsaOp::SelectU32 { cond: a, t: b, f: c } => {
+        | SsaOp::BfeU32 {
+            src: a,
+            offset: b,
+            width: c,
+        }
+        | SsaOp::BfeI32 {
+            src: a,
+            offset: b,
+            width: c,
+        }
+        | SsaOp::SelectU32 {
+            cond: a,
+            t: b,
+            f: c,
+        } => {
             f(a);
             f(b);
             f(c);
@@ -381,6 +459,7 @@ fn for_each_operand(op: &SsaOp, mut f: impl FnMut(ValueId)) {
         | SsaOp::ConstBool(_)
         | SsaOp::PushConstSgpr(_)
         | SsaOp::ThreadIdX
+        | SsaOp::StageInput(_)
         | SsaOp::WorkgroupBarrier => {}
         SsaOp::Phi { incoming } => {
             for &(_, v) in incoming {
@@ -405,15 +484,39 @@ fn for_each_operand(op: &SsaOp, mut f: impl FnMut(ValueId)) {
         | SsaOp::LogicalNot(a)
         | SsaOp::WaveReadFirstLane(a)
         | SsaOp::WaveBallot64(a)
+        | SsaOp::WaveAny(a)
         | SsaOp::QuadSwap { val: a, .. }
+        | SsaOp::QuadBroadcast { val: a, .. }
         | SsaOp::LdsLoadU32 { byte_addr: a }
         | SsaOp::ExtractLane(a, _)
+        | SsaOp::HalfToF32(a)
+        | SsaOp::RoundEvenF32(a)
         | SsaOp::BdaLoad { addr: a, .. } => f(*a),
+        SsaOp::ImageSample {
+            u, v, lod, bias, ..
+        } => {
+            f(*u);
+            f(*v);
+            lod.iter().chain(bias.iter()).for_each(|&x| f(x));
+        }
+        SsaOp::ImageFetch { x, y, lod, .. } => {
+            f(*x);
+            f(*y);
+            lod.iter().for_each(|&l| f(l));
+        }
+        SsaOp::ImageStore { x, y, values, .. } => {
+            f(*x);
+            f(*y);
+            values.iter().for_each(|&v| f(v));
+        }
+        SsaOp::Export { values, .. } => values.iter().for_each(|&v| f(v)),
         SsaOp::PackU64 { lo: a, hi: b }
         | SsaOp::AddU32(a, b)
         | SsaOp::SubU32(a, b)
         | SsaOp::MulU32(a, b)
         | SsaOp::AddU64(a, b)
+        | SsaOp::AndU64(a, b)
+        | SsaOp::PackHalf2x16(a, b)
         | SsaOp::AndU32(a, b)
         | SsaOp::OrU32(a, b)
         | SsaOp::XorU32(a, b)
@@ -430,13 +533,33 @@ fn for_each_operand(op: &SsaOp, mut f: impl FnMut(ValueId)) {
         | SsaOp::LogicalAnd(a, b)
         | SsaOp::LogicalOr(a, b)
         | SsaOp::LogicalXor(a, b)
-        | SsaOp::LdsStoreU32 { byte_addr: a, val: b } => {
+        | SsaOp::LdsStoreU32 {
+            byte_addr: a,
+            val: b,
+        }
+        | SsaOp::LdsAtomicAddU32 {
+            byte_addr: a,
+            val: b,
+        } => {
             f(*a);
             f(*b);
         }
         SsaOp::FmaF32(a, b, c)
-        | SsaOp::BfeU32 { src: a, offset: b, width: c }
-        | SsaOp::SelectU32 { cond: a, t: b, f: c } => {
+        | SsaOp::BfeU32 {
+            src: a,
+            offset: b,
+            width: c,
+        }
+        | SsaOp::BfeI32 {
+            src: a,
+            offset: b,
+            width: c,
+        }
+        | SsaOp::SelectU32 {
+            cond: a,
+            t: b,
+            f: c,
+        } => {
             f(*a);
             f(*b);
             f(*c);

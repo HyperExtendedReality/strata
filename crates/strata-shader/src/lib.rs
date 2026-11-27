@@ -3,12 +3,25 @@
 pub mod bvh;
 pub mod cache;
 pub mod container;
+pub mod coverage;
+pub mod descriptor;
+pub mod format;
+pub mod geometry;
 pub mod inflate;
+pub mod opcodes;
 pub mod opt;
 pub mod rdna2;
+pub mod resource;
+pub mod sampler;
+pub mod spill;
 pub mod spirv;
 pub mod ssa;
+pub mod store;
+pub mod structurizer;
+#[doc(hidden)]
+pub mod test_kernels;
 pub mod wave;
+pub mod wave_ops;
 
 use thiserror::Error;
 
@@ -32,12 +45,26 @@ pub fn compile_rdna2_to_spirv(
     words: &[u32],
     workgroup_size: [u32; 3],
 ) -> Result<CompiledShader, CompileError> {
+    compile_rdna2_with(words, workgroup_size, &ssa::BuildOptions::default())
+}
+
+/// As [`compile_rdna2_to_spirv`], for any stage (vertex and pixel shaders
+/// ignore `workgroup_size`).
+pub fn compile_rdna2_with(
+    words: &[u32],
+    workgroup_size: [u32; 3],
+    opts: &ssa::BuildOptions,
+) -> Result<CompiledShader, CompileError> {
     let decoded = rdna2::decode_program(words)?;
     let wave = wave::analyze_wave_liveness(&decoded);
-    let mut module = ssa::build_ssa(&decoded, &wave, workgroup_size)?;
+    let mut module = ssa::build_ssa_with(&decoded, &wave, workgroup_size, opts)?;
     let opt_stats = opt::optimize(&mut module);
     let spirv = spirv::emit_spirv(&module);
-    Ok(CompiledShader { spirv, opt_stats, wave })
+    Ok(CompiledShader {
+        spirv,
+        opt_stats,
+        wave,
+    })
 }
 
 #[cfg(test)]
@@ -97,8 +124,18 @@ mod tests {
         };
         let node = bvh::Box32Node {
             children: [10, 20, 30, bvh::INVALID_NODE],
-            bounds_min: [[-1.0, -1.0, 20.0], [-1.0, -1.0, 5.0], [10.0, 10.0, 10.0], [0.0; 3]],
-            bounds_max: [[1.0, 1.0, 25.0], [1.0, 1.0, 8.0], [12.0, 12.0, 12.0], [0.0; 3]],
+            bounds_min: [
+                [-1.0, -1.0, 20.0],
+                [-1.0, -1.0, 5.0],
+                [10.0, 10.0, 10.0],
+                [0.0; 3],
+            ],
+            bounds_max: [
+                [1.0, 1.0, 25.0],
+                [1.0, 1.0, 8.0],
+                [12.0, 12.0, 12.0],
+                [0.0; 3],
+            ],
         };
         let hits = bvh::intersect_box32(&ray, &node);
         assert_eq!(hits, [20, 10, bvh::INVALID_NODE, bvh::INVALID_NODE]);
@@ -112,15 +149,15 @@ mod tests {
         // if (v0 < 32) v1 = v0 + 10; else v1 = v0 + 20;
         // store v1 at s[0:1] + (v0 << 2)
         let mut prog = Vec::new();
-        prog.push(v_cmp_lt_u32_imm(0, 32));          // pc 0
-        prog.push(s_and_saveexec_b64(4, 106));        // pc 1: s[4:5] = exec; exec &= vcc
-        prog.push(s_cbranch_execz(1));                // pc 2: skip pc 3 if execz -> pc 4
-        prog.push(v_add_nc_u32_imm(1, 10, 0));        // pc 3: then-body
-        prog.push(s_xor_b64(126, 126, 4));            // pc 4: exec ^= s[4:5] (else lanes)
-        prog.push(s_cbranch_execz(1));                // pc 5: skip pc 6 if execz -> pc 7
-        prog.push(v_add_nc_u32_imm(1, 20, 0));        // pc 6: else-body
-        prog.push(s_or_b64(126, 126, 4));             // pc 7: restore exec
-        prog.push(v_lshlrev_b32_imm(2, 2, 0));        // pc 8: byte offset = v0 << 2
+        prog.push(v_cmp_lt_u32_imm(0, 32)); // pc 0
+        prog.push(s_and_saveexec_b64(4, 106)); // pc 1: s[4:5] = exec; exec &= vcc
+        prog.push(s_cbranch_execz(1)); // pc 2: skip pc 3 if execz -> pc 4
+        prog.push(v_add_nc_u32_imm(1, 10, 0)); // pc 3: then-body
+        prog.push(s_xor_b64(126, 126, 4)); // pc 4: exec ^= s[4:5] (else lanes)
+        prog.push(s_cbranch_execz(1)); // pc 5: skip pc 6 if execz -> pc 7
+        prog.push(v_add_nc_u32_imm(1, 20, 0)); // pc 6: else-body
+        prog.push(s_or_b64(126, 126, 4)); // pc 7: restore exec
+        prog.push(v_lshlrev_b32_imm(2, 2, 0)); // pc 8: byte offset = v0 << 2
         prog.extend_from_slice(&global_store_dword(2, 1, 0, 0)); // pc 9..10
         prog.push(s_endpgm());
 
@@ -148,7 +185,10 @@ mod tests {
         prog.push(s_endpgm());
 
         let compiled = compile_rdna2_to_spirv(&prog, [64, 1, 1]).expect("compile failed");
-        assert!(!compiled.wave.whole_live_pcs.is_empty(), "expected whole-live VCC ballot");
+        assert!(
+            !compiled.wave.whole_live_pcs.is_empty(),
+            "expected whole-live VCC ballot"
+        );
         assert_spirv_valid(&compiled.spirv, "rdna2_w64_ballot");
     }
 
@@ -171,12 +211,182 @@ mod tests {
         assert_spirv_valid(&compiled.spirv, "rdna2_lds_vop3_bvh");
     }
 
+    /// Synthetic RDNA2 loop kernels shared with the live GPU test in `strata-cli`.
+    pub use crate::test_kernels::*;
+
     #[test]
-    fn rejects_unsupported_graphics_exp_instead_of_silently_dropping() {
+    fn uniform_do_while_loop_validates_spirv() {
+        let compiled =
+            compile_rdna2_to_spirv(&uniform_do_while_sum(), [64, 1, 1]).expect("compile");
+        assert_spirv_valid(&compiled.spirv, "loop_do_while");
+    }
+
+    #[test]
+    fn divergent_exec_loop_validates_spirv() {
+        let compiled = compile_rdna2_to_spirv(&divergent_exec_loop(), [64, 1, 1]).expect("compile");
+        assert_spirv_valid(&compiled.spirv, "loop_exec");
+    }
+
+    #[test]
+    fn while_loop_with_top_test_validates_spirv() {
+        let compiled = compile_rdna2_to_spirv(&while_loop_sum(), [64, 1, 1]).expect("compile");
+        assert_spirv_valid(&compiled.spirv, "loop_while");
+    }
+
+    #[test]
+    fn nested_loops_validate_spirv() {
+        let compiled = compile_rdna2_to_spirv(&nested_loops(), [64, 1, 1]).expect("compile");
+        assert_spirv_valid(&compiled.spirv, "loop_nested");
+    }
+
+    #[test]
+    fn lds_atomic_add_validates_spirv() {
+        let compiled = compile_rdna2_to_spirv(&lds_atomic_count(), [64, 1, 1]).expect("compile");
+        assert_spirv_valid(&compiled.spirv, "lds_atomic");
+    }
+
+    #[test]
+    fn typed_buffer_and_image_kernels_validate_spirv() {
+        for (name, prog) in [
+            ("typed_load_rgba8", typed_load_rgba8_unorm()),
+            ("typed_load_rg16_snorm", typed_load_rg16_snorm()),
+            ("typed_store_rgba8", typed_store_rgba8_unorm()),
+            ("image_fetch", image_fetch_8x8()),
+            ("image_sample_lz", image_sample_lz_fixed()),
+            ("image_store", image_store_8x8()),
+        ] {
+            let compiled =
+                compile_rdna2_to_spirv(&prog, [64, 1, 1]).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_spirv_valid(&compiled.spirv, name);
+        }
+    }
+
+    #[test]
+    fn image_slots_match_between_compiler_and_descriptor_trace() {
+        use resource::{ImageBinding, image_bindings, trace_descriptors};
+        let mut prog = image_fetch_8x8();
+        prog.pop(); // s_endpgm
+        prog.extend_from_slice(&rdna2::encode::image_store_2d(4, 10, 8, 0xf));
+        prog.extend_from_slice(&rdna2::encode::image_sample_lz_2d(4, 10, 8, 16, 0xf));
+        prog.push(rdna2::encode::s_endpgm());
+        let decoded = rdna2::decode_program(&prog).unwrap();
+        let slots: Vec<_> = image_bindings(&trace_descriptors(&decoded))
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(
+            slots,
+            [
+                ImageBinding::Fetched(0),
+                ImageBinding::Storage(0),
+                ImageBinding::Sampled(1)
+            ]
+        );
+        let wave = wave::analyze_wave_liveness(&decoded);
+        let m = ssa::build_ssa(&decoded, &wave, [64, 1, 1]).unwrap();
+        assert_eq!((m.texture_slots, m.storage_slots), (2, 1));
+    }
+
+    #[test]
+    fn a_break_out_of_a_loop_body_is_rejected() {
+        use rdna2::encode::*;
+        // L: s_cbranch_scc1 EXIT(past the back edge) ; v_nop-ish ; s_cbranch_execnz L ; EXIT:
+        let prog = vec![
+            s_cmp_lt_u32(4, 132),
+            v_add_nc_u32_imm(1, 1, 1), // pc 1: header
+            s_cbranch_scc1(1),         // pc 2: forward to pc 4, past the latch
+            s_cbranch_execnz(-3),      // pc 3: back to pc 1
+            s_endpgm(),                // pc 4
+        ];
+        assert!(matches!(
+            compile_rdna2_to_spirv(&prog, [64, 1, 1]),
+            Err(CompileError::Lower(
+                ssa::LowerError::UnsupportedBranch { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn exp_in_a_compute_shader_is_rejected() {
         use rdna2::encode::*;
         let mut prog = Vec::new();
         prog.extend_from_slice(&exp_mrt0([0, 1, 2, 3], true));
         prog.push(s_endpgm());
         assert!(compile_rdna2_to_spirv(&prog, [64, 1, 1]).is_err());
+    }
+
+    #[test]
+    fn packed_2_10_10_10_unorm_typed_buffer_validates_spirv() {
+        use rdna2::encode::*;
+        // Format 50 = BUF_FMT_2_10_10_10_UNORM
+        let mut prog = Vec::new();
+        prog.extend_from_slice(&tbuffer_load_format_idx(2, 4, 0, 0, 50, 0));
+        prog.push(s_waitcnt());
+        prog.extend_from_slice(&tbuffer_store_format_idx(2, 4, 0, 4, 50, 0));
+        prog.push(s_endpgm());
+        let compiled = compile_rdna2_to_spirv(&prog, [64, 1, 1]).expect("packed format compiles");
+        assert_spirv_valid(&compiled.spirv, "packed_2_10_10_10");
+    }
+
+    fn stage(stage: ssa::Stage) -> ssa::BuildOptions {
+        ssa::BuildOptions {
+            stage,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn vertex_and_pixel_shaders_validate_spirv() {
+        use ssa::Stage::*;
+        for (name, prog, opts) in [
+            ("vs_fullscreen", fullscreen_triangle_vs(), stage(Vertex)),
+            ("ps_interp", interpolated_color_ps(), stage(Pixel)),
+            ("ps_flat", flat_color_ps(), stage(Pixel)),
+            (
+                "ps_sample",
+                sampled_color_ps(),
+                ssa::BuildOptions {
+                    stage: Pixel,
+                    texture_slot_base: 3,
+                    ..Default::default()
+                },
+            ),
+            (
+                "ps_quad_full",
+                quad_broadcast_ps(),
+                ssa::BuildOptions {
+                    stage: Pixel,
+                    require_full_quads: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let compiled = compile_rdna2_with(&prog, [1, 1, 1], &opts)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_spirv_valid(&compiled.spirv, name);
+        }
+    }
+
+    #[test]
+    fn quad_swizzles_decode_exactly() {
+        use rdna2::encode::*;
+        let d = |off| rdna2::decode_program(&ds_swizzle(1, 0, off)).map(|v| v[0].inst.clone());
+        assert!(matches!(
+            d(0x80B1),
+            Ok(rdna2::Inst::VQuadSwap { direction: 0, .. })
+        ));
+        assert!(matches!(
+            d(0x804E),
+            Ok(rdna2::Inst::VQuadSwap { direction: 1, .. })
+        ));
+        assert!(matches!(
+            d(0x80AA),
+            Ok(rdna2::Inst::VQuadBroadcast { lane: 2, .. })
+        ));
+        assert!(
+            d(0x80E4).is_err(),
+            "identity / mixed selects are not a swap"
+        );
+        assert!(d(0x0041).is_err(), "bit-mask mode");
     }
 }

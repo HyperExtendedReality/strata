@@ -1,13 +1,26 @@
 //! Strata No-API Vulkan 1.3+ GPU backend.
 
+pub mod async_submit;
 pub mod bindless;
 pub mod context;
+pub mod descriptors;
+pub mod graphics;
+pub mod images;
+pub mod indirect_upload;
 pub mod layout;
 pub mod memory;
 pub mod present;
+pub mod readback;
+pub mod replay;
+pub mod residency;
 pub mod runner;
 pub mod swapchain;
+pub mod tdr;
+pub mod texstore;
+pub mod texture;
 pub mod thin_list;
+pub mod timeline;
 pub mod uma;
 pub mod vram;
 pub mod window;
+pub mod write_watch;

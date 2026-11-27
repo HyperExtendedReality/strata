@@ -9,3 +9,6 @@ strata-shader = { path = "../strata-shader" }
 strata-runtime-shaders = { path = "../strata-runtime-shaders" }
 strata-gpu = { path = "../strata-gpu" }
 strata-hle = { path = "../strata-hle" }
+
+[lints]
+workspace = true

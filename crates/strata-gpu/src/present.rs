@@ -96,7 +96,10 @@ mod tests {
         clock.schedule(FrameEventKind::Present, 120);
 
         let fired = clock.advance_and_fire(100);
-        assert_eq!(fired, vec![FrameEventKind::Origin, FrameEventKind::CustomType2]);
+        assert_eq!(
+            fired,
+            vec![FrameEventKind::Origin, FrameEventKind::CustomType2]
+        );
 
         let fired2 = clock.advance_and_fire(120);
         assert_eq!(fired2, vec![FrameEventKind::Present]);

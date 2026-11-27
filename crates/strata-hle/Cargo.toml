@@ -6,5 +6,16 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+strata-formats = { path = "../strata-formats" }
 strata-gpu = { path = "../strata-gpu" }
+strata-shader = { path = "../strata-shader" }
 strata-runtime-shaders = { path = "../strata-runtime-shaders" }
+
+[[bin]]
+name = "strata_probe"
+path = "src/bin/strata_probe.rs"
+test = false
+doc = false
+
+[lints]
+workspace = true

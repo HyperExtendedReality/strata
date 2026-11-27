@@ -43,13 +43,18 @@ pub fn unimplemented_stub_call_count() -> u64 {
     UNIMPLEMENTED_STUB_CALLS.load(Ordering::Relaxed)
 }
 
+pub(crate) fn note_unimplemented_call() {
+    UNIMPLEMENTED_STUB_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
 // ============================================================================
 // ID3DBlob COM Object (for D3D12SerializeVersionedRootSignature)
 // ============================================================================
 
 #[repr(C)]
 pub struct BlobVTable {
-    pub query_interface: unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> i32,
+    pub query_interface:
+        unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> i32,
     pub add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
     pub release: unsafe extern "system" fn(*mut c_void) -> u32,
     pub get_buffer_pointer: unsafe extern "system" fn(*mut c_void) -> *mut c_void,
@@ -81,7 +86,11 @@ impl ComBlob {
     }
 }
 
-unsafe extern "system" fn blob_qi(this: *mut c_void, _riid: *const c_void, out: *mut *mut c_void) -> i32 {
+unsafe extern "system" fn blob_qi(
+    this: *mut c_void,
+    _riid: *const c_void,
+    out: *mut *mut c_void,
+) -> i32 {
     if out.is_null() {
         return 0x8000_4002u32 as i32;
     }
@@ -125,12 +134,14 @@ unsafe extern "system" fn blob_get_size(this: *mut c_void) -> usize {
 
 #[repr(C)]
 pub struct XgComputerVTable {
-    pub query_interface: unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> i32,
+    pub query_interface:
+        unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> i32,
     pub add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
     pub release: unsafe extern "system" fn(*mut c_void) -> u32,
     pub get_resource_size_bytes: unsafe extern "system" fn(*mut c_void) -> u64,
     pub get_resource_base_alignment_bytes: unsafe extern "system" fn(*mut c_void) -> u64,
-    pub get_texel_element_offset_bytes: unsafe extern "system" fn(*mut c_void, u32, u64, u32, u32, u32, u32) -> u64,
+    pub get_texel_element_offset_bytes:
+        unsafe extern "system" fn(*mut c_void, u32, u64, u32, u32, u32, u32) -> u64,
 }
 
 #[repr(C)]
@@ -159,7 +170,11 @@ impl XgTextureComputerCom {
     }
 }
 
-unsafe extern "system" fn xg_qi(this: *mut c_void, _riid: *const c_void, out: *mut *mut c_void) -> i32 {
+unsafe extern "system" fn xg_qi(
+    this: *mut c_void,
+    _riid: *const c_void,
+    out: *mut *mut c_void,
+) -> i32 {
     if out.is_null() {
         return 0x8000_4002u32 as i32;
     }
@@ -208,7 +223,9 @@ unsafe extern "system" fn xg_get_offset(
 ) -> u64 {
     let obj = unsafe { &*(this as *const XgTextureComputerCom) };
     match obj.layout.swizzle {
-        SwizzleMode::Linear => (y as u64) * (obj.layout.row_pitch_bytes as u64) + x * (obj.layout.bpp as u64),
+        SwizzleMode::Linear => {
+            (y as u64) * (obj.layout.row_pitch_bytes as u64) + x * (obj.layout.bpp as u64)
+        }
         SwizzleMode::Swizzle64KS | SwizzleMode::Swizzle64KD => {
             TextureLayout::swizzle_64ks_offset(x as u32, y, obj.layout.width, obj.layout.bpp) as u64
         }
@@ -296,10 +313,11 @@ unsafe extern "system" fn xmem_map_physical_pages(
     }
     let pfns = unsafe { std::slice::from_raw_parts(page_array, num_pages) };
     with_hle(|g| {
-        let mapped = g
-            .runtime
-            .phys_pool
-            .map_scatter(&mut g.runtime.uma.address_space, base_address as u64, pfns);
+        let mapped = g.runtime.phys_pool.map_scatter(
+            &mut g.runtime.uma.address_space,
+            base_address as u64,
+            pfns,
+        );
         if mapped == num_pages { 1 } else { 0 }
     })
     .unwrap_or(0)
@@ -320,7 +338,9 @@ struct XMemWorkingSetStats {
     active_physical_bytes: u64,
 }
 
-unsafe extern "system" fn xmem_get_working_set_statistics(out_stats: *mut XMemWorkingSetStats) -> i32 {
+unsafe extern "system" fn xmem_get_working_set_statistics(
+    out_stats: *mut XMemWorkingSetStats,
+) -> i32 {
     if out_stats.is_null() {
         return 0;
     }
@@ -441,7 +461,10 @@ unsafe extern "system" fn offline_net_denied() -> i32 {
     0x8007_0005u32 as i32
 }
 
-unsafe extern "system" fn dstorage_get_factory(_riid: *const c_void, out_factory: *mut *mut c_void) -> i32 {
+unsafe extern "system" fn dstorage_get_factory(
+    _riid: *const c_void,
+    out_factory: *mut *mut c_void,
+) -> i32 {
     if !out_factory.is_null() {
         let factory = crate::gdk::DStorageFactoryX::new_boxed(crate::vfs::Vfs::new());
         unsafe { *out_factory = factory as *mut c_void };
@@ -479,7 +502,9 @@ pub fn resolve_hle(dll_name: &str, func_name: &str) -> Option<usize> {
             _ => return None,
         }),
         "d3d12_xs.dll" | "d3d12_x.dll" => Some(match func_name {
-            "D3D12ConfigureVirtualMemoryX" => d3d12_configure_virtual_memory_x as *const () as usize,
+            "D3D12ConfigureVirtualMemoryX" => {
+                d3d12_configure_virtual_memory_x as *const () as usize
+            }
             "D3D12XboxCreateDevice" => d3d12_xbox_create_device as *const () as usize,
             "D3D12SerializeVersionedRootSignature" => {
                 d3d12_serialize_versioned_root_signature as *const () as usize
@@ -491,12 +516,31 @@ pub fn resolve_hle(dll_name: &str, func_name: &str) -> Option<usize> {
             "XGCreateTextureComputer" => xg_create_texture_computer as *const () as usize,
             _ => return None,
         }),
-        "xcrdapi.dll" => Some(match func_name {
+        "xcrdapi.dll" | "dstorage.dll" => Some(match func_name {
             "DStorageGetFactory" => dstorage_get_factory as *const () as usize,
             _ => logged_unimplemented_stub as *const () as usize,
         }),
-        "libhttpclient.gdk.dll" => Some(offline_net_denied as *const () as usize),
-        "xapu.dll" | "acphal.dll" => Some(audio_stub_silent as *const () as usize),
+        "xgameruntime.dll" => Some(match func_name {
+            "XGameRuntimeInitialize"
+            | "XGameRuntimeUninitialize"
+            | "XSystemGetDeviceType"
+            | "XNetworkingQueryConnectivityHint"
+            | "XUserAddAsync"
+            | "XGameSaveInitializeProviderAsync"
+            | "XPackageGetCurrentProcessPackageIdentifier"
+            | "XStoreCreateContext"
+            | "XTaskQueueCreate"
+            | "XTaskQueueDispatch"
+            | "XAsyncGetStatus" => audio_stub_silent as *const () as usize,
+            _ => logged_unimplemented_stub as *const () as usize,
+        }),
+        "xaudio2_9.dll" | "xaudio2_9redist.dll" | "xapu.dll" | "acphal.dll" => {
+            Some(audio_stub_silent as *const () as usize)
+        }
+        "gameinput.dll" => Some(audio_stub_silent as *const () as usize),
+        "libhttpclient.gdk.dll" | "xnetworking.dll" => {
+            Some(offline_net_denied as *const () as usize)
+        }
         _ => None,
     }
 }
@@ -516,7 +560,10 @@ mod tests {
             ("xg_xs.dll", "XGCreateTextureComputer"),
             ("libHttpClient.GDK.dll", "HCInitialize"),
         ] {
-            assert!(resolve_hle(dll, func).is_some(), "missing HLE thunk for {dll}!{func}");
+            assert!(
+                resolve_hle(dll, func).is_some(),
+                "missing HLE thunk for {dll}!{func}"
+            );
         }
 
         // Verify D3D12SerializeVersionedRootSignature actually fills out a valid ID3DBlob
@@ -524,7 +571,11 @@ mod tests {
             let mut blob_ptr: *mut c_void = std::ptr::null_mut();
             let mut err_ptr: *mut c_void = 0x1234 as *mut c_void;
             assert_eq!(
-                d3d12_serialize_versioned_root_signature(std::ptr::null(), &mut blob_ptr, &mut err_ptr),
+                d3d12_serialize_versioned_root_signature(
+                    std::ptr::null(),
+                    &mut blob_ptr,
+                    &mut err_ptr
+                ),
                 0
             );
             assert!(err_ptr.is_null());
@@ -535,13 +586,21 @@ mod tests {
             assert_eq!(((*blob).vtable.release)(blob_ptr), 0);
 
             // Verify XGCreateTextureComputer actually fills out a valid XGTextureAddressComputer
-            let desc = XgTexture2DDesc { width: 256, height: 256, bpp: 4, swizzle_mode: 9 };
+            let desc = XgTexture2DDesc {
+                width: 256,
+                height: 256,
+                bpp: 4,
+                swizzle_mode: 9,
+            };
             let mut xg_ptr: *mut c_void = std::ptr::null_mut();
             assert_eq!(xg_create_texture_computer(&desc, &mut xg_ptr), 0);
             assert!(!xg_ptr.is_null());
             let comp = xg_ptr as *mut XgTextureComputerCom;
             assert_eq!(((*comp).vtable.get_resource_size_bytes)(xg_ptr), 256 * 1024);
-            assert_eq!(((*comp).vtable.get_resource_base_alignment_bytes)(xg_ptr), 65_536);
+            assert_eq!(
+                ((*comp).vtable.get_resource_base_alignment_bytes)(xg_ptr),
+                65_536
+            );
             assert_eq!(((*comp).vtable.release)(xg_ptr), 0);
         }
     }

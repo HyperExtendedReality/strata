@@ -67,16 +67,26 @@ pub fn intersect_triangle(ray: &Ray, v0: [f32; 3], v1: [f32; 3], v2: [f32; 3]) -
         return [f32::INFINITY, 1.0, 0.0, 0.0];
     }
 
-    let tvec = [ray.origin[0] - v0[0], ray.origin[1] - v0[1], ray.origin[2] - v0[2]];
+    let tvec = [
+        ray.origin[0] - v0[0],
+        ray.origin[1] - v0[1],
+        ray.origin[2] - v0[2],
+    ];
     let u = dot(tvec, p);
     let q = cross(tvec, e1);
     let v = dot(ray.dir, q);
     let t = dot(e2, q);
 
     let (inside, t_ok) = if det > 0.0 {
-        (u >= 0.0 && v >= 0.0 && u + v <= det, t >= 0.0 && t <= ray.t_max * det)
+        (
+            u >= 0.0 && v >= 0.0 && u + v <= det,
+            t >= 0.0 && t <= ray.t_max * det,
+        )
     } else {
-        (u <= 0.0 && v <= 0.0 && u + v >= det, t <= 0.0 && t >= ray.t_max * det)
+        (
+            u <= 0.0 && v <= 0.0 && u + v >= det,
+            t <= 0.0 && t >= ray.t_max * det,
+        )
     };
 
     if inside && t_ok {
@@ -96,4 +106,52 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// RDNA2 Box16 BVH node storing four IEEE-754 binary16 AABBs.
+#[derive(Debug, Clone, Copy)]
+pub struct Box16Node {
+    pub children: [u32; 4],
+    pub bounds_min_f16: [[u16; 3]; 4],
+    pub bounds_max_f16: [[u16; 3]; 4],
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits >> 15) << 31;
+    let exp = u32::from((bits >> 10) & 0x1F);
+    let mant = u32::from(bits & 0x3FF);
+    let f32_bits = if exp == 0 {
+        if mant == 0 {
+            sign
+        } else {
+            let mut m = mant;
+            let mut e = 127 - 14;
+            while (m & 0x400) == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            sign | (e << 23) | ((m & 0x3FF) << 13)
+        }
+    } else if exp == 31 {
+        sign | (0xFF << 23) | (mant << 13)
+    } else {
+        sign | ((exp + 112) << 23) | (mant << 13)
+    };
+    f32::from_bits(f32_bits)
+}
+
+/// Four-way Box16 AABB intersection (expands fp16 bounds to fp32 and runs [`intersect_box32`]).
+pub fn intersect_box16(ray: &Ray, node: &Box16Node) -> [u32; 4] {
+    let mut b32 = Box32Node {
+        children: node.children,
+        bounds_min: [[0.0; 3]; 4],
+        bounds_max: [[0.0; 3]; 4],
+    };
+    for i in 0..4 {
+        for a in 0..3 {
+            b32.bounds_min[i][a] = f16_to_f32(node.bounds_min_f16[i][a]);
+            b32.bounds_max[i][a] = f16_to_f32(node.bounds_max_f16[i][a]);
+        }
+    }
+    intersect_box32(ray, &b32)
 }

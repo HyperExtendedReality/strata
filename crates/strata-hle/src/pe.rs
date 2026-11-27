@@ -29,6 +29,9 @@ pub struct ImportDll {
     pub dll_name: String,
     pub first_thunk_rva: u32,
     pub functions: Vec<String>,
+    /// Delay-load import (`IMAGE_DELAYLOAD_DESCRIPTOR`): RVA of the slot the
+    /// delay helper keeps the module handle in. `None` for ordinary imports.
+    pub delay_module_handle_rva: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +43,8 @@ pub struct ExportFunc {
 
 #[derive(Debug, Clone)]
 pub struct Pe64Info {
+    /// `IMAGE_FILE_DLL` is set: the entry point is `DllMain`.
+    pub is_dll: bool,
     pub image_base: u64,
     pub entry_rva: u32,
     pub size_of_image: u32,
@@ -56,6 +61,19 @@ pub struct Pe64Info {
 impl Pe64Info {
     pub fn total_import_count(&self) -> usize {
         self.imports.iter().map(|d| d.functions.len()).sum()
+    }
+
+    /// RVA of an export named `func`, or `ordinal#N`.
+    pub fn export_rva(&self, func: &str) -> Option<u32> {
+        if let Some(ord) = func.strip_prefix("ordinal#") {
+            let ord: u16 = ord.parse().ok()?;
+            return self
+                .exports
+                .iter()
+                .find(|e| e.ordinal == ord)
+                .map(|e| e.rva);
+        }
+        self.exports.iter().find(|e| e.name == func).map(|e| e.rva)
     }
 }
 
@@ -76,6 +94,7 @@ pub fn parse_pe64(bytes: &[u8]) -> Result<Pe64Info, PeError> {
     }
 
     let num_sections = u16_at(bytes, pe_off + 6) as usize;
+    let is_dll = u16_at(bytes, pe_off + 22) & 0x2000 != 0;
     let opt_size = u16_at(bytes, pe_off + 20) as usize;
     let opt_off = pe_off + 24;
     let magic = u16_at(bytes, opt_off);
@@ -116,6 +135,12 @@ pub fn parse_pe64(bytes: &[u8]) -> Result<Pe64Info, PeError> {
         (0, 0)
     };
 
+    let delay_dir_rva = if num_rva_and_sizes >= 14 {
+        u32_at(bytes, opt_off + 112 + 13 * 8)
+    } else {
+        0
+    };
+
     let sec_table_off = opt_off + opt_size;
     let mut sections = Vec::with_capacity(num_sections);
     for i in 0..num_sections {
@@ -124,10 +149,8 @@ pub fn parse_pe64(bytes: &[u8]) -> Result<Pe64Info, PeError> {
             break;
         }
         let raw_name = &bytes[off..off + 8];
-        let name = String::from_utf8_lossy(
-            raw_name.split(|&b| b == 0).next().unwrap_or(&[]),
-        )
-        .into_owned();
+        let name =
+            String::from_utf8_lossy(raw_name.split(|&b| b == 0).next().unwrap_or(&[])).into_owned();
         sections.push(Section {
             name,
             virtual_size: u32_at(bytes, off + 8),
@@ -153,29 +176,47 @@ pub fn parse_pe64(bytes: &[u8]) -> Result<Pe64Info, PeError> {
                     .map(|o| read_cstr(bytes, o))
                     .unwrap_or_default();
 
-                let thunk_rva = if orig_first_thunk != 0 { orig_first_thunk } else { first_thunk };
-                let mut functions = Vec::new();
-                if let Some(mut t_off) = rva_to_offset(&sections, thunk_rva) {
-                    while t_off + 8 <= bytes.len() {
-                        let entry = u64_at(bytes, t_off);
-                        if entry == 0 {
-                            break;
-                        }
-                        if (entry >> 63) != 0 {
-                            functions.push(format!("ordinal#{}", entry & 0xffff));
-                        } else if let Some(hint_off) = rva_to_offset(&sections, entry as u32) {
-                            functions.push(read_cstr(bytes, hint_off + 2));
-                        }
-                        t_off += 8;
-                    }
-                }
-
+                let thunk_rva = if orig_first_thunk != 0 {
+                    orig_first_thunk
+                } else {
+                    first_thunk
+                };
                 imports.push(ImportDll {
                     dll_name,
                     first_thunk_rva: first_thunk,
-                    functions,
+                    functions: read_thunk_names(bytes, &sections, thunk_rva),
+                    delay_module_handle_rva: None,
                 });
                 desc_off += 20;
+            }
+        }
+    }
+
+    // Delay-load imports (#13): IMAGE_DELAYLOAD_DESCRIPTOR, 32 bytes each.
+    // Only the RVA-based form (Attributes bit 0) that every modern linker emits.
+    if delay_dir_rva != 0 {
+        if let Some(mut d_off) = rva_to_offset(&sections, delay_dir_rva) {
+            while d_off + 32 <= bytes.len() {
+                let attributes = u32_at(bytes, d_off);
+                let name_rva = u32_at(bytes, d_off + 4);
+                let handle_rva = u32_at(bytes, d_off + 8);
+                let iat_rva = u32_at(bytes, d_off + 12);
+                let int_rva = u32_at(bytes, d_off + 16);
+                if name_rva == 0 {
+                    break;
+                }
+                if attributes & 1 != 0 {
+                    let dll_name = rva_to_offset(&sections, name_rva)
+                        .map(|o| read_cstr(bytes, o))
+                        .unwrap_or_default();
+                    imports.push(ImportDll {
+                        dll_name,
+                        first_thunk_rva: iat_rva,
+                        functions: read_thunk_names(bytes, &sections, int_rva),
+                        delay_module_handle_rva: Some(handle_rva),
+                    });
+                }
+                d_off += 32;
             }
         }
     }
@@ -220,6 +261,7 @@ pub fn parse_pe64(bytes: &[u8]) -> Result<Pe64Info, PeError> {
     }
 
     Ok(Pe64Info {
+        is_dll,
         image_base,
         entry_rva,
         size_of_image,
@@ -234,7 +276,28 @@ pub fn parse_pe64(bytes: &[u8]) -> Result<Pe64Info, PeError> {
     })
 }
 
-fn rva_to_offset(sections: &[Section], rva: u32) -> Option<usize> {
+/// Names of a 64-bit import name table: `ordinal#N` or the hint/name string.
+fn read_thunk_names(bytes: &[u8], sections: &[Section], thunk_rva: u32) -> Vec<String> {
+    let mut functions = Vec::new();
+    let Some(mut t_off) = rva_to_offset(sections, thunk_rva) else {
+        return functions;
+    };
+    while t_off + 8 <= bytes.len() {
+        let entry = u64_at(bytes, t_off);
+        if entry == 0 {
+            break;
+        }
+        if (entry >> 63) != 0 {
+            functions.push(format!("ordinal#{}", entry & 0xffff));
+        } else if let Some(hint_off) = rva_to_offset(sections, entry as u32) {
+            functions.push(read_cstr(bytes, hint_off + 2));
+        }
+        t_off += 8;
+    }
+    functions
+}
+
+pub(crate) fn rva_to_offset(sections: &[Section], rva: u32) -> Option<usize> {
     for s in sections {
         let span = s.virtual_size.max(s.raw_size);
         if rva >= s.virtual_addr && rva < s.virtual_addr.saturating_add(span) {
@@ -253,14 +316,14 @@ fn read_cstr(bytes: &[u8], off: usize) -> String {
     String::from_utf8_lossy(&slice[..end]).into_owned()
 }
 
-fn u16_at(b: &[u8], o: usize) -> u16 {
+pub(crate) fn u16_at(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes(b[o..o + 2].try_into().unwrap())
 }
 
-fn u32_at(b: &[u8], o: usize) -> u32 {
+pub(crate) fn u32_at(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
 }
 
-fn u64_at(b: &[u8], o: usize) -> u64 {
+pub(crate) fn u64_at(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
 }

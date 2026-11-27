@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  clippy:
+    name: Clippy
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: Tests & Asset Policy
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Asset policy check
+        run: cargo xtask asset-check
+      - name: Unit & integration tests
+        run: cargo test --workspace --locked
+
+  check:
+    needs: [clippy, test]
+    if: always()
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require all jobs to pass
+        run: |
+          if ('${{ needs.clippy.result }}' -ne 'success' -or
+              '${{ needs.test.result }}' -ne 'success') {
+            exit 1
+          }

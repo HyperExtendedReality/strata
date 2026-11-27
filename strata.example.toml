@@ -1,0 +1,43 @@
+# Copy to `strata.toml` (git-ignored) and point it at YOUR files.
+# Every path must be OUTSIDE the repository; Strata refuses otherwise.
+# Environment variables (shown below) take precedence over this file.
+# STRATA_CONFIG selects a different config file.
+
+[paths]
+# Your own unpacked copy of a title.          env: STRATA_GAME_DIR
+game_dir = 'D:\strata-data\title'
+
+# Optional PC FidelityFX / FSR DLL folder.    env: STRATA_FIDELITYFX_DIR
+# fidelityfx_dir = 'D:\strata-data\fidelityfx'
+
+# Derived data (shader & pipeline caches).    env: STRATA_CACHE_DIR
+# Default: %LOCALAPPDATA%\strata\cache
+# cache_dir = 'D:\strata-data\cache'
+
+# Persistent title save data.                 env: STRATA_DATA_DIR
+# Default: %LOCALAPPDATA%\strata\data
+# data_dir = 'D:\strata-data\data'
+
+[gpu]
+# Vulkan adapter index ("0") or name substring ("NVIDIA", "Radeon", "Arc").
+# env: STRATA_GPU_ADAPTER
+# adapter = "Radeon"
+
+# Optional output resolution override (e.g. "1920x1080", "3840x2160").
+# env: STRATA_OUTPUT
+# output = "1920x1080"
+
+# Optional FSR 4K preset: "quality" | "balanced" | "performance".
+# env: STRATA_FSR_4K
+# fsr_4k = "quality"
+
+[runtime]
+# Console profile: "series-x" | "series-s"    env: STRATA_CONSOLE
+console = "series-x"
+
+# Target frame interval in milliseconds (e.g. 16.667 for 60 fps, 33.333 for 30 fps).
+# env: STRATA_FRAME_INTERVAL_MS
+# frame_interval_ms = 16.667
+
+# Unimplemented import policy: "trap" | "zero" | "notimpl"
+unimplemented = "trap"

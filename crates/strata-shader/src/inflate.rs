@@ -88,7 +88,9 @@ pub fn inflate_raw(data: &[u8]) -> Result<Vec<u8>, InflateError> {
                         }
                         16 => {
                             let rep = br.read_bits(2)? as usize + 3;
-                            let prev = *all_lens.get(idx.wrapping_sub(1)).ok_or(InflateError::BadSymbol)?;
+                            let prev = *all_lens
+                                .get(idx.wrapping_sub(1))
+                                .ok_or(InflateError::BadSymbol)?;
                             for _ in 0..rep {
                                 if idx < all_lens.len() {
                                     all_lens[idx] = prev;
@@ -180,7 +182,12 @@ struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, byte_pos: 0, bit_buf: 0, bit_cnt: 0 }
+        Self {
+            data,
+            byte_pos: 0,
+            bit_buf: 0,
+            bit_cnt: 0,
+        }
     }
 
     fn fill(&mut self, need: u32) -> Result<(), InflateError> {
@@ -292,8 +299,7 @@ mod tests {
         let stored_zlib = [
             0x78, 0x01, // zlib header
             0x01, 0x04, 0x00, 0xfb, 0xff, // final stored block, len=4
-            b'F', b'S', b'S', b'M',
-            0x03, 0xd8, 0x01, 0x3b, // adler32
+            b'F', b'S', b'S', b'M', 0x03, 0xd8, 0x01, 0x3b, // adler32
         ];
         assert_eq!(inflate_zlib(&stored_zlib).unwrap(), b"FSSM");
     }

@@ -7,3 +7,7 @@ license.workspace = true
 [dependencies]
 ash.workspace = true
 thiserror.workspace = true
+strata-shader = { path = "../strata-shader" }
+
+[lints]
+workspace = true

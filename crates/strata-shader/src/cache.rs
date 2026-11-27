@@ -58,6 +58,35 @@ impl ShaderDiskCache {
     pub fn dir(&self) -> &Path {
         &self.dir
     }
+
+    /// Every SPIR-V entry this compiler version wrote, for warming pipelines.
+    pub fn entries(&self) -> Vec<Vec<u32>> {
+        let prefix = format!("v{COMPILER_VERSION}_");
+        let Ok(dir) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(PathBuf, Vec<u32>)> = dir
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().is_some_and(|x| x == "spv")
+                    && p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
+            })
+            .filter_map(|p| {
+                let bytes = std::fs::read(&p).ok()?;
+                (bytes.len() >= 20 && bytes.len() % 4 == 0).then(|| {
+                    let words = bytes
+                        .chunks_exact(4)
+                        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                        .collect();
+                    (p, words)
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.into_iter().map(|(_, w)| w).collect()
+    }
 }
 
 #[cfg(test)]

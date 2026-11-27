@@ -8,9 +8,26 @@ const SHADERS: &[(&str, &str, &str, &str)] = &[
     ("dirty_hash.slang", "dirty_hash.spv", "main", "compute"),
     ("detile.slang", "detile.spv", "main", "compute"),
     ("bvh_oracle.slang", "bvh_oracle.spv", "main", "compute"),
-    ("clamp_indirect.slang", "clamp_indirect.spv", "main", "compute"),
-    ("present_blit.slang", "present_blit_vs.spv", "main_vs", "vertex"),
-    ("present_blit.slang", "present_blit_fs.spv", "main_fs", "fragment"),
+    (
+        "clamp_indirect.slang",
+        "clamp_indirect.spv",
+        "main",
+        "compute",
+    ),
+    ("tex_convert.slang", "tex_convert.spv", "main", "compute"),
+    ("mip_gen.slang", "mip_gen.spv", "main", "compute"),
+    (
+        "present_blit.slang",
+        "present_blit_vs.spv",
+        "main_vs",
+        "vertex",
+    ),
+    (
+        "present_blit.slang",
+        "present_blit_fs.spv",
+        "main_fs",
+        "fragment",
+    ),
 ];
 
 fn find_slangc() -> PathBuf {

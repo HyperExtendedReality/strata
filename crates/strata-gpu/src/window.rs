@@ -111,7 +111,12 @@ impl Win32Window {
             if hwnd.is_null() {
                 return None;
             }
-            Some(Self { hinstance, hwnd, width, height })
+            Some(Self {
+                hinstance,
+                hwnd,
+                width,
+                height,
+            })
         }
     }
 
