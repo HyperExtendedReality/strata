@@ -62,7 +62,38 @@ pub unsafe fn write_code(addr: *mut u8, expected: &[u8], replacement: &[u8]) -> 
             FlushInstructionCache(GetCurrentProcess(), addr.cast(), replacement.len());
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
+        }
+        const PROT_READ: i32 = 1;
+        const PROT_WRITE: i32 = 2;
+        const PROT_EXEC: i32 = 4;
+        let page_size = 4096usize;
+        let page_start = (addr as usize) & !(page_size - 1);
+        let page_end = ((addr as usize) + replacement.len() + page_size - 1) & !(page_size - 1);
+        let ok = unsafe {
+            mprotect(
+                page_start as *mut c_void,
+                page_end - page_start,
+                PROT_READ | PROT_WRITE | PROT_EXEC,
+            )
+        };
+        if ok != 0 {
+            return PatchResult::ProtectFailed;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(replacement.as_ptr(), addr, replacement.len());
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            let _ = mprotect(
+                page_start as *mut c_void,
+                page_end - page_start,
+                PROT_READ | PROT_EXEC,
+            );
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
     unsafe {
         std::ptr::copy_nonoverlapping(replacement.as_ptr(), addr, replacement.len());
     }

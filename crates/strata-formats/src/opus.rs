@@ -85,7 +85,7 @@ pub struct OpusDecoder {
 impl OpusDecoder {
     pub fn new(channels: u16, sample_rate: u32) -> Self {
         Self {
-            channels: (channels as usize).clamp(1, 2),
+            channels: (channels as usize).clamp(1, 8),
             sample_rate: sample_rate.max(8_000),
             packets_decoded: 0,
             prev_energy: 0.0,

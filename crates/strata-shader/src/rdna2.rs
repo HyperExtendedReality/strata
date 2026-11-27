@@ -627,6 +627,11 @@ pub enum Inst {
         addr: u8,
         data: u8,
     },
+    DsSwizzleB32 {
+        dst: u8,
+        src: u8,
+        offset: u16,
+    },
 
     // --- Global & Buffer Atomics ---
     GlobalAtomic {
@@ -1134,40 +1139,41 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
                     offset,
                 },
                 0x35 => {
-                    // ds_swizzle_b32 quad-permute mode: offset[15] = 1 and four
-                    // 2-bit selects, lane i of each quad reading lane sel_i.
-                    if offset & 0x8000 == 0 {
-                        return Err(DecodeError::Unsupported {
-                            word: w,
-                            offset: pc,
-                        }); // bit-mask mode
-                    }
-                    match offset & 0xff {
-                        0xB1 => Inst::VQuadSwap {
+                    // ds_swizzle_b32: quad-permute mode (offset[15] = 1) or
+                    // bit-mask / FFT butterfly mode (offset[15] = 0).
+                    if (offset & 0x8000) != 0 {
+                        match offset & 0xff {
+                            0xB1 => Inst::VQuadSwap {
+                                dst: vdst,
+                                src: addr,
+                                direction: 0,
+                            }, // 1,0,3,2
+                            0x4E => Inst::VQuadSwap {
+                                dst: vdst,
+                                src: addr,
+                                direction: 1,
+                            }, // 2,3,0,1
+                            0x1B => Inst::VQuadSwap {
+                                dst: vdst,
+                                src: addr,
+                                direction: 2,
+                            }, // 3,2,1,0
+                            sel @ (0x00 | 0x55 | 0xAA | 0xFF) => Inst::VQuadBroadcast {
+                                dst: vdst,
+                                src: addr,
+                                lane: (sel & 3) as u8,
+                            },
+                            _ => Inst::DsSwizzleB32 {
+                                dst: vdst,
+                                src: addr,
+                                offset,
+                            },
+                        }
+                    } else {
+                        Inst::DsSwizzleB32 {
                             dst: vdst,
                             src: addr,
-                            direction: 0,
-                        }, // 1,0,3,2
-                        0x4E => Inst::VQuadSwap {
-                            dst: vdst,
-                            src: addr,
-                            direction: 1,
-                        }, // 2,3,0,1
-                        0x1B => Inst::VQuadSwap {
-                            dst: vdst,
-                            src: addr,
-                            direction: 2,
-                        }, // 3,2,1,0
-                        sel @ (0x00 | 0x55 | 0xAA | 0xFF) => Inst::VQuadBroadcast {
-                            dst: vdst,
-                            src: addr,
-                            lane: (sel & 3) as u8,
-                        },
-                        _ => {
-                            return Err(DecodeError::Unsupported {
-                                word: w,
-                                offset: pc,
-                            });
+                            offset,
                         }
                     }
                 }

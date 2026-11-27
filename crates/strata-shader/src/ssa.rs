@@ -3622,6 +3622,20 @@ impl Builder {
                 let res = b.m.emit(blk, Ty::U32, SsaOp::WaveShuffle { val, lane });
                 b.write_vgpr(*dst, res);
             }
+            Inst::DsSwizzleB32 { dst, src, offset } => {
+                let value = b.read_vgpr(*src);
+                let blk = b.cur_block;
+                let res = b.m.emit(
+                    blk,
+                    Ty::U32,
+                    SsaOp::WavePermute {
+                        op: crate::wave_ops::LanePermuteOp::DsSwizzle { offset16: *offset },
+                        value,
+                        aux: None,
+                    },
+                );
+                b.write_vgpr(*dst, res);
+            }
             Inst::GlobalAtomic {
                 op,
                 dst,

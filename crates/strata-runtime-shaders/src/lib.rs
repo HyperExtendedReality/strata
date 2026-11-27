@@ -8,6 +8,15 @@ pub const CLAMP_INDIRECT_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/clamp_indirect.spv"));
 pub const TEX_CONVERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tex_convert.spv"));
 pub const MIP_GEN_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mip_gen.spv"));
+pub const MSAA_RESOLVE_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/msaa_resolve.spv"));
+pub const CHUNK_DIRTY_HASH_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/chunk_dirty_hash.spv"));
+pub const SCATTER_UPLOAD_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/scatter_upload.spv"));
+pub const RECT_EXPAND_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rect_expand.spv"));
+pub const AMBIENT_CLAMP_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ambient_clamp.spv"));
+pub const OVERLAY_HUD_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/overlay_hud.spv"));
+pub const BCPACK_DECODE_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bcpack_decode.spv"));
 pub const COMPOSE_VS_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/compose_vs.spv"));
 pub const COMPOSE_FS_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/compose_fs.spv"));
 pub const PRESENT_BLIT_VS_SPV: &[u8] =
@@ -54,6 +63,13 @@ mod tests {
         assert_valid_spv_header("clamp_indirect", CLAMP_INDIRECT_SPV);
         assert_valid_spv_header("tex_convert", TEX_CONVERT_SPV);
         assert_valid_spv_header("mip_gen", MIP_GEN_SPV);
+        assert_valid_spv_header("msaa_resolve", MSAA_RESOLVE_SPV);
+        assert_valid_spv_header("chunk_dirty_hash", CHUNK_DIRTY_HASH_SPV);
+        assert_valid_spv_header("scatter_upload", SCATTER_UPLOAD_SPV);
+        assert_valid_spv_header("rect_expand", RECT_EXPAND_SPV);
+        assert_valid_spv_header("ambient_clamp", AMBIENT_CLAMP_SPV);
+        assert_valid_spv_header("overlay_hud", OVERLAY_HUD_SPV);
+        assert_valid_spv_header("bcpack_decode", BCPACK_DECODE_SPV);
         assert_valid_spv_header("compose_vs", COMPOSE_VS_SPV);
         assert_valid_spv_header("compose_fs", COMPOSE_FS_SPV);
         assert_valid_spv_header("present_blit_vs", PRESENT_BLIT_VS_SPV);

@@ -147,6 +147,24 @@ impl SwapchainPresenter {
             3
         });
 
+        let present_modes = unsafe {
+            surface_loader
+                .get_physical_device_surface_present_modes(pdev, surface)
+                .unwrap_or_default()
+        };
+        let want_vsync = std::env::var("STRATA_VSYNC")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let present_mode = if want_vsync {
+            vk::PresentModeKHR::FIFO
+        } else if present_modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
+            vk::PresentModeKHR::IMMEDIATE
+        } else if present_modes.contains(&vk::PresentModeKHR::MAILBOX) {
+            vk::PresentModeKHR::MAILBOX
+        } else {
+            vk::PresentModeKHR::FIFO
+        };
+
         let format = vk::Format::B8G8R8A8_UNORM;
         let sc_ci = vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
@@ -159,7 +177,7 @@ impl SwapchainPresenter {
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(vk::PresentModeKHR::FIFO)
+            .present_mode(present_mode)
             .clipped(true);
 
         let swapchain = unsafe { swapchain_loader.create_swapchain(&sc_ci, None)? };

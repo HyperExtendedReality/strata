@@ -38,11 +38,54 @@ pub fn is_sgd5(bytes: &[u8]) -> bool {
 
 /// Parse an `SGD5` archive and return all embedded `XBCH` / `FSSM` / `DXBC`
 /// container slices in offset order.
+///
+/// Prefers the structured TOC header (`[u32 count][count * (u32 offset, u32 size)]`)
+/// when present and valid, falling back to magic-byte scanning for raw streams.
 pub fn parse_sgd5(bytes: &[u8]) -> Option<Sgd5Archive<'_>> {
     if !is_sgd5(bytes) {
         return None;
     }
     let version = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+
+    // Attempt structured TOC parse at +8: [entry_count: u32, reserved: u32, (offset: u32, size: u32) * count]
+    if bytes.len() >= 16 {
+        let count = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
+        let toc_end = 16usize.saturating_add(count.saturating_mul(8));
+        if count > 0 && count <= 65_536 && toc_end <= bytes.len() {
+            let mut toc_entries = Vec::with_capacity(count);
+            let mut valid = true;
+            for idx in 0..count {
+                let base = 16 + idx * 8;
+                let off = u32::from_le_bytes(bytes[base..base + 4].try_into().ok()?) as usize;
+                let size = u32::from_le_bytes(bytes[base + 4..base + 8].try_into().ok()?) as usize;
+                if off < toc_end || size < 4 || off.saturating_add(size) > bytes.len() {
+                    valid = false;
+                    break;
+                }
+                let kind = match &bytes[off..off + 4] {
+                    b"XBCH" => EmbeddedContainerKind::Xbch,
+                    b"FSSM" => EmbeddedContainerKind::Fssm,
+                    b"DXBC" => EmbeddedContainerKind::Dxbc,
+                    _ => {
+                        valid = false;
+                        break;
+                    }
+                };
+                toc_entries.push(Sgd5Entry {
+                    index: idx,
+                    offset: off,
+                    kind,
+                    payload: &bytes[off..off + size],
+                });
+            }
+            if valid {
+                return Some(Sgd5Archive {
+                    version,
+                    entries: toc_entries,
+                });
+            }
+        }
+    }
 
     let mut offsets: Vec<(usize, EmbeddedContainerKind)> = Vec::new();
     let mut i = 8usize;

@@ -3149,13 +3149,29 @@ fn make_graphics_pso(
     )
 }
 
+fn workgroup_size_of(bytes: &[u8]) -> [u32; 3] {
+    if bytes.starts_with(b"FSSM")
+        && let Ok(p) = strata_shader::container::parse_fssm(bytes)
+        && let Some(wg) = p.workgroup_size
+    {
+        return wg;
+    }
+    if bytes.starts_with(b"XBCH")
+        && let Ok(fssm) = strata_shader::container::unpack_xbch(bytes)
+        && let Ok(p) = strata_shader::container::parse_fssm(&fssm)
+        && let Some(wg) = p.workgroup_size
+    {
+        return wg;
+    }
+    [64, 1, 1]
+}
+
 fn make_compute_pso(dev: *mut c_void, cs: &[u8], rs: *mut c_void) -> *mut Com<PipelineStateInner> {
     let key = next_pso_key(dev);
     if let Some(b) = &device_inner(dev).backend {
+        let wg = workgroup_size_of(cs);
         match program_of(cs) {
-            // The thread-group size is in console shader metadata Strata does
-            // not parse yet: 64x1x1 (one wave) is assumed.
-            Some(words) => match crate::d3d12x::translate_compute(&words, [64, 1, 1]) {
+            Some(words) => match crate::d3d12x::translate_compute(&words, wg) {
                 Ok(e) => {
                     b.pipelines.lock().unwrap().insert(key, e);
                 }
@@ -3163,7 +3179,7 @@ fn make_compute_pso(dev: *mut c_void, cs: &[u8], rs: *mut c_void) -> *mut Com<Pi
             },
             None => {
                 // DXIL-only compute PSO fallback.
-                if let Ok((_, spirv)) = strata_shader::dxil::compile_dxil_to_spirv(cs, [64, 1, 1]) {
+                if let Ok((_, spirv)) = strata_shader::dxil::compile_dxil_to_spirv(cs, wg) {
                     b.pipelines.lock().unwrap().insert(
                         key,
                         crate::d3d12x::PipelineEntry {

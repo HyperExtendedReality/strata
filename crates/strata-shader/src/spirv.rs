@@ -186,6 +186,7 @@ const BUILTIN_INSTANCE_INDEX: u32 = 43;
 const BUILTIN_GLOBAL_INVOCATION_ID: u32 = 28;
 const BUILTIN_LOCAL_INVOCATION_INDEX: u32 = 29;
 const BUILTIN_SUBGROUP_SIZE: u32 = 36;
+const BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID: u32 = 41;
 
 // Memory operands
 const MEM_ALIGNED: u32 = 0x2;
@@ -395,6 +396,8 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     } else {
         None
     };
+    let uses_sg_local_id = live().any(|i| matches!(i.op, SsaOp::WavePermute { .. }));
+    let sg_local_id_var = uses_sg_local_id.then(|| w.id());
     let ballot_shared_var = if module.uses_wave64_ballot {
         Some(w.id())
     } else {
@@ -441,6 +444,9 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
         ep.push(v);
     }
     if let Some(v) = sg_size_var {
+        ep.push(v);
+    }
+    if let Some(v) = sg_local_id_var {
         ep.push(v);
     }
     if let Some(v) = ballot_shared_var {
@@ -600,6 +606,12 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     }
     if let Some(v) = sg_size_var {
         w.inst(OP_DECORATE, &[v, DEC_BUILTIN, BUILTIN_SUBGROUP_SIZE]);
+    }
+    if let Some(v) = sg_local_id_var {
+        w.inst(
+            OP_DECORATE,
+            &[v, DEC_BUILTIN, BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID],
+        );
     }
     w.inst(OP_DECORATE, &[t_sgpr_arr, DEC_ARRAY_STRIDE, 4]);
     w.inst(OP_DECORATE, &[t_push_struct, DEC_BLOCK]);
@@ -858,6 +870,39 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                         id
                     });
                 }
+                SsaOp::WavePermute { op, .. } => {
+                    use crate::wave_ops::LanePermuteOp;
+                    let mut needed: Vec<u32> = Vec::new();
+                    match *op {
+                        LanePermuteOp::ReadLane { lane } | LanePermuteOp::WriteLane { lane } => {
+                            needed.push(lane);
+                        }
+                        LanePermuteOp::DsSwizzle { offset16 } => {
+                            if (offset16 & 0x8000) != 0 {
+                                needed.extend_from_slice(&[u32::from(offset16), 1, 3, !3u32]);
+                            } else {
+                                let and_m = u32::from(offset16 & 0x1F);
+                                let or_m = u32::from((offset16 >> 5) & 0x1F);
+                                let xor_m = u32::from((offset16 >> 10) & 0x1F);
+                                needed.extend_from_slice(&[and_m, or_m, xor_m, 31, !31u32]);
+                            }
+                        }
+                        LanePermuteOp::DsBpermute => {
+                            needed.push(2);
+                        }
+                        LanePermuteOp::PermLane16 { .. } | LanePermuteOp::PermLaneX16 { .. } => {
+                            needed.extend_from_slice(&[2, 7, 15, 16, !15u32]);
+                        }
+                        _ => {}
+                    }
+                    for k in needed {
+                        const_u32.entry(k).or_insert_with(|| {
+                            let id = w.id();
+                            w.inst(OP_CONSTANT, &[t_u32, id, k]);
+                            id
+                        });
+                    }
+                }
                 SsaOp::ImageGather { slot, comp, .. } => {
                     for &k in &[*slot, *comp] {
                         const_u32.entry(k).or_insert_with(|| {
@@ -928,6 +973,9 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
         w.inst(OP_VARIABLE, &[t_ptr_in_u32, v, SC_INPUT]);
     }
     if let Some(v) = sg_size_var {
+        w.inst(OP_VARIABLE, &[t_ptr_in_u32, v, SC_INPUT]);
+    }
+    if let Some(v) = sg_local_id_var {
         w.inst(OP_VARIABLE, &[t_ptr_in_u32, v, SC_INPUT]);
     }
     if let Some(v) = ballot_shared_var {
@@ -2078,25 +2126,138 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                             );
                         }
                         LanePermuteOp::ReadLane { lane } => {
-                            let l = const_u32.get(lane).copied().unwrap_or(c_zero);
+                            let l = const_u32[lane];
                             w.inst(
                                 OP_GROUP_NON_UNIFORM_SHUFFLE,
                                 &[t_u32, res, c_scope_subgroup, v, l],
                             );
                         }
-                        LanePermuteOp::DsSwizzle { offset16 } => {
-                            let xor_mask = u32::from((offset16 >> 10) & 0x1F);
-                            let m = const_u32.get(&xor_mask).copied().unwrap_or(c_zero);
-                            w.inst(
-                                OP_GROUP_NON_UNIFORM_SHUFFLE_XOR,
-                                &[t_u32, res, c_scope_subgroup, v, m],
-                            );
+                        LanePermuteOp::WriteLane { lane } => {
+                            // Write scalar `aux` into `v` only in `lane`, preserving all other lanes.
+                            let lid_var = sg_local_id_var.expect("sg_local_id_var");
+                            let lid = w.id();
+                            w.inst(OP_LOAD, &[t_u32, lid, lid_var]);
+                            let is_target = w.id();
+                            w.inst(OP_I_EQUAL, &[t_bool, is_target, lid, const_u32[lane]]);
+                            let scalar = aux.map_or(c_zero, |a| val_map[&a]);
+                            w.inst(OP_SELECT, &[t_u32, res, is_target, scalar, v]);
                         }
-                        _ => {
-                            let lane_id = aux.map_or(c_zero, |a| val_map[&a]);
+                        LanePermuteOp::DsSwizzle { offset16 } => {
+                            if (offset16 & 0x8000) != 0 {
+                                // Quad-permute mode: src_lane = (lane & !3) | ((offset16 >> ((lane & 3) * 2)) & 3)
+                                let lid_var = sg_local_id_var.expect("sg_local_id_var");
+                                let lid = w.id();
+                                w.inst(OP_LOAD, &[t_u32, lid, lid_var]);
+                                let quad_base = w.id();
+                                w.inst(OP_BITWISE_AND, &[t_u32, quad_base, lid, const_u32[&!3u32]]);
+                                let in_quad = w.id();
+                                w.inst(OP_BITWISE_AND, &[t_u32, in_quad, lid, const_u32[&3]]);
+                                let shift = w.id();
+                                w.inst(
+                                    OP_SHIFT_LEFT_LOGICAL,
+                                    &[t_u32, shift, in_quad, const_u32[&1]],
+                                );
+                                let shifted = w.id();
+                                w.inst(
+                                    OP_SHIFT_RIGHT_LOGICAL,
+                                    &[t_u32, shifted, const_u32[&u32::from(*offset16)], shift],
+                                );
+                                let pick = w.id();
+                                w.inst(OP_BITWISE_AND, &[t_u32, pick, shifted, const_u32[&3]]);
+                                let src_lane = w.id();
+                                w.inst(OP_BITWISE_OR, &[t_u32, src_lane, quad_base, pick]);
+                                w.inst(
+                                    OP_GROUP_NON_UNIFORM_SHUFFLE,
+                                    &[t_u32, res, c_scope_subgroup, v, src_lane],
+                                );
+                            } else {
+                                let and_mask = u32::from(offset16 & 0x1F);
+                                let or_mask = u32::from((offset16 >> 5) & 0x1F);
+                                let xor_mask = u32::from((offset16 >> 10) & 0x1F);
+                                if and_mask == 0x1F && or_mask == 0 {
+                                    w.inst(
+                                        OP_GROUP_NON_UNIFORM_SHUFFLE_XOR,
+                                        &[t_u32, res, c_scope_subgroup, v, const_u32[&xor_mask]],
+                                    );
+                                } else {
+                                    // Full bit-mask mode: half | ((((lane & 31) & and_mask) | or_mask) ^ xor_mask)
+                                    let lid_var = sg_local_id_var.expect("sg_local_id_var");
+                                    let lid = w.id();
+                                    w.inst(OP_LOAD, &[t_u32, lid, lid_var]);
+                                    let half = w.id();
+                                    w.inst(OP_BITWISE_AND, &[t_u32, half, lid, const_u32[&!31u32]]);
+                                    let low = w.id();
+                                    w.inst(
+                                        OP_BITWISE_AND,
+                                        &[t_u32, low, lid, const_u32[&and_mask]],
+                                    );
+                                    let ored = w.id();
+                                    w.inst(OP_BITWISE_OR, &[t_u32, ored, low, const_u32[&or_mask]]);
+                                    let xored = w.id();
+                                    w.inst(
+                                        OP_BITWISE_XOR,
+                                        &[t_u32, xored, ored, const_u32[&xor_mask]],
+                                    );
+                                    let src_lane = w.id();
+                                    w.inst(OP_BITWISE_OR, &[t_u32, src_lane, half, xored]);
+                                    w.inst(
+                                        OP_GROUP_NON_UNIFORM_SHUFFLE,
+                                        &[t_u32, res, c_scope_subgroup, v, src_lane],
+                                    );
+                                }
+                            }
+                        }
+                        LanePermuteOp::DsBpermute => {
+                            // `aux` is a byte address (lane_id * 4); convert to lane index via >> 2.
+                            let addr_bytes = aux.map_or(c_zero, |a| val_map[&a]);
+                            let lane_idx = w.id();
+                            w.inst(
+                                OP_SHIFT_RIGHT_LOGICAL,
+                                &[t_u32, lane_idx, addr_bytes, const_u32[&2]],
+                            );
                             w.inst(
                                 OP_GROUP_NON_UNIFORM_SHUFFLE,
-                                &[t_u32, res, c_scope_subgroup, v, lane_id],
+                                &[t_u32, res, c_scope_subgroup, v, lane_idx],
+                            );
+                        }
+                        LanePermuteOp::PermLane16 { .. } | LanePermuteOp::PermLaneX16 { .. } => {
+                            let cross = matches!(op, LanePermuteOp::PermLaneX16 { .. });
+                            let lid_var = sg_local_id_var.expect("sg_local_id_var");
+                            let lid = w.id();
+                            w.inst(OP_LOAD, &[t_u32, lid, lid_var]);
+                            let row = w.id();
+                            w.inst(OP_BITWISE_AND, &[t_u32, row, lid, const_u32[&!15u32]]);
+                            let src_row = if cross {
+                                let sr = w.id();
+                                w.inst(OP_BITWISE_XOR, &[t_u32, sr, row, const_u32[&16]]);
+                                sr
+                            } else {
+                                row
+                            };
+                            let in_row = w.id();
+                            w.inst(OP_BITWISE_AND, &[t_u32, in_row, lid, const_u32[&7]]);
+                            let shift = w.id();
+                            w.inst(
+                                OP_SHIFT_LEFT_LOGICAL,
+                                &[t_u32, shift, in_row, const_u32[&2]],
+                            );
+                            let sel = aux.map_or(c_zero, |a| val_map[&a]);
+                            let shifted = w.id();
+                            w.inst(OP_SHIFT_RIGHT_LOGICAL, &[t_u32, shifted, sel, shift]);
+                            let pick = w.id();
+                            w.inst(OP_BITWISE_AND, &[t_u32, pick, shifted, const_u32[&15]]);
+                            let src_lane = w.id();
+                            w.inst(OP_BITWISE_OR, &[t_u32, src_lane, src_row, pick]);
+                            w.inst(
+                                OP_GROUP_NON_UNIFORM_SHUFFLE,
+                                &[t_u32, res, c_scope_subgroup, v, src_lane],
+                            );
+                        }
+                        LanePermuteOp::DsPermute => {
+                            let lane_idx = aux.map_or(c_zero, |a| val_map[&a]);
+                            w.inst(
+                                OP_GROUP_NON_UNIFORM_SHUFFLE,
+                                &[t_u32, res, c_scope_subgroup, v, lane_idx],
                             );
                         }
                     }

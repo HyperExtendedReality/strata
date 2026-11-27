@@ -17,6 +17,33 @@ const SHADERS: &[(&str, &str, &str, &str)] = &[
     ),
     ("tex_convert.slang", "tex_convert.spv", "main", "compute"),
     ("mip_gen.slang", "mip_gen.spv", "main", "compute"),
+    ("msaa_resolve.slang", "msaa_resolve.spv", "main", "compute"),
+    (
+        "chunk_dirty_hash.slang",
+        "chunk_dirty_hash.spv",
+        "main",
+        "compute",
+    ),
+    (
+        "scatter_upload.slang",
+        "scatter_upload.spv",
+        "main",
+        "compute",
+    ),
+    ("rect_expand.slang", "rect_expand.spv", "main", "compute"),
+    (
+        "ambient_clamp.slang",
+        "ambient_clamp.spv",
+        "main",
+        "compute",
+    ),
+    ("overlay_hud.slang", "overlay_hud.spv", "main", "compute"),
+    (
+        "bcpack_decode.slang",
+        "bcpack_decode.spv",
+        "main",
+        "compute",
+    ),
     ("compose_vs.slang", "compose_vs.spv", "main", "vertex"),
     ("compose_fs.slang", "compose_fs.spv", "main", "fragment"),
     (

@@ -118,12 +118,67 @@ fn install_hook() -> Result<(), String> {
     Ok(())
 }
 
+fn extract_strata_switches(text: &str) -> std::collections::BTreeSet<String> {
+    let mut found = std::collections::BTreeSet::new();
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i + 7 <= bytes.len() {
+        if &bytes[i..i + 7] == b"STRATA_" {
+            let mut end = i + 7;
+            while end < bytes.len()
+                && (bytes[end].is_ascii_uppercase()
+                    || bytes[end].is_ascii_digit()
+                    || bytes[end] == b'_')
+            {
+                end += 1;
+            }
+            if end > i + 7 {
+                found.insert(text[i..end].to_string());
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    found
+}
+
+fn switches_check() -> Result<usize, String> {
+    let files = git_files(&["ls-files", "-z", "--cached"])?;
+    let mut documented = std::collections::BTreeSet::new();
+    let mut code_refs = std::collections::BTreeSet::new();
+    for f in &files {
+        let Ok(content) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        if f.ends_with(".md") {
+            documented.extend(extract_strata_switches(&content));
+        } else if f.ends_with(".rs") {
+            code_refs.extend(extract_strata_switches(&content));
+        }
+    }
+    let mut dead = 0usize;
+    for sw in &documented {
+        if !code_refs.contains(sw) {
+            eprintln!("switches: documented switch `{sw}` is not referenced in Rust code");
+            dead += 1;
+        }
+    }
+    println!(
+        "switches: {} documented, {} referenced in Rust, {dead} dead",
+        documented.len(),
+        code_refs.len()
+    );
+    Ok(dead)
+}
+
 fn main() -> ExitCode {
     let result = match std::env::args().nth(1).as_deref() {
         Some("asset-check") => asset_check().map(|bad| bad == 0),
         Some("install-hook") => install_hook().map(|()| true),
+        Some("switches") => switches_check().map(|dead| dead == 0),
         _ => {
-            eprintln!("usage: cargo xtask <asset-check|install-hook>");
+            eprintln!("usage: cargo xtask <asset-check|install-hook|switches>");
             return ExitCode::from(2);
         }
     };

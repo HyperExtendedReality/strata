@@ -9,8 +9,12 @@
 //! host backend (`STRATA_UPSCALE=auto|fsr|dlss|bilinear`) with a clean
 //! bilinear fallback when proprietary host SDK DLLs are not present.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 const FFX_API_RETURN_OK: u32 = 0;
 const FFX_API_RETURN_ERROR_PARAMETER: u32 = 1;
@@ -18,10 +22,24 @@ const FFX_API_RETURN_ERROR_PARAMETER: u32 = 1;
 static NEXT_CTX_ID: AtomicU64 = AtomicU64::new(0xFF00_0001);
 static DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug, Clone, Copy)]
+struct UpscalerContext {
+    backend: UpscalerBackend,
+    dispatches: u64,
+    frame_gen_enabled: bool,
+}
+
+static CONTEXTS: OnceLock<Mutex<HashMap<u64, UpscalerContext>>> = OnceLock::new();
+
+fn contexts() -> &'static Mutex<HashMap<u64, UpscalerContext>> {
+    CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpscalerBackend {
     Auto,
     FidelityFxVk,
+    IntelXeSS,
     NvidiaDlss,
     BilinearFallback,
 }
@@ -34,14 +52,15 @@ impl UpscalerBackend {
             .as_str()
         {
             "fsr" | "ffx" | "fidelityfx" => Self::FidelityFxVk,
+            "xess" | "intel" => Self::IntelXeSS,
             "dlss" | "nvidia" => Self::NvidiaDlss,
             "bilinear" | "stretch" => Self::BilinearFallback,
             _ => Self::Auto,
         }
     }
 
-    /// Resolves `Auto` to the best available host upscaler DLL (if installed
-    /// beside Strata or in the system loader path), else `BilinearFallback`.
+    /// Resolves `Auto` to the best available vendor-agnostic Vulkan upscaler DLL
+    /// (FSR 3.1/4 VK -> Intel XeSS VK -> NVIDIA NGX VK DLSS -> Slang/Bilinear fallback).
     pub fn resolve(self) -> Self {
         if self != Self::Auto {
             return self;
@@ -50,6 +69,11 @@ impl UpscalerBackend {
         {
             if crate::loader::host_export("amd_fidelityfx_vk.dll", "ffxCreateContext") != 0 {
                 return Self::FidelityFxVk;
+            }
+            if crate::loader::host_export("libxess_vk.dll", "xessVKCreateContext") != 0
+                || crate::loader::host_export("libxess.dll", "xessGetVersion") != 0
+            {
+                return Self::IntelXeSS;
             }
             if crate::loader::host_export("sl.interposer.dll", "slInit") != 0
                 || crate::loader::host_export("nvngx_dlss.dll", "NVSDK_NGX_VULKAN_Init") != 0
@@ -121,6 +145,18 @@ pub unsafe extern "system" fn ffx_create_context(
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
     let id = NEXT_CTX_ID.fetch_add(1, Ordering::Relaxed);
+    let backend = UpscalerBackend::from_env().resolve();
+    let frame_gen_enabled = std::env::var("STRATA_FRAME_GEN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    contexts().lock().unwrap().insert(
+        id,
+        UpscalerContext {
+            backend,
+            dispatches: 0,
+            frame_gen_enabled,
+        },
+    );
     unsafe { *ctx_out = id as *mut c_void };
     FFX_API_RETURN_OK
 }
@@ -130,6 +166,8 @@ pub unsafe extern "system" fn ffx_destroy_context(
     _mem_cb: *const c_void,
 ) -> u32 {
     if !ctx.is_null() {
+        let id = unsafe { *ctx } as u64;
+        contexts().lock().unwrap().remove(&id);
         unsafe { *ctx = std::ptr::null_mut() };
     }
     FFX_API_RETURN_OK
@@ -143,8 +181,15 @@ pub unsafe extern "system" fn ffx_query(_ctx: *mut *mut c_void, _desc: *mut c_vo
     FFX_API_RETURN_OK
 }
 
-pub unsafe extern "system" fn ffx_dispatch(_ctx: *mut *mut c_void, _desc: *const c_void) -> u32 {
+pub unsafe extern "system" fn ffx_dispatch(ctx: *mut *mut c_void, _desc: *const c_void) -> u32 {
     DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+    if !ctx.is_null() {
+        let id = unsafe { *ctx } as u64;
+        if let Some(entry) = contexts().lock().unwrap().get_mut(&id) {
+            entry.dispatches += 1;
+            let _ = (entry.backend, entry.frame_gen_enabled);
+        }
+    }
     FFX_API_RETURN_OK
 }
 

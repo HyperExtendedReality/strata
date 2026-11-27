@@ -405,6 +405,8 @@ pub fn emit_domain_spirv(desc: &DomainShaderDesc) -> Vec<u32> {
     let t5 = alloc();
     let t6 = alloc();
     let t7 = alloc();
+    let t8 = alloc();
+    let t9 = alloc();
     let final_pos = alloc();
 
     let mut w = Vec::with_capacity(256);
@@ -542,20 +544,18 @@ pub fn emit_domain_spirv(desc: &DomainShaderDesc) -> Vec<u32> {
         }
         TessDomain::Quads => {
             // (1-u)*(1-v)*p0 + u*(1-v)*p1 + u*v*p2 + (1-u)*v*p3
+            // = mix(mix(p0, p1, u), mix(p3, p2, u), v)
             push_inst(&mut w, 131 /* OpFSub */, &[f32_ty, t0, c_one_f, u_val]);
             push_inst(&mut w, 131, &[f32_ty, t1, c_one_f, v_val]);
             push_inst(&mut w, 142, &[vec4_ty, t2, p_vals[0], t0]);
             push_inst(&mut w, 142, &[vec4_ty, t3, p_vals[1], u_val]);
-            push_inst(&mut w, 129, &[vec4_ty, t4, t2, t3]); // top
+            push_inst(&mut w, 129, &[vec4_ty, t4, t2, t3]); // top = mix(p0, p1, u)
             push_inst(&mut w, 142, &[vec4_ty, t5, p_vals[3], t0]);
             push_inst(&mut w, 142, &[vec4_ty, t6, p_vals[2], u_val]);
-            push_inst(&mut w, 129, &[vec4_ty, t7, t5, t6]); // bottom
-            let _ = (t0, t1); // used above
-            // Weighted blend top*(1-v) + bottom*v using fresh IDs? Reuse? No: SSA requires unique IDs.
-            // Let's emit simple (top*(1-v)) + (bottom*v) by allocating 2 more IDs before header?
-            // Instead: we already have unused p_ptrs/p_vals? No, use t4/t7 directly via FAdd(VectorTimesScalar).
-            // Wait: let's just keep it strictly SSA-valid: use the unused `w_val`? No, allocate properly!
-            push_inst(&mut w, 129, &[vec4_ty, final_pos, t4, t7]);
+            push_inst(&mut w, 129, &[vec4_ty, t7, t5, t6]); // bottom = mix(p3, p2, u)
+            push_inst(&mut w, 142, &[vec4_ty, t8, t4, t1]); // top * (1 - v)
+            push_inst(&mut w, 142, &[vec4_ty, t9, t7, v_val]); // bottom * v
+            push_inst(&mut w, 129, &[vec4_ty, final_pos, t8, t9]);
         }
         TessDomain::Isolines => {
             // (1-u)*p0 + u*p1

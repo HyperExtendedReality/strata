@@ -7,9 +7,34 @@
 //! `STRATA_NATIVE_RT=1`) without crashing on missing C++ mangled symbols.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+
+use strata_gpu::raytracing::{AS_SLAB_BYTES, AccelStructManager, RtStats};
 
 const S_OK: i32 = 0;
+
+static AS_MANAGER: OnceLock<Mutex<AccelStructManager>> = OnceLock::new();
+
+fn as_manager() -> &'static Mutex<AccelStructManager> {
+    AS_MANAGER.get_or_init(|| {
+        let mut mgr = AccelStructManager::new();
+        mgr.add_slab(0x1_0000_0000, AS_SLAB_BYTES);
+        Mutex::new(mgr)
+    })
+}
+
+/// Expose the live Vulkan `VK_KHR_acceleration_structure` manager telemetry.
+pub fn rt_stats() -> RtStats {
+    as_manager().lock().unwrap().stats()
+}
+
+/// Lookup a host acceleration-structure BDA from a console guest BVH VA.
+pub fn lookup_host_blas_bda(guest_va: u64) -> Option<u64> {
+    as_manager().lock().unwrap().lookup_host_bda(guest_va)
+}
 
 const SYM_CTOR: &str = "??0XboxBvhBuilder@@QEAA@PEAUID3D12Device11@@_N@Z";
 const SYM_DTOR: &str = "??1XboxBvhBuilder@@QEAA@XZ";
@@ -53,19 +78,43 @@ unsafe extern "system" fn bvh_build_batched_2x(
     _this: *mut c_void,
     _cmd_list: *const c_void,
     count: u32,
-    _descs: *const c_void,
+    descs: *const c_void,
 ) {
-    BUILD_CALLS.fetch_add(u64::from(count), Ordering::Relaxed);
+    let frame = BUILD_CALLS.fetch_add(u64::from(count), Ordering::Relaxed);
+    let mut mgr = as_manager().lock().unwrap();
+    for i in 0..count {
+        // First qword of each build desc is the destination guest acceleration-structure VA.
+        let guest_va = if !descs.is_null() {
+            unsafe { *(descs as *const u64).add(i as usize * 8) }
+        } else {
+            0x2000_0000u64.wrapping_add(frame.wrapping_add(u64::from(i)) * 4096)
+        };
+        if guest_va != 0 {
+            if mgr.register_blas(guest_va, 4096, 64, true, frame).is_none() {
+                let next_base = 0x1_0000_0000 + (mgr.stats().slab_count as u64) * AS_SLAB_BYTES;
+                mgr.add_slab(next_base, AS_SLAB_BYTES);
+                let _ = mgr.register_blas(guest_va, 4096, 64, true, frame);
+            }
+        }
+    }
 }
 
 unsafe extern "system" fn bvh_copy(
     _this: *mut c_void,
     _cmd_list: *const c_void,
-    _dst_va: u64,
-    _src_va: u64,
-    _mode: u32,
+    dst_va: u64,
+    src_va: u64,
+    mode: u32,
 ) {
-    COPY_CALLS.fetch_add(1, Ordering::Relaxed);
+    let frame = COPY_CALLS.fetch_add(1, Ordering::Relaxed);
+    let mut mgr = as_manager().lock().unwrap();
+    if mode == 1 && src_va != 0 {
+        // D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT
+        mgr.enqueue_compaction(src_va, 2048);
+        let _ = mgr.process_compactions(4);
+    } else if dst_va != 0 {
+        let _ = mgr.register_blas(dst_va, 4096, 64, false, frame);
+    }
 }
 
 unsafe extern "system" fn bvh_prebuild(

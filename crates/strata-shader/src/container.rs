@@ -106,6 +106,8 @@ pub enum ShaderStage {
 pub struct FssmProgram<'a> {
     pub stage: ShaderStage,
     pub code_dwords: &'a [u8],
+    /// Parsed compute threadgroup dimensions `[x, y, z]` when present in FSSM metadata.
+    pub workgroup_size: Option<[u32; 3]>,
 }
 
 /// Parse an unpacked `FSSM` (v0x101) console microcode block into its API stage
@@ -136,9 +138,24 @@ pub fn parse_fssm(bytes: &[u8]) -> Result<FssmProgram<'_>, ContainerError> {
         8 => ShaderStage::Library,
         other => ShaderStage::Unknown(other),
     };
+    // Optional compute workgroup dimensions stored as three non-zero u32s at +0x104..+0x110
+    // when the FSSM header carries inline compute dimensions.
+    let workgroup_size = if stage == ShaderStage::Compute && bytes.len() >= 0x110 {
+        let x = u32::from_le_bytes(bytes[0x104..0x108].try_into().unwrap());
+        let y = u32::from_le_bytes(bytes[0x108..0x10C].try_into().unwrap());
+        let z = u32::from_le_bytes(bytes[0x10C..0x110].try_into().unwrap());
+        if (1..=1024).contains(&x) && (1..=1024).contains(&y) && (1..=64).contains(&z) {
+            Some([x, y, z])
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     Ok(FssmProgram {
         stage,
         code_dwords: &bytes[code_start..code_start + code_size],
+        workgroup_size,
     })
 }
 

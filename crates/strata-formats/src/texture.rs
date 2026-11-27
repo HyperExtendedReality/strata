@@ -1286,10 +1286,46 @@ impl SurfaceLayout {
         let block_index = (u64::from(bz) * u64::from(blocks_y) + u64::from(by))
             * u64::from(blocks_x)
             + u64::from(bx);
-        let in_block = self.pattern[0].get(lx).copied().unwrap_or(0)
+        let mut in_block = self.pattern[0].get(lx).copied().unwrap_or(0)
             | self.pattern[1].get(ly).copied().unwrap_or(0)
             | self.pattern[2].get(lz).copied().unwrap_or(0);
+        if self.desc.swizzle.is_xor() && self.alignment >= 4096 {
+            // Apply RDNA2 pipe-bank XOR across macro-tile coordinates within the block.
+            let pipe_bank_xor = ((bx ^ by ^ bz) & 3) << 8;
+            if u64::from(in_block ^ pipe_bank_xor) < self.alignment {
+                in_block ^= pipe_bank_xor;
+            }
+        }
         Some(slice_base + m.offset + block_index * self.alignment + u64::from(in_block))
+    }
+
+    /// Coalesced byte-copy run mapping tiled source offsets to tightly packed linear offsets,
+    /// used by GPU detiling (`detile.slang`) and staging upload planners.
+    pub fn copy_table(&self, mip: u32, slice: u32) -> Result<Vec<(u64, u64, u32)>, LayoutError> {
+        let m = self.mips.get(mip as usize).ok_or(LayoutError::Invalid)?;
+        let bpp = u64::from(self.desc.element_bytes);
+        let mut runs: Vec<(u64, u64, u32)> = Vec::new();
+        for z in 0..m.depth {
+            for y in 0..m.height {
+                for x in 0..m.width {
+                    let src = self
+                        .element_offset(mip, slice, x, y, z)
+                        .ok_or(LayoutError::Invalid)?;
+                    let dst = u64::from((z * m.height + y) * m.width + x) * bpp;
+                    if let Some(last) = runs.last_mut() {
+                        if last.0 + u64::from(last.2) == src
+                            && last.1 + u64::from(last.2) == dst
+                            && last.2.checked_add(bpp as u32).is_some()
+                        {
+                            last.2 += bpp as u32;
+                            continue;
+                        }
+                    }
+                    runs.push((src, dst, bpp as u32));
+                }
+            }
+        }
+        Ok(runs)
     }
 
     /// Detile a single `(mip, slice)` from tiled surface bytes into tightly packed rows.

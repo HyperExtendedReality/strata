@@ -404,7 +404,7 @@ fn decode_lanes(
     Ok(())
 }
 
-/// Decode a BCPack stream (`bc` in `{1, 3, 4, 5, 6, 7}`) into `dst`.
+/// Decode a BCPack stream (`bc` in `{1, 2, 3, 4, 5, 6, 7}`) into `dst`.
 pub fn decode(
     bc: u8,
     src: &[u8],
@@ -413,7 +413,7 @@ pub fn decode(
 ) -> Result<(), BcPackError> {
     let block_bytes = match bc {
         1 | 4 => 8,
-        3 | 5 | 6 | 7 => 16,
+        2 | 3 | 5 | 6 | 7 => 16,
         other => return Err(BcPackError::UnsupportedFormat(other)),
     };
     if dst.is_empty() || !dst.len().is_multiple_of(block_bytes) {
@@ -422,7 +422,7 @@ pub fn decode(
     let blocks = dst.len() / block_bytes;
     let (widths, per): (&[u8], usize) = match bc {
         1 => (&[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1),
-        3 => (&[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
+        2 | 3 => (&[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
         4 => (&[7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 1),
         5 => (&[3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 2),
         6 => (&[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
@@ -520,6 +520,28 @@ pub fn decode(
                     cur.ix[6 + i] = out[12 + i];
                 }
             }
+            2 => {
+                // BC2: 8 bytes explicit 4-bit alpha followed by 8 bytes BC1 color block.
+                for i in 0..8 {
+                    out[i] = rec[2 + i] ^ cur.ix[i % 10];
+                    cur.ix[i % 10] = out[i];
+                }
+                for i in 0..6 {
+                    cur.ep[i] = cur.ep[i].wrapping_add(rec[10 + i]);
+                }
+                let c0 = u16::from(cur.ep[0] & 31)
+                    | (u16::from(cur.ep[1] & 63) << 5)
+                    | (u16::from(cur.ep[2] & 31) << 11);
+                let c1 = u16::from(cur.ep[3] & 31)
+                    | (u16::from(cur.ep[4] & 63) << 5)
+                    | (u16::from(cur.ep[5] & 31) << 11);
+                out[8..10].copy_from_slice(&c0.to_le_bytes());
+                out[10..12].copy_from_slice(&c1.to_le_bytes());
+                for i in 0..4 {
+                    out[12 + i] = tables.rank3c[rec[16 + i] as usize] ^ cur.ix[6 + i];
+                    cur.ix[6 + i] = out[12 + i];
+                }
+            }
             5 => {
                 for i in 0..4 {
                     cur.ep[i] = cur.ep[i].wrapping_add(rec[2 + i]);
@@ -569,8 +591,13 @@ mod tests {
         let tables = BcPackTables::uniform_default();
         let mut dst = [0u8; 8];
         assert_eq!(
-            decode(2, &[], &mut dst, &tables),
-            Err(BcPackError::UnsupportedFormat(2))
+            decode(99, &[], &mut dst, &tables),
+            Err(BcPackError::UnsupportedFormat(99))
+        );
+        let mut dst16 = [0u8; 16];
+        assert_eq!(
+            decode(2, &[0u8; 4], &mut dst16, &tables),
+            Err(BcPackError::TruncatedStream)
         );
         let mut bad_dst = [0u8; 7];
         assert_eq!(

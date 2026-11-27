@@ -441,11 +441,14 @@ mod tests {
             d(0x80AA),
             Ok(rdna2::Inst::VQuadBroadcast { lane: 2, .. })
         ));
-        assert!(
-            d(0x80E4).is_err(),
-            "identity / mixed selects are not a swap"
-        );
-        assert!(d(0x0041).is_err(), "bit-mask mode");
+        assert!(matches!(
+            d(0x80E4),
+            Ok(rdna2::Inst::DsSwizzleB32 { offset: 0x80E4, .. })
+        ));
+        assert!(matches!(
+            d(0x0041),
+            Ok(rdna2::Inst::DsSwizzleB32 { offset: 0x0041, .. })
+        ));
     }
 
     #[test]
