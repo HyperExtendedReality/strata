@@ -1,6 +1,6 @@
 //! Real GameInput HLE (`IGameInput`, `IGameInputDevice`, `IGameInputReading`)
-//! with Win32 keyboard/mouse polling, gamepad state, reading history, and
-//! device enumeration.
+//! with physical controllers (XInput), keyboard and mouse polling, rumble,
+//! reading history, and device enumeration.
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -70,6 +70,40 @@ pub struct InputDeviceInfo {
 #[cfg(windows)]
 unsafe extern "system" {
     fn GetAsyncKeyState(vkey: i32) -> i16;
+    fn GetCursorPos(point: *mut i32) -> i32;
+}
+
+/// XInput buttons → `GameInputGamepadButtons`.
+pub fn gamepad_from_xinput(x: &crate::input::GamepadState) -> GamepadState {
+    use crate::input as xi;
+    let map = [
+        (xi::BTN_MENU, BTN_MENU),
+        (xi::BTN_VIEW, BTN_VIEW),
+        (xi::BTN_A, BTN_A),
+        (xi::BTN_B, BTN_B),
+        (xi::BTN_X, BTN_X),
+        (xi::BTN_Y, BTN_Y),
+        (xi::BTN_DPAD_UP, BTN_DPAD_UP),
+        (xi::BTN_DPAD_DOWN, BTN_DPAD_DOWN),
+        (xi::BTN_DPAD_LEFT, BTN_DPAD_LEFT),
+        (xi::BTN_DPAD_RIGHT, BTN_DPAD_RIGHT),
+        (xi::BTN_LEFT_SHOULDER, BTN_LEFT_SHOULDER),
+        (xi::BTN_RIGHT_SHOULDER, BTN_RIGHT_SHOULDER),
+        (xi::BTN_LEFT_THUMB, BTN_LEFT_THUMB),
+        (xi::BTN_RIGHT_THUMB, BTN_RIGHT_THUMB),
+    ];
+    GamepadState {
+        buttons: map
+            .iter()
+            .filter(|(from, _)| x.buttons & from != 0)
+            .fold(0, |acc, (_, to)| acc | to),
+        left_trigger: x.left_trigger,
+        right_trigger: x.right_trigger,
+        left_thumbstick_x: x.left_stick_x,
+        left_thumbstick_y: x.left_stick_y,
+        right_thumbstick_x: x.right_stick_x,
+        right_thumbstick_y: x.right_stick_y,
+    }
 }
 
 /// Real GameInput subsystem managing virtual/host input devices and reading ring buffers.
@@ -126,57 +160,104 @@ impl GameInputManager {
         &self.devices
     }
 
-    /// Poll host Win32 keyboard keys into the virtual gamepad & keyboard state.
+    /// Poll the host: the first connected XInput controller (a physical
+    /// gamepad), else the keyboard mapped onto a virtual one; the whole
+    /// keyboard; and the mouse.
     pub fn poll_host(&mut self) {
         let mut gp = GamepadState::default();
         let mut keys = Vec::new();
+        let pad = crate::input::first_controller();
+        if let Some((_, s)) = pad {
+            gp = gamepad_from_xinput(&s.to_gamepad());
+        }
         #[cfg(windows)]
         {
             let pressed =
                 |vk: i32| -> bool { unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 } };
-            if pressed(0x57) {
-                gp.left_thumbstick_y += 1.0;
-                keys.push(0x57);
-            } // W
-            if pressed(0x53) {
-                gp.left_thumbstick_y -= 1.0;
-                keys.push(0x53);
-            } // S
-            if pressed(0x41) {
-                gp.left_thumbstick_x -= 1.0;
-                keys.push(0x41);
-            } // A
-            if pressed(0x44) {
-                gp.left_thumbstick_x += 1.0;
-                keys.push(0x44);
-            } // D
-            if pressed(0x20) {
-                gp.buttons |= BTN_A;
-                keys.push(0x20);
-            } // Space -> A
-            if pressed(0x1B) {
-                gp.buttons |= BTN_MENU;
-                keys.push(0x1B);
-            } // Esc -> Menu
-            if pressed(0x0D) {
-                gp.buttons |= BTN_A;
-                keys.push(0x0D);
-            } // Enter -> A
-            if pressed(0x45) {
-                gp.buttons |= BTN_X;
-                keys.push(0x45);
-            } // E -> X
-            if pressed(0x51) {
-                gp.buttons |= BTN_Y;
-                keys.push(0x51);
-            } // Q -> Y
-            if pressed(0x10) {
-                gp.right_trigger = 1.0;
-                keys.push(0x10);
-            } // Shift -> RT
+            for vk in 0x08..0xFF {
+                if pressed(vk) {
+                    keys.push(vk as u8);
+                }
+            }
+            if pad.is_none() {
+                // No controller: WASD / Space / Enter / Esc / E / Q / Shift.
+                let k = |vk: u8| keys.contains(&vk);
+                if k(0x57) {
+                    gp.left_thumbstick_y += 1.0;
+                }
+                if k(0x53) {
+                    gp.left_thumbstick_y -= 1.0;
+                }
+                if k(0x41) {
+                    gp.left_thumbstick_x -= 1.0;
+                }
+                if k(0x44) {
+                    gp.left_thumbstick_x += 1.0;
+                }
+                if k(0x20) || k(0x0D) {
+                    gp.buttons |= BTN_A;
+                }
+                if k(0x1B) {
+                    gp.buttons |= BTN_MENU;
+                }
+                if k(0x45) {
+                    gp.buttons |= BTN_X;
+                }
+                if k(0x51) {
+                    gp.buttons |= BTN_Y;
+                }
+                if k(0x10) {
+                    gp.right_trigger = 1.0;
+                }
+            }
+            let mut p = [0i32; 2];
+            if unsafe { GetCursorPos(p.as_mut_ptr()) } != 0 {
+                let mut buttons = 0;
+                for (bit, vk) in [(1, 0x01), (2, 0x02), (4, 0x04), (8, 0x05), (16, 0x06)] {
+                    if pressed(vk) {
+                        buttons |= bit;
+                    }
+                }
+                self.current_mouse = MouseState {
+                    buttons,
+                    position_x: i64::from(p[0]),
+                    position_y: i64::from(p[1]),
+                    ..self.current_mouse
+                };
+            }
         }
-        self.push_gamepad(gp);
+        self.devices[0].connected = true;
+        self.devices[0].name = match pad {
+            Some((u, _)) => format!("XInput Controller {u}"),
+            None => "Strata Virtual Controller 0 (keyboard)".into(),
+        };
         self.current_keys = keys;
+        if gp != self.current_gamepad || self.history.is_empty() {
+            self.push_gamepad(gp);
+        }
+        self.record(GAME_INPUT_KIND_KEYBOARD | GAME_INPUT_KIND_MOUSE, 2);
+    }
+
+    /// `IGameInputDevice::SetRumbleState`: forwarded to the controller.
+    pub fn set_rumble(&self, low: f32, high: f32, left_trigger: f32, right_trigger: f32) {
+        // XInput has two motors; trigger impulse motors fold into them.
+        let user = crate::input::first_controller().map_or(0, |(u, _)| u);
+        crate::input::set_rumble(user, low.max(left_trigger), high.max(right_trigger));
+    }
+
+    pub fn get_previous_reading(&self, before_id: u64, kind_mask: u32) -> Option<&InputReading> {
+        self.history
+            .iter()
+            .rev()
+            .find(|r| r.id < before_id && (r.kind & kind_mask) != 0)
+    }
+
+    /// The reading nearest `timestamp_us` (at or before it).
+    pub fn get_temporal_reading(&self, timestamp_us: u64) -> Option<&InputReading> {
+        self.history
+            .iter()
+            .rev()
+            .find(|r| r.timestamp_us <= timestamp_us)
     }
 
     /// Inject a gamepad state snapshot (used by host adapters or tests).
@@ -246,5 +327,24 @@ mod tests {
 
         let next = gi.get_next_reading(id1, GAME_INPUT_KIND_GAMEPAD).unwrap();
         assert_eq!(next.id, id2);
+        let prev = gi
+            .get_previous_reading(id2, GAME_INPUT_KIND_GAMEPAD)
+            .unwrap();
+        assert_eq!(prev.id, id1);
+    }
+
+    #[test]
+    fn xinput_buttons_map_to_gameinput_bits() {
+        use crate::input as xi;
+        let g = gamepad_from_xinput(&xi::GamepadState {
+            buttons: xi::BTN_A | xi::BTN_MENU | xi::BTN_DPAD_LEFT | xi::BTN_RIGHT_THUMB,
+            left_trigger: 0.5,
+            ..Default::default()
+        });
+        assert_eq!(
+            g.buttons,
+            BTN_A | BTN_MENU | BTN_DPAD_LEFT | BTN_RIGHT_THUMB
+        );
+        assert_eq!(g.left_trigger, 0.5);
     }
 }

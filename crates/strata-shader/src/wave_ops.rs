@@ -3,7 +3,7 @@
 //! and Waterfall Loop synthesis for non-uniform descriptor / SGPR indexing.
 
 /// Cross-lane wave64 permute operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LanePermuteOp {
     ReadFirstLane,
     ReadLane { lane: u32 },

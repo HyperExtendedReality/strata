@@ -7,18 +7,21 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use strata_gpu::graphics::DrawArgs;
+use strata_gpu::async_submit::{TextureAheadQueue, ThinTranslationPool};
+use strata_gpu::graphics::{DrawArgs, GraphicsPsoState};
 use strata_gpu::images::ImageBindings;
+use strata_gpu::indirect_upload::{PipelineLibrary, UploadQueue};
 use strata_gpu::present::FramePacingClock;
 use strata_gpu::runner::ComputeRunner;
+use strata_gpu::texstore::TextureStore;
 use strata_gpu::texture::TextureCache;
 use strata_gpu::thin_list::{PipelineKey, RenderTargetDesc, ThinCommand, ThinCommandList};
+use strata_gpu::timeline::{SpanTrack, TimelineProfiler};
 use strata_gpu::uma::UmaManager;
 use strata_runtime_shaders::CLAMP_INDIRECT_SPV;
 use strata_shader::descriptor::ImageDescriptor;
 use strata_shader::resource::{
-    DescriptorUse, ImageBinding, Origin, ResourceKind, image_bindings, image_bindings_from,
-    trace_descriptors,
+    DescriptorUse, ImageBinding, Origin, ResourceKind, planned_image_bindings, trace_descriptors,
 };
 use strata_shader::ssa::{BuildOptions, Stage};
 
@@ -368,7 +371,7 @@ unsafe extern "system" fn list_dispatch_indirect(this: *mut c_void, args_va: u64
 }
 
 /// Whether `len` bytes at `addr` are committed, readable memory.
-fn readable(addr: u64, len: usize) -> bool {
+pub(crate) fn readable(addr: u64, len: usize) -> bool {
     #[repr(C)]
     struct Mbi {
         base: usize,
@@ -404,7 +407,9 @@ fn readable(addr: u64, len: usize) -> bool {
     let info = unsafe { info.assume_init() };
     info.state == MEM_COMMIT
         && info.protect & NO_READ == 0
-        && addr as usize + len <= info.base + info.region_size
+        && (addr as usize)
+            .checked_add(len)
+            .is_some_and(|end| end <= info.base.saturating_add(info.region_size))
 }
 
 /// The three group counts of an indirect dispatch, from console memory.
@@ -518,7 +523,7 @@ unsafe extern "system" fn list_copy_buffer_region(
 }
 
 // ============================================================================
-// ID3D12CommandQueueX COM VTable
+// ID3D12CommandQueueX COM VTable + the execution engine
 // ============================================================================
 
 #[repr(C)]
@@ -531,6 +536,10 @@ pub struct CommandQueueVTable {
     pub present_x: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *const c_void) -> i32,
 }
 
+/// Graphics pipelines and textures, shared by every queue of a device.
+pub type PipelineTable = Arc<Mutex<HashMap<PipelineKey, PipelineEntry>>>;
+pub type SharedTextures = Arc<Mutex<TextureCache>>;
+
 #[repr(C)]
 pub struct D3D12CommandQueueX {
     pub header: ComHeader<CommandQueueVTable>,
@@ -541,17 +550,40 @@ pub struct D3D12CommandQueueX {
     pub frame_clock: Mutex<FramePacingClock>,
     /// Optional live Vulkan 1.3 BDA runner + compiled SPIR-V pipeline table.
     pub gpu_runner: Option<Arc<ComputeRunner>>,
-    pub pipelines: Mutex<HashMap<PipelineKey, PipelineEntry>>,
+    pub pipelines: PipelineTable,
     /// Vulkan images for the T#s / S#s translated shaders use.
-    pub textures: Mutex<TextureCache>,
+    pub textures: SharedTextures,
     /// Render targets by console address, described like textures.
     pub render_targets: Mutex<HashMap<u64, [u32; 8]>>,
     pub executed_draws: AtomicU32,
+    /// Draws and dispatches `SetPredication` skipped.
+    pub predicated_skips: AtomicU32,
     /// Console memory: mirrors are synced before each list and read back
     /// where a list asks for it.
     pub uma: Option<Arc<Mutex<UmaManager>>>,
     pub synced_bytes: std::sync::atomic::AtomicU64,
     pub readback_bytes: std::sync::atomic::AtomicU64,
+    /// GPU-visible scratch memory (spilled root arguments, vertex-buffer
+    /// tables): `(console VA, BDA, size)`. Draws are synchronous, so one
+    /// block is reused by every draw.
+    scratch: Mutex<Option<(u64, u64, u64)>>,
+    /// The origin of `WriteTimestamp` values (1 GHz, like
+    /// `GetTimestampFrequency` reports).
+    epoch: std::time::Instant,
+    /// Messages already logged once (unsupported paths).
+    logged: Mutex<std::collections::HashSet<&'static str>>,
+    /// Parallel thin-list flattener for multi-list `ExecuteCommandLists` batches.
+    pub translation_pool: ThinTranslationPool,
+    /// Ahead-of-time texture upload staging queue.
+    pub texture_ahead: TextureAheadQueue,
+    /// Dedicated copy/upload staging queue.
+    pub upload_queue: Mutex<UploadQueue>,
+    /// Persistent `ID3D12PipelineLibrary` store.
+    pub pipeline_library: Mutex<PipelineLibrary>,
+    /// Optional content-addressed on-disk texture store.
+    pub texture_store: Mutex<Option<TextureStore>>,
+    /// CPU/GPU timeline profiler (Chrome Trace JSON export).
+    pub timeline: Mutex<TimelineProfiler>,
 }
 
 static CMD_QUEUE_VTABLE: CommandQueueVTable = CommandQueueVTable {
@@ -568,25 +600,12 @@ impl D3D12CommandQueueX {
     }
 
     pub fn new_boxed_with_runner(gpu_runner: Option<Arc<ComputeRunner>>) -> *mut Self {
-        Box::into_raw(Box::new(Self {
-            header: ComHeader {
-                vtable: &CMD_QUEUE_VTABLE,
-                ref_count: AtomicU32::new(1),
-            },
-            submitted_lists: AtomicU32::new(0),
-            submitted_commands: AtomicU32::new(0),
-            hoisted_clamps: AtomicU32::new(0),
-            executed_gpu_dispatches: AtomicU32::new(0),
-            frame_clock: Mutex::new(FramePacingClock::new(60)),
+        Self::new_boxed_shared(
             gpu_runner,
-            pipelines: Mutex::new(HashMap::new()),
-            textures: Mutex::new(TextureCache::new()),
-            render_targets: Mutex::new(HashMap::new()),
-            executed_draws: AtomicU32::new(0),
-            uma: None,
-            synced_bytes: std::sync::atomic::AtomicU64::new(0),
-            readback_bytes: std::sync::atomic::AtomicU64::new(0),
-        }))
+            None,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(TextureCache::new())),
+        )
     }
 
     /// As [`Self::new_boxed_with_runner`], with console memory attached.
@@ -600,13 +619,123 @@ impl D3D12CommandQueueX {
         q
     }
 
+    /// An engine sharing a device's pipelines and textures (every queue of
+    /// a `ID3D12Device` sees the PSOs and images the others made).
+    pub fn new_boxed_shared(
+        gpu_runner: Option<Arc<ComputeRunner>>,
+        uma: Option<Arc<Mutex<UmaManager>>>,
+        pipelines: PipelineTable,
+        textures: SharedTextures,
+    ) -> *mut Self {
+        Box::into_raw(Box::new(Self {
+            header: ComHeader {
+                vtable: &CMD_QUEUE_VTABLE,
+                ref_count: AtomicU32::new(1),
+            },
+            submitted_lists: AtomicU32::new(0),
+            submitted_commands: AtomicU32::new(0),
+            hoisted_clamps: AtomicU32::new(0),
+            executed_gpu_dispatches: AtomicU32::new(0),
+            frame_clock: Mutex::new(FramePacingClock::new(60)),
+            gpu_runner,
+            pipelines,
+            textures,
+            render_targets: Mutex::new(HashMap::new()),
+            executed_draws: AtomicU32::new(0),
+            predicated_skips: AtomicU32::new(0),
+            uma,
+            synced_bytes: std::sync::atomic::AtomicU64::new(0),
+            readback_bytes: std::sync::atomic::AtomicU64::new(0),
+            scratch: Mutex::new(None),
+            epoch: std::time::Instant::now(),
+            logged: Mutex::new(std::collections::HashSet::new()),
+            translation_pool: ThinTranslationPool::new(
+                std::thread::available_parallelism()
+                    .map(|n| n.get().clamp(1, 8))
+                    .unwrap_or(4),
+            ),
+            texture_ahead: TextureAheadQueue::new(),
+            upload_queue: Mutex::new(UploadQueue::default()),
+            pipeline_library: Mutex::new(PipelineLibrary::default()),
+            texture_store: Mutex::new(None),
+            timeline: Mutex::new(TimelineProfiler::new()),
+        }))
+    }
+
+    /// Opens an on-disk content-addressed texture store for converted textures.
+    pub fn open_texture_store(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        let store = TextureStore::open(dir)?;
+        *self.texture_store.lock().unwrap() = Some(store);
+        Ok(())
+    }
+
+    /// Exports all recorded queue spans as Chrome Trace JSON (`chrome://tracing`).
+    pub fn timeline_chrome_trace(&self) -> String {
+        self.timeline.lock().unwrap().to_chrome_trace_json()
+    }
+
+    /// Executes a batch of closed command lists, translating multi-list batches
+    /// in parallel via [`ThinTranslationPool`] and draining queued uploads first.
+    pub fn execute_command_lists(&self, lists: Vec<ThinCommandList>) {
+        if lists.is_empty() {
+            return;
+        }
+        // Drain any queued host-to-UMA uploads before running commands.
+        {
+            let mem = TitleMemory {
+                uma: self.uma.as_deref(),
+            };
+            let t0 = self.timeline.lock().unwrap().now_us();
+            let mut uq = self.upload_queue.lock().unwrap();
+            let prev_bytes = uq.total_bytes_uploaded;
+            uq.flush(|dst_va, data| {
+                let _ = mem.write(dst_va, data);
+            });
+            if uq.total_bytes_uploaded > prev_bytes {
+                let mut tl = self.timeline.lock().unwrap();
+                let dur = tl.now_us().saturating_sub(t0);
+                tl.record_span("UploadQueue::flush", SpanTrack::UploadCopy, t0, dur);
+            }
+            let _ready_tex = self.texture_ahead.drain_ready(64);
+        }
+        if lists.len() == 1 {
+            self.execute_thin(&lists[0]);
+            return;
+        }
+        let t0 = self.timeline.lock().unwrap().now_us();
+        let batches = self.translation_pool.translate_parallel(lists);
+        {
+            let mut tl = self.timeline.lock().unwrap();
+            let dur = tl.now_us().saturating_sub(t0);
+            tl.record_span(
+                format!("ThinTranslationPool({})", batches.len()),
+                SpanTrack::Cpu,
+                t0,
+                dur,
+            );
+        }
+        for batch in batches {
+            let mut flattened = ThinCommandList::new();
+            for op in batch.ops {
+                flattened.push(op);
+            }
+            self.execute_thin(&flattened);
+        }
+    }
+
     pub fn register_pipeline(&self, key: PipelineKey, spirv_words: Vec<u32>) {
         self.pipelines.lock().unwrap().insert(
             key,
             PipelineEntry {
                 spirv: spirv_words,
                 vertex: None,
+                hull: None,
+                domain: None,
+                geometry: None,
+                task: None,
+                mesh: None,
                 images: Vec::new(),
+                gfx: None,
             },
         );
     }
@@ -620,54 +749,9 @@ impl D3D12CommandQueueX {
         vs_words: &[u32],
         ps_words: &[u32],
     ) -> Result<(), strata_shader::CompileError> {
-        let vs_opts = BuildOptions {
-            stage: Stage::Vertex,
-            ..Default::default()
-        };
-        let vs = strata_shader::compile_rdna2_with(vs_words, [1, 1, 1], &vs_opts)?;
-        let vs_uses = trace_descriptors(&strata_shader::rdna2::decode_program(vs_words)?);
-        let vs_bind = image_bindings(&vs_uses);
-        let next = |pick: fn(&ImageBinding) -> Option<u32>| {
-            vs_bind
-                .iter()
-                .flatten()
-                .filter_map(pick)
-                .map(|s| s + 1)
-                .max()
-                .unwrap_or(0)
-        };
-        let tex_base = next(|b| match b {
-            ImageBinding::Sampled(s) | ImageBinding::Fetched(s) => Some(*s),
-            ImageBinding::Storage(_) => None,
-        });
-        let stor_base = next(|b| match b {
-            ImageBinding::Storage(s) => Some(*s),
-            _ => None,
-        });
-        let ps_opts = BuildOptions {
-            stage: Stage::Pixel,
-            texture_slot_base: tex_base,
-            storage_slot_base: stor_base,
-            require_full_quads: self.gpu_runner.as_ref().is_some_and(|r| r.quad_control),
-            ps_input_vgprs: None,
-        };
-        let ps = strata_shader::compile_rdna2_with(ps_words, [1, 1, 1], &ps_opts)?;
-        let ps_uses = trace_descriptors(&strata_shader::rdna2::decode_program(ps_words)?);
-        let ps_bind = image_bindings_from(&ps_uses, tex_base, stor_base);
-        let images = vs_bind
-            .into_iter()
-            .zip(vs_uses)
-            .chain(ps_bind.into_iter().zip(ps_uses))
-            .filter_map(|(b, u)| b.map(|b| (u, b)))
-            .collect();
-        self.pipelines.lock().unwrap().insert(
-            key,
-            PipelineEntry {
-                spirv: ps.spirv,
-                vertex: Some(vs.spirv),
-                images,
-            },
-        );
+        let quad = self.gpu_runner.as_ref().is_some_and(|r| r.quad_control);
+        let entry = translate_graphics(vs_words, ps_words, quad, None)?;
+        self.pipelines.lock().unwrap().insert(key, entry);
         Ok(())
     }
 
@@ -689,24 +773,225 @@ impl D3D12CommandQueueX {
         rdna2_words: &[u32],
         workgroup_size: [u32; 3],
     ) -> Result<(), strata_shader::CompileError> {
-        let compiled = strata_shader::compile_rdna2_to_spirv(rdna2_words, workgroup_size)?;
-        let decoded = strata_shader::rdna2::decode_program(rdna2_words)?;
-        let uses = trace_descriptors(&decoded);
-        let images = image_bindings(&uses)
-            .into_iter()
-            .zip(uses)
-            .filter_map(|(b, u)| b.map(|b| (u, b)))
-            .collect();
-        self.pipelines.lock().unwrap().insert(
-            key,
-            PipelineEntry {
-                spirv: compiled.spirv,
-                vertex: None,
-                images,
-            },
-        );
+        let entry = translate_compute(rdna2_words, workgroup_size)?;
+        self.pipelines.lock().unwrap().insert(key, entry);
         Ok(())
     }
+
+    /// The GPU clock `WriteTimestamp` writes (ns since the engine started).
+    pub fn timestamp_ns(&self) -> u64 {
+        self.epoch.elapsed().as_nanos() as u64
+    }
+
+    /// Logs `what` the first time only.
+    fn log_once(&self, what: &'static str) {
+        if self.logged.lock().unwrap().insert(what) {
+            crate::crash::log_line(what);
+        }
+    }
+}
+
+/// A compute pipeline from console RDNA2 code, with its image trace.
+pub fn translate_compute(
+    rdna2_words: &[u32],
+    workgroup_size: [u32; 3],
+) -> Result<PipelineEntry, strata_shader::CompileError> {
+    let compiled = strata_shader::compile_rdna2_to_spirv(rdna2_words, workgroup_size)?;
+    let decoded = strata_shader::rdna2::decode_program(rdna2_words)?;
+    let uses = trace_descriptors(&decoded);
+    let images = planned_image_bindings(&decoded, &uses, 0, 0)
+        .into_iter()
+        .zip(uses)
+        .filter_map(|(b, u)| b.map(|b| (u, b)))
+        .collect();
+    Ok(PipelineEntry {
+        spirv: compiled.spirv,
+        vertex: None,
+        hull: None,
+        domain: None,
+        geometry: None,
+        task: None,
+        mesh: None,
+        images,
+        gfx: None,
+    })
+}
+
+/// A graphics pipeline from a console vertex + pixel shader pair. The pixel
+/// shader's images take the set-0 slots after the vertex shader's.
+pub fn translate_graphics(
+    vs_words: &[u32],
+    ps_words: &[u32],
+    quad_control: bool,
+    state: Option<GraphicsPsoState>,
+) -> Result<PipelineEntry, strata_shader::CompileError> {
+    let vs_opts = BuildOptions {
+        stage: Stage::Vertex,
+        ..Default::default()
+    };
+    let vs = strata_shader::compile_rdna2_with(vs_words, [1, 1, 1], &vs_opts)?;
+    let vs_decoded = strata_shader::rdna2::decode_program(vs_words)?;
+    let vs_uses = trace_descriptors(&vs_decoded);
+    let vs_bind = planned_image_bindings(&vs_decoded, &vs_uses, 0, 0);
+    let next = |pick: fn(&ImageBinding) -> Option<u32>| {
+        vs_bind
+            .iter()
+            .flatten()
+            .filter_map(pick)
+            .map(|s| s + 1)
+            .max()
+            .unwrap_or(0)
+    };
+    let tex_base = next(|b| match b {
+        ImageBinding::Sampled(s) | ImageBinding::Fetched(s) => Some(*s),
+        ImageBinding::Storage(_) => None,
+    });
+    let stor_base = next(|b| match b {
+        ImageBinding::Storage(s) => Some(*s),
+        _ => None,
+    });
+    let ps_opts = BuildOptions {
+        stage: Stage::Pixel,
+        texture_slot_base: tex_base,
+        storage_slot_base: stor_base,
+        require_full_quads: quad_control,
+        ps_input_vgprs: None,
+    };
+    let ps = strata_shader::compile_rdna2_with(ps_words, [1, 1, 1], &ps_opts)?;
+    let ps_decoded = strata_shader::rdna2::decode_program(ps_words)?;
+    let ps_uses = trace_descriptors(&ps_decoded);
+    let ps_bind = planned_image_bindings(&ps_decoded, &ps_uses, tex_base, stor_base);
+    let images = vs_bind
+        .into_iter()
+        .zip(vs_uses)
+        .chain(ps_bind.into_iter().zip(ps_uses))
+        .filter_map(|(b, u)| b.map(|b| (u, b)))
+        .collect();
+    Ok(PipelineEntry {
+        spirv: ps.spirv,
+        vertex: Some(vs.spirv),
+        hull: None,
+        domain: None,
+        geometry: None,
+        task: None,
+        mesh: None,
+        images,
+        gfx: state,
+    })
+}
+
+/// Translates a graphics pipeline with optional Hull, Domain, and Geometry shaders.
+#[allow(clippy::too_many_arguments)]
+pub fn translate_graphics_full(
+    vs_words: &[u32],
+    ps_words: &[u32],
+    hs_words: Option<&[u32]>,
+    ds_words: Option<&[u32]>,
+    gs_words: Option<&[u32]>,
+    quad_control: bool,
+    state: Option<GraphicsPsoState>,
+) -> Result<PipelineEntry, strata_shader::CompileError> {
+    let mut entry = translate_graphics(vs_words, ps_words, quad_control, state)?;
+    if let (Some(h), Some(d)) = (hs_words, ds_words) {
+        let hs = strata_shader::tessellation::translate_hull_rdna2(
+            h,
+            &strata_shader::tessellation::HullShaderDesc::default(),
+        )?;
+        let ds = strata_shader::tessellation::translate_domain_rdna2(
+            d,
+            &strata_shader::tessellation::DomainShaderDesc::default(),
+        )?;
+        entry.hull = Some(hs);
+        entry.domain = Some(ds);
+        if let Some(ref mut g) = entry.gfx {
+            g.patch_control_points = 3;
+        }
+    }
+    if let Some(g) = gs_words {
+        let gs = strata_shader::geometry::translate_geometry_rdna2(
+            g,
+            &strata_shader::geometry::GeometryShaderDesc {
+                input: strata_shader::geometry::GsInputPrimitive::Triangles,
+                output: strata_shader::geometry::GsOutputPrimitive::TriangleStrip,
+                max_vertices: 64,
+                invocations: 1,
+            },
+        )?;
+        entry.geometry = Some(gs);
+    }
+    Ok(entry)
+}
+
+/// Translates an Amplification (optional) + Mesh + Pixel pipeline for `VK_EXT_mesh_shader`.
+pub fn translate_mesh(
+    as_words: Option<&[u32]>,
+    ms_words: &[u32],
+    ps_words: Option<&[u32]>,
+    quad_control: bool,
+    state: Option<GraphicsPsoState>,
+) -> Result<PipelineEntry, strata_shader::CompileError> {
+    let task = match as_words {
+        Some(w) => Some(strata_shader::geometry::translate_task_rdna2(
+            w,
+            &strata_shader::geometry::TaskShaderDesc::default(),
+        )?),
+        None => None,
+    };
+    let mesh = strata_shader::geometry::translate_mesh_rdna2(
+        ms_words,
+        &strata_shader::geometry::MeshShaderDesc {
+            workgroup_size: [32, 1, 1],
+            max_vertices: 64,
+            max_primitives: 64,
+            output_topology: strata_shader::geometry::GsOutputPrimitive::TriangleStrip,
+        },
+    )?;
+    let (ps_spirv, images) = if let Some(ps_w) = ps_words {
+        let ps_opts = BuildOptions {
+            stage: Stage::Pixel,
+            require_full_quads: quad_control,
+            ..Default::default()
+        };
+        let ps = strata_shader::compile_rdna2_with(ps_w, [1, 1, 1], &ps_opts)?;
+        let ps_decoded = strata_shader::rdna2::decode_program(ps_w)?;
+        let ps_uses = trace_descriptors(&ps_decoded);
+        let ps_bind = planned_image_bindings(&ps_decoded, &ps_uses, 0, 0);
+        let imgs = ps_bind
+            .into_iter()
+            .zip(ps_uses)
+            .filter_map(|(b, u)| b.map(|b| (u, b)))
+            .collect();
+        (ps.spirv, imgs)
+    } else {
+        // Depth-only mesh pass: minimal empty fragment shader.
+        let (_, frag) =
+            strata_shader::dxil::compile_dxil_to_spirv(&[], [1, 1, 1]).unwrap_or_else(|_| {
+                let mut w = vec![0x0723_0203, 0x0001_0600, 0, 5, 0];
+                w.extend_from_slice(&[(2 << 16) | 17, 1]);
+                w.extend_from_slice(&[(3 << 16) | 14, 0, 1]);
+                w.extend_from_slice(&[(5 << 16) | 15, 4, 1, u32::from_le_bytes(*b"main"), 0]);
+                w.extend_from_slice(&[(3 << 16) | 16, 1, 7]);
+                w.extend_from_slice(&[(2 << 16) | 19, 2]);
+                w.extend_from_slice(&[(3 << 16) | 33, 3, 2]);
+                w.extend_from_slice(&[(5 << 16) | 54, 2, 1, 0, 3]);
+                w.extend_from_slice(&[(2 << 16) | 248, 4]);
+                w.extend_from_slice(&[(1 << 16) | 253]);
+                w.extend_from_slice(&[(1 << 16) | 56]);
+                (strata_shader::dxil::DxilStage::Pixel, w)
+            });
+        (frag, Vec::new())
+    };
+    Ok(PipelineEntry {
+        spirv: ps_spirv,
+        vertex: None,
+        hull: None,
+        domain: None,
+        geometry: None,
+        task,
+        mesh: Some(mesh),
+        images,
+        gfx: state,
+    })
 }
 
 /// A registered pipeline: its SPIR-V and the images it binds.
@@ -715,12 +1000,25 @@ pub struct PipelineEntry {
     pub spirv: Vec<u32>,
     /// The vertex shader of a graphics pipeline.
     pub vertex: Option<Vec<u32>>,
+    /// Optional Hull (`TessellationControl`) shader.
+    pub hull: Option<Vec<u32>>,
+    /// Optional Domain (`TessellationEvaluation`) shader.
+    pub domain: Option<Vec<u32>>,
+    /// Optional Geometry shader.
+    pub geometry: Option<Vec<u32>>,
+    /// Optional Amplification (`TaskEXT`) shader.
+    pub task: Option<Vec<u32>>,
+    /// Optional Mesh (`MeshEXT`) shader.
+    pub mesh: Option<Vec<u32>>,
     /// Image instructions in program order and the slot each binds.
     pub images: Vec<(DescriptorUse, ImageBinding)>,
+    /// The PSO's fixed-function state (`None`: defaults).
+    pub gfx: Option<GraphicsPsoState>,
 }
 
-/// Reads and writes title memory by console address: through the UMA when an
-/// allocation covers it (a mirror's host copy), else directly when readable.
+/// Reads and writes title memory by console address or GPU address (BDA):
+/// through the UMA when an allocation covers it (a mirror's host copy),
+/// else directly when readable.
 struct TitleMemory<'a> {
     uma: Option<&'a Mutex<UmaManager>>,
 }
@@ -728,7 +1026,7 @@ struct TitleMemory<'a> {
 impl TitleMemory<'_> {
     fn host(&self, addr: u64) -> u64 {
         self.uma
-            .and_then(|u| u.lock().unwrap().host_ptr(addr))
+            .and_then(|u| u.lock().unwrap().host_ptr_any(addr))
             .map_or(addr, |p| p as u64)
     }
 
@@ -752,6 +1050,17 @@ impl TitleMemory<'_> {
         true
     }
 
+    /// Brings `len` bytes at `addr` that shaders may have written in a
+    /// VRAM mirror back to the memory the host reads.
+    fn sync_for_read(&self, runner: &ComputeRunner, addr: u64, len: u64) {
+        if let Some(u) = self.uma {
+            let u = u.lock().unwrap();
+            if let Some(va) = u.console_va_of(addr) {
+                let _ = u.readback(runner, va, len);
+            }
+        }
+    }
+
     fn dwords(&self, addr: u64, n: usize) -> Option<Vec<u32>> {
         let b = self.read(addr, n * 4)?;
         Some(
@@ -761,6 +1070,11 @@ impl TitleMemory<'_> {
                 .map(|c| u32::from_le_bytes(*c))
                 .collect(),
         )
+    }
+
+    fn u64_at(&self, addr: u64) -> Option<u64> {
+        let d = self.dwords(addr, 2)?;
+        Some(u64::from(d[0]) | (u64::from(d[1]) << 32))
     }
 
     /// The 64-bit address an SGPR pair holds, as the trace names it.
@@ -774,8 +1088,7 @@ impl TitleMemory<'_> {
                 let at = self
                     .pair_address(base, sgprs)?
                     .wrapping_add(*offset as i64 as u64);
-                let d = self.dwords(at, 2)?;
-                Some(u64::from(d[0]) | (u64::from(d[1]) << 32))
+                self.u64_at(at)
             }
             _ => None,
         }
@@ -826,7 +1139,7 @@ fn bind_images(
         match *binding {
             ImageBinding::Sampled(slot) | ImageBinding::Fetched(slot) => {
                 let view = textures
-                    .texture(runner, t, false, &read)
+                    .texture_dim(runner, t, false, u.dim, &read)
                     .map_err(|e| format!("pc {}: {e}", u.pc))?;
                 let sampler = match (&u.sampler, u.kind) {
                     (Some(o), ResourceKind::SampledImage) => {
@@ -835,19 +1148,19 @@ fn bind_images(
                             .ok_or_else(|| format!("pc {}: cannot read S# at {o}", u.pc))?;
                         Some(
                             textures
-                                .sampler(runner, sw.try_into().unwrap())
+                                .sampler_for(runner, sw.try_into().unwrap(), u.compare)
                                 .map_err(|e| e.to_string())?,
                         )
                     }
                     _ => None,
                 };
-                b.set_texture(slot, view, sampler);
+                b.set_texture_dim(slot, view, sampler, u.dim);
             }
             ImageBinding::Storage(slot) => {
                 let view = textures
-                    .texture(runner, t, true, &read)
+                    .texture_dim(runner, t, true, u.dim.for_storage(), &read)
                     .map_err(|e| format!("pc {}: {e}", u.pc))?;
-                b.set_storage(slot, view);
+                b.set_storage_dim(slot, view, u.dim);
                 writes.push(t);
             }
         }
@@ -855,7 +1168,131 @@ fn bind_images(
     Ok((b, writes))
 }
 
+/// The graphics state a draw applies over its PSO's (`IASetPrimitiveTopology`,
+/// `RSSet*`, `OMSet*`).
+#[derive(Debug, Clone, Default)]
+struct DrawState {
+    topology: Option<i32>,
+    viewport: Option<[f32; 6]>,
+    scissor: Option<[i32; 4]>,
+    stencil_ref: u32,
+    blend_factor: [f32; 4],
+    depth_bounds: Option<(f32, f32)>,
+    shading_rate: [u32; 2],
+    shading_rate_combiners: [u32; 2],
+    shading_rate_image: Option<u64>,
+    stream_output: Vec<Option<(u64, u64, u64)>>,
+    active_occlusion_query: Option<(u64, bool)>,
+    active_stats_query: Option<u64>,
+    query_acc: strata_gpu::graphics::DrawQueryResults,
+    index: Option<(u64, u32, bool)>,
+    vertex_buffers: Vec<Option<(u64, u32, u32)>>,
+    colors: Vec<[u32; 8]>,
+    depth: Option<[u32; 8]>,
+    /// Render targets named by registered address (the D3D12.X test path).
+    legacy_rts: Vec<RenderTargetDesc>,
+    root_dwords: u32,
+    root_spilled: bool,
+    vertex_table_sgpr: Option<u8>,
+    predicate: Option<(u64, bool)>,
+}
+
 impl D3D12CommandQueueX {
+    /// GPU-visible scratch memory of at least `len` bytes: `(console VA, BDA)`.
+    fn scratch(&self, runner: &ComputeRunner, len: u64) -> Option<(u64, u64)> {
+        let uma = self.uma.as_ref()?;
+        let mut s = self.scratch.lock().unwrap();
+        if let Some((va, bda, size)) = *s
+            && size >= len
+        {
+            return Some((va, bda));
+        }
+        let mut u = uma.lock().unwrap();
+        if let Some((va, _, _)) = s.take() {
+            u.free_allocation(runner, va);
+        }
+        let size = len.max(64 * 1024).next_power_of_two();
+        let a = u.xmem_alloc_identity(runner, 0, size).ok()?;
+        let r = (a.console_va, a.host_bda, a.size);
+        *s = Some(r);
+        Some((r.0, r.1))
+    }
+
+    /// The user SGPRs a draw or dispatch pushes: the root shadow, with the
+    /// vertex-buffer table and (when the root spills) the root's own
+    /// address filled in.
+    fn push_sgprs(
+        &self,
+        runner: &ComputeRunner,
+        mem: &TitleMemory<'_>,
+        shadow: &[u32; 256],
+        st: &DrawState,
+    ) -> [u32; 32] {
+        let mut shadow = *shadow;
+        let vb_bytes = st.vertex_buffers.len() * 16;
+        let root_bytes = if st.root_spilled {
+            st.root_dwords as usize * 4
+        } else {
+            0
+        };
+        let need = (vb_bytes + root_bytes) as u64;
+        let scratch = if need > 0 {
+            self.scratch(runner, need)
+        } else {
+            None
+        };
+        if let (Some((va, bda)), Some(sgpr)) = (scratch, st.vertex_table_sgpr)
+            && vb_bytes > 0
+        {
+            // One V# per slot: base, stride, records (bytes / stride).
+            let mut table = Vec::with_capacity(vb_bytes);
+            for v in &st.vertex_buffers {
+                let (base, size, stride) = v.unwrap_or((0, 0, 0));
+                let records = size.checked_div(stride).unwrap_or(size);
+                let vsharp = crate::d3d12_types::buffer_descriptor(base, stride, records, 0);
+                for w in vsharp {
+                    table.extend_from_slice(&w.to_le_bytes());
+                }
+            }
+            mem.write(va + root_bytes as u64, &table);
+            let at = bda + root_bytes as u64;
+            let s = sgpr as usize;
+            if s + 1 < shadow.len() {
+                shadow[s] = at as u32;
+                shadow[s + 1] = (at >> 32) as u32;
+            }
+        }
+        let mut push = [0u32; 32];
+        if st.root_spilled {
+            if let Some((va, bda)) = scratch {
+                let bytes: Vec<u8> = shadow[..st.root_dwords as usize]
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect();
+                mem.write(va, &bytes);
+                push[0] = bda as u32;
+                push[1] = (bda >> 32) as u32;
+            }
+        } else {
+            push.copy_from_slice(&shadow[..32]);
+        }
+        push
+    }
+
+    /// Whether `SetPredication` skips the next draw or dispatch.
+    fn predicated(&self, mem: &TitleMemory<'_>, runner: &ComputeRunner, st: &DrawState) -> bool {
+        let Some((va, skip_if_zero)) = st.predicate else {
+            return false;
+        };
+        mem.sync_for_read(runner, va, 8);
+        let v = mem.u64_at(va).unwrap_or(0);
+        let skip = (v == 0) == skip_if_zero;
+        if skip {
+            self.predicated_skips.fetch_add(1, Ordering::Relaxed);
+        }
+        skip
+    }
+
     /// Runs one recorded dispatch of `entry` with its images bound, then
     /// writes the storage images it used back to title memory.
     fn run_dispatch(
@@ -896,15 +1333,17 @@ impl D3D12CommandQueueX {
         true
     }
 
-    /// Runs one recorded draw of a graphics `entry` into the render targets
-    /// `rts` name, then writes them (and any storage images) back.
+    /// Runs one draw of a graphics `entry` into the bound targets (or the
+    /// registered ones `st.legacy_rts` names), then writes them (and any
+    /// storage images) back.
     fn run_draw(
         &self,
         runner: &ComputeRunner,
         entry: &PipelineEntry,
         sgprs: &[u32; 32],
         args: DrawArgs,
-        rts: &[RenderTargetDesc],
+        indexed: Option<i32>,
+        st: &mut DrawState,
     ) -> bool {
         let Some(vs) = &entry.vertex else {
             return false;
@@ -915,9 +1354,12 @@ impl D3D12CommandQueueX {
         };
         let read = |a: u64, n: usize| mem.read(a, n);
         let write = |a: u64, b: &[u8]| mem.write(a, b);
-        let rt_words: Vec<[u32; 8]> = {
+        let colors: Vec<[u32; 8]> = if !st.colors.is_empty() || st.depth.is_some() {
+            st.colors.clone()
+        } else {
             let known = self.render_targets.lock().unwrap();
-            match rts
+            match st
+                .legacy_rts
                 .iter()
                 .map(|r| known.get(&r.console_va).copied())
                 .collect::<Option<Vec<_>>>()
@@ -929,6 +1371,14 @@ impl D3D12CommandQueueX {
                 }
             }
         };
+        let depth_fmt = st.depth.map(|d| {
+            let raw = crate::d3d12_types::trailer(&d).map_or(0, |t| t.1);
+            if raw == 0 {
+                ash::vk::Format::D32_SFLOAT
+            } else {
+                ash::vk::Format::from_raw(raw)
+            }
+        });
         let mut textures = self.textures.lock().unwrap();
         let (bindings, writes) = match bind_images(entry, sgprs, &mut textures, runner, &mem) {
             Ok(x) => x,
@@ -937,25 +1387,1010 @@ impl D3D12CommandQueueX {
                 return false;
             }
         };
-        for w in &rt_words {
+        for w in &colors {
             if let Err(e) = textures.texture(runner, *w, false, &read) {
                 crate::crash::log_line(&format!("draw skipped: render target: {e}"));
                 return false;
             }
         }
+        if let (Some(d), Some(f)) = (st.depth, depth_fmt)
+            && let Err(e) = textures.depth_target(runner, d, f, &read)
+        {
+            crate::crash::log_line(&format!("draw skipped: depth target: {e}"));
+            return false;
+        }
+        let mut state = entry.gfx.clone().unwrap_or_default();
+        if let Some(t) = st.topology {
+            state.topology = ash::vk::PrimitiveTopology::from_raw(t);
+        }
+        state.viewport = st.viewport;
+        state.scissor = st.scissor.map(|[l, t, r, b]| ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: l.max(0),
+                y: t.max(0),
+            },
+            extent: ash::vk::Extent2D {
+                width: (r - l.max(0)).max(0) as u32,
+                height: (b - t.max(0)).max(0) as u32,
+            },
+        });
+        state.stencil_reference = st.stencil_ref;
+        state.blend_constants = st.blend_factor;
+        if let Some((min_d, max_d)) = st.depth_bounds {
+            state.depth_bounds_test_enable = true;
+            state.min_depth_bounds = min_d;
+            state.max_depth_bounds = max_d;
+        }
+        state.shading_rate = st.shading_rate;
+        state.shading_rate_combiners = st.shading_rate_combiners;
+        let index = match (indexed, st.index) {
+            (Some(base_vertex), Some((va, _, index32))) => {
+                let uma = self.uma.as_ref().map(|u| u.lock().unwrap());
+                match uma.as_ref().and_then(|u| u.buffer_at(va)) {
+                    Some((buffer, offset, _)) => Some(strata_gpu::graphics::IndexBufferBinding {
+                        buffer,
+                        offset,
+                        index_type: if index32 {
+                            ash::vk::IndexType::UINT32
+                        } else {
+                            ash::vk::IndexType::UINT16
+                        },
+                        vertex_offset: base_vertex,
+                    }),
+                    None => {
+                        crate::crash::log_line("indexed draw skipped: index buffer not in UMA");
+                        return false;
+                    }
+                }
+            }
+            (Some(_), None) => {
+                crate::crash::log_line("indexed draw skipped: no index buffer bound");
+                return false;
+            }
+            _ => None,
+        };
+        let want_query = st.active_occlusion_query.is_some() || st.active_stats_query.is_some();
+        if want_query {
+            st.query_acc.capture_occlusion = st.active_occlusion_query.is_some();
+            st.query_acc.capture_pipeline_stats = st.active_stats_query.is_some();
+        }
         let ok = {
             let targets: Vec<&strata_gpu::images::GpuImage> =
-                rt_words.iter().filter_map(|w| textures.image(w)).collect();
+                colors.iter().filter_map(|w| textures.image(w)).collect();
+            let depth = match (st.depth, depth_fmt) {
+                (Some(d), Some(f)) => textures.depth_image(&d, f),
+                _ => None,
+            };
             runner
-                .draw_spirv(vs, &entry.spirv, &push, args, &targets, &bindings)
+                .draw_stages_with_state(
+                    strata_gpu::graphics::GraphicsStages::Classic {
+                        vs,
+                        hs: entry.hull.as_deref(),
+                        ds: entry.domain.as_deref(),
+                        gs: entry.geometry.as_deref(),
+                        ps: &entry.spirv,
+                    },
+                    &push,
+                    Some(args),
+                    None,
+                    &targets,
+                    depth,
+                    index,
+                    &bindings,
+                    &state,
+                    want_query.then_some(&mut st.query_acc),
+                )
                 .is_ok()
         };
-        for t in rt_words.iter().chain(&writes) {
+        for t in colors.iter().chain(&writes) {
             if let Err(e) = textures.write_back(runner, *t, &write, &read) {
                 crate::crash::log_line(&format!("render target write-back: {e}"));
             }
         }
+        if let (Some(d), Some(f)) = (st.depth, depth_fmt)
+            && state.depth_write_enable
+            && let Err(e) = textures.write_back_depth(runner, d, f, &write, &read)
+        {
+            crate::crash::log_line(&format!("depth target write-back: {e}"));
+        }
         ok
+    }
+
+    /// Runs one mesh/amplification draw (`DispatchMesh`) via `VK_EXT_mesh_shader`.
+    fn run_mesh(
+        &self,
+        runner: &ComputeRunner,
+        entry: &PipelineEntry,
+        sgprs: &[u32; 32],
+        groups: [u32; 3],
+        st: &mut DrawState,
+    ) -> bool {
+        let Some(mesh) = &entry.mesh else {
+            return false;
+        };
+        if !runner.mesh_shader {
+            self.log_once("DispatchMesh: host GPU does not expose VK_EXT_mesh_shader");
+            return false;
+        }
+        let push: Vec<u8> = sgprs.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mem = TitleMemory {
+            uma: self.uma.as_deref(),
+        };
+        let read = |a: u64, n: usize| mem.read(a, n);
+        let write = |a: u64, b: &[u8]| mem.write(a, b);
+        let colors: Vec<[u32; 8]> = st.colors.clone();
+        let depth_fmt = st.depth.map(|d| {
+            let raw = crate::d3d12_types::trailer(&d).map_or(0, |t| t.1);
+            if raw == 0 {
+                ash::vk::Format::D32_SFLOAT
+            } else {
+                ash::vk::Format::from_raw(raw)
+            }
+        });
+        let mut textures = self.textures.lock().unwrap();
+        let (bindings, writes) = match bind_images(entry, sgprs, &mut textures, runner, &mem) {
+            Ok(x) => x,
+            Err(why) => {
+                crate::crash::log_line(&format!("mesh draw skipped: {why}"));
+                return false;
+            }
+        };
+        for w in &colors {
+            if let Err(e) = textures.texture(runner, *w, false, &read) {
+                crate::crash::log_line(&format!("mesh draw skipped: render target: {e}"));
+                return false;
+            }
+        }
+        if let (Some(d), Some(f)) = (st.depth, depth_fmt)
+            && let Err(e) = textures.depth_target(runner, d, f, &read)
+        {
+            crate::crash::log_line(&format!("mesh draw skipped: depth target: {e}"));
+            return false;
+        }
+        let mut state = entry.gfx.clone().unwrap_or_default();
+        state.viewport = st.viewport;
+        state.scissor = st.scissor.map(|[l, t, r, b]| ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: l.max(0),
+                y: t.max(0),
+            },
+            extent: ash::vk::Extent2D {
+                width: (r - l.max(0)).max(0) as u32,
+                height: (b - t.max(0)).max(0) as u32,
+            },
+        });
+        state.stencil_reference = st.stencil_ref;
+        state.blend_constants = st.blend_factor;
+        if let Some((min_d, max_d)) = st.depth_bounds {
+            state.depth_bounds_test_enable = true;
+            state.min_depth_bounds = min_d;
+            state.max_depth_bounds = max_d;
+        }
+        state.shading_rate = st.shading_rate;
+        state.shading_rate_combiners = st.shading_rate_combiners;
+        let want_query = st.active_occlusion_query.is_some() || st.active_stats_query.is_some();
+        if want_query {
+            st.query_acc.capture_occlusion = st.active_occlusion_query.is_some();
+            st.query_acc.capture_pipeline_stats = st.active_stats_query.is_some();
+        }
+        let ok = {
+            let targets: Vec<&strata_gpu::images::GpuImage> =
+                colors.iter().filter_map(|w| textures.image(w)).collect();
+            let depth = match (st.depth, depth_fmt) {
+                (Some(d), Some(f)) => textures.depth_image(&d, f),
+                _ => None,
+            };
+            runner
+                .draw_mesh_with_state(
+                    entry.task.as_deref(),
+                    mesh,
+                    &entry.spirv,
+                    &push,
+                    groups,
+                    &targets,
+                    depth,
+                    &bindings,
+                    &state,
+                    want_query.then_some(&mut st.query_acc),
+                )
+                .is_ok()
+        };
+        for t in colors.iter().chain(&writes) {
+            if let Err(e) = textures.write_back(runner, *t, &write, &read) {
+                crate::crash::log_line(&format!("mesh render target write-back: {e}"));
+            }
+        }
+        if let (Some(d), Some(f)) = (st.depth, depth_fmt)
+            && state.depth_write_enable
+            && let Err(e) = textures.write_back_depth(runner, d, f, &write, &read)
+        {
+            crate::crash::log_line(&format!("mesh depth target write-back: {e}"));
+        }
+        ok
+    }
+
+    /// Executes one closed command list's thin commands, in order.
+    pub fn execute_thin(&self, list: &ThinCommandList) {
+        crate::frame_capture::record(list);
+        self.submitted_lists.fetch_add(1, Ordering::Relaxed);
+        self.submitted_commands
+            .fetch_add(list.commands().len() as u32, Ordering::Relaxed);
+        self.hoisted_clamps
+            .fetch_add(list.hoisted_clamps.len() as u32, Ordering::Relaxed);
+        let Some(runner) = &self.gpu_runner else {
+            return;
+        };
+        // 0. The title's CPU writes since the last list reach the mirrors.
+        if let Some(uma) = &self.uma
+            && let Ok(stats) = uma.lock().unwrap().sync_mirrors(runner)
+        {
+            self.synced_bytes.fetch_add(stats.bytes, Ordering::Relaxed);
+        }
+
+        // 1. Batched pre-pass for all hoisted indirect draw clamps (single GPU dispatch)
+        if !list.hoisted_clamps.is_empty() {
+            let count = list.hoisted_clamps.len();
+            if let Ok(mut entries_buf) = runner.alloc_bda_buffer((count * 16) as u64) {
+                unsafe {
+                    let dst = entries_buf.as_mut_slice::<u32>(count * 4);
+                    for (i, &(bda, max_c, max_i)) in list.hoisted_clamps.iter().enumerate() {
+                        dst[i * 4] = bda as u32;
+                        dst[i * 4 + 1] = (bda >> 32) as u32;
+                        dst[i * 4 + 2] = max_c;
+                        dst[i * 4 + 3] = max_i;
+                    }
+                }
+                let mut pc = Vec::with_capacity(16);
+                pc.extend_from_slice(&entries_buf.bda.to_le_bytes());
+                pc.extend_from_slice(&(count as u32).to_le_bytes());
+                pc.extend_from_slice(&0u32.to_le_bytes());
+                let clamp_words: Vec<u32> = CLAMP_INDIRECT_SPV
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                let groups = (count as u32).div_ceil(64);
+                let _ = runner.dispatch_spirv(&clamp_words, &pc, [groups, 1, 1]);
+                runner.free_bda_buffer(entries_buf);
+            }
+        }
+
+        // 2. Replay the list.
+        let mem = TitleMemory {
+            uma: self.uma.as_deref(),
+        };
+        let mut active_pso: Option<PipelineKey> = None;
+        let mut shadow = [0u32; 256];
+        let mut st = DrawState::default();
+        for cmd in list.commands() {
+            match cmd {
+                ThinCommand::BindPipeline(k) => active_pso = Some(*k),
+                ThinCommand::PushUserSgprs { offset_dw, values } => {
+                    for (i, &v) in values.iter().enumerate() {
+                        let idx = (*offset_dw as usize) + i;
+                        if idx < shadow.len() {
+                            shadow[idx] = v;
+                        }
+                    }
+                }
+                ThinCommand::Dispatch {
+                    x,
+                    y,
+                    z,
+                    is_thread_count,
+                } => {
+                    if self.predicated(&mem, runner, &st) {
+                        continue;
+                    }
+                    let groups = if *is_thread_count {
+                        // Console DispatchX with USE_THREAD_DIMENSIONS (0x20):
+                        // convert thread counts into whole workgroups.
+                        [(*x).div_ceil(64).max(1), (*y).max(1), (*z).max(1)]
+                    } else {
+                        [*x, *y, *z]
+                    };
+                    let sgprs = self.push_sgprs(runner, &mem, &shadow, &st);
+                    let pipes = self.pipelines.lock().unwrap();
+                    if let Some(entry) = active_pso.and_then(|k| pipes.get(&k))
+                        && self.run_dispatch(runner, entry, &sgprs, groups)
+                    {
+                        self.executed_gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                ThinCommand::SetRenderTargets(r) => {
+                    st.legacy_rts = r.clone();
+                    st.colors.clear();
+                    st.depth = None;
+                }
+                ThinCommand::BindTargets { colors, depth } => {
+                    st.colors = colors.clone();
+                    st.depth = *depth;
+                    st.legacy_rts.clear();
+                }
+                ThinCommand::DrawInstanced {
+                    vertex_count,
+                    instance_count,
+                    start_vertex,
+                    start_instance,
+                } => {
+                    let args = DrawArgs {
+                        vertex_count: *vertex_count,
+                        instance_count: *instance_count,
+                        first_vertex: *start_vertex,
+                        first_instance: *start_instance,
+                    };
+                    self.draw(runner, &mem, active_pso, &shadow, &mut st, args, None);
+                }
+                ThinCommand::DrawIndexedInstanced {
+                    index_count,
+                    instance_count,
+                    start_index,
+                    base_vertex,
+                    start_instance,
+                } => {
+                    let args = DrawArgs {
+                        vertex_count: *index_count,
+                        instance_count: *instance_count,
+                        first_vertex: *start_index,
+                        first_instance: *start_instance,
+                    };
+                    self.draw(
+                        runner,
+                        &mem,
+                        active_pso,
+                        &shadow,
+                        &mut st,
+                        args,
+                        Some(*base_vertex),
+                    );
+                }
+                ThinCommand::DrawIndirect { args_bda, .. } => {
+                    // Clamped in the pre-pass; the arguments are read back
+                    // and the draw issued directly.
+                    mem.sync_for_read(runner, *args_bda, 16);
+                    if let Some(a) = mem.dwords(*args_bda, 4) {
+                        let args = DrawArgs {
+                            vertex_count: a[0],
+                            instance_count: a[1],
+                            first_vertex: a[2],
+                            first_instance: a[3],
+                        };
+                        self.draw(runner, &mem, active_pso, &shadow, &mut st, args, None);
+                    }
+                }
+                ThinCommand::DispatchIndirect { args_va } => {
+                    if self.predicated(&mem, runner, &st) {
+                        continue;
+                    }
+                    let groups = indirect_args(self.uma.as_deref(), runner, *args_va);
+                    let sgprs = self.push_sgprs(runner, &mem, &shadow, &st);
+                    let pipes = self.pipelines.lock().unwrap();
+                    if let (Some(g), Some(entry)) = (groups, active_pso.and_then(|k| pipes.get(&k)))
+                    {
+                        // Never clamped: dispatches split past the device limit.
+                        if self.run_dispatch(runner, entry, &sgprs, g) {
+                            self.executed_gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                // Shader-written data the title's CPU code reads (e.g. ocean
+                // height maps its physics samples) goes back to title memory.
+                ThinCommand::ReadbackTexture {
+                    console_va,
+                    byte_len,
+                } => {
+                    if let Some(uma) = &self.uma
+                        && let Ok(n) = uma.lock().unwrap().readback(runner, *console_va, *byte_len)
+                    {
+                        self.readback_bytes.fetch_add(n, Ordering::Relaxed);
+                    }
+                }
+                ThinCommand::SetViewport(v) => st.viewport = Some(v.map(f32::from_bits)),
+                ThinCommand::SetScissor(r) => st.scissor = Some(*r),
+                ThinCommand::SetStencilRef(r) => st.stencil_ref = *r,
+                ThinCommand::SetBlendFactor(b) => st.blend_factor = b.map(f32::from_bits),
+                ThinCommand::SetTopology(t) => st.topology = Some(*t),
+                ThinCommand::SetIndexBuffer { va, size, index32 } => {
+                    st.index = (*va != 0).then_some((*va, *size, *index32));
+                }
+                ThinCommand::SetVertexBuffers { start_slot, views } => {
+                    let end = *start_slot as usize + views.len();
+                    if st.vertex_buffers.len() < end {
+                        st.vertex_buffers.resize(end, None);
+                    }
+                    for (i, v) in views.iter().enumerate() {
+                        st.vertex_buffers[*start_slot as usize + i] = (v.0 != 0).then_some(*v);
+                    }
+                }
+                ThinCommand::SetRootLayout {
+                    dwords,
+                    spilled,
+                    vertex_table_sgpr,
+                } => {
+                    st.root_dwords = *dwords;
+                    st.root_spilled = *spilled;
+                    st.vertex_table_sgpr = Some(*vertex_table_sgpr);
+                }
+                ThinCommand::ClearImage {
+                    words,
+                    aspects,
+                    color,
+                    depth,
+                    stencil,
+                } => self.clear(runner, &mem, words, *aspects, *color, *depth, *stencil),
+                ThinCommand::FillMemory {
+                    va,
+                    len,
+                    pattern,
+                    dwords,
+                } => {
+                    let n = (*dwords).clamp(1, 4) as usize;
+                    let unit: Vec<u8> = pattern[..n].iter().flat_map(|w| w.to_le_bytes()).collect();
+                    let bytes: Vec<u8> = unit.iter().copied().cycle().take(*len as usize).collect();
+                    if !mem.write(*va, &bytes) {
+                        self.log_once("FillMemory: destination is not title memory");
+                    }
+                }
+                ThinCommand::CopyMemory { dst, src, len } => {
+                    let gpu_done = self
+                        .uma
+                        .as_ref()
+                        .and_then(|u| {
+                            u.lock()
+                                .unwrap()
+                                .gpu_copy_buffer(runner, *dst, *src, *len)
+                                .ok()
+                        })
+                        .unwrap_or(false);
+                    if !gpu_done {
+                        mem.sync_for_read(runner, *src, *len);
+                        match mem.read(*src, *len as usize) {
+                            Some(b) if mem.write(*dst, &b) => {}
+                            _ => self.log_once("CopyMemory: a range is not title memory"),
+                        }
+                    }
+                }
+                ThinCommand::CopyTexture(c) => self.copy_texture(runner, &mem, c),
+                ThinCommand::WriteTimestamp { va } => {
+                    let ns = runner
+                        .query_gpu_timestamp_ns()
+                        .unwrap_or_else(|_| self.epoch.elapsed().as_nanos() as u64);
+                    mem.write(*va, &ns.to_le_bytes());
+                }
+                ThinCommand::WriteU64 { va, value } => {
+                    mem.write(*va, &value.to_le_bytes());
+                }
+                ThinCommand::SetPredication { va, skip_if_zero } => {
+                    st.predicate = (*va != 0).then_some((*va, *skip_if_zero));
+                }
+                ThinCommand::ExecuteIndirect {
+                    layout,
+                    max_count,
+                    args_va,
+                    count_va,
+                } => self.execute_indirect(
+                    runner,
+                    &mem,
+                    active_pso,
+                    &mut shadow,
+                    &mut st,
+                    layout,
+                    *max_count,
+                    *args_va,
+                    *count_va,
+                ),
+                ThinCommand::DispatchMesh { x, y, z } => {
+                    self.dispatch_mesh(runner, &mem, active_pso, &shadow, &mut st, [*x, *y, *z]);
+                }
+                ThinCommand::BuildAccel(build) => {
+                    if let Err(e) = crate::d3d12_rt::build(&mem_reader(&mem, runner), build) {
+                        crate::crash::log_line(&format!("acceleration structure build: {e}"));
+                    }
+                }
+                ThinCommand::CopyAccel { dst, src } => {
+                    // Strata's BVHs hold no absolute addresses: a byte copy
+                    // of the used size is a valid clone (and compaction).
+                    let used = mem.u64_at(*src + 8).unwrap_or(0).min(1 << 30);
+                    mem.sync_for_read(runner, *src, used);
+                    if let Some(b) = mem.read(*src, used as usize) {
+                        mem.write(*dst, &b);
+                    }
+                }
+                ThinCommand::SetDepthBounds { min, max } => {
+                    st.depth_bounds = Some((f32::from_bits(*min), f32::from_bits(*max)));
+                }
+                ThinCommand::SetStreamOutputTargets { start_slot, views } => {
+                    let s = *start_slot as usize;
+                    if st.stream_output.len() < s + views.len() {
+                        st.stream_output.resize(s + views.len(), None);
+                    }
+                    for (i, &(va, size, filled_va)) in views.iter().enumerate() {
+                        st.stream_output[s + i] = (va != 0).then_some((va, size, filled_va));
+                    }
+                }
+                ThinCommand::SetShadingRate {
+                    width,
+                    height,
+                    combiners,
+                } => {
+                    st.shading_rate = [(*width).max(1), (*height).max(1)];
+                    st.shading_rate_combiners = *combiners;
+                }
+                ThinCommand::SetShadingRateImage { va } => {
+                    st.shading_rate_image = (*va != 0).then_some(*va);
+                }
+                ThinCommand::BeginQuery { va, query_type } => match *query_type {
+                    0 | 1 => {
+                        st.active_occlusion_query = Some((*va, *query_type == 1));
+                        st.query_acc.samples_passed = 0;
+                    }
+                    3 => {
+                        st.active_stats_query = Some(*va);
+                        st.query_acc.pipeline_stats = [0; 11];
+                    }
+                    _ => {}
+                },
+                ThinCommand::EndQuery { va, query_type } => match *query_type {
+                    0 | 1 => {
+                        let samples = st.query_acc.samples_passed;
+                        let val = if *query_type == 1 {
+                            u64::from(samples > 0)
+                        } else {
+                            samples
+                        };
+                        mem.write(*va, &val.to_le_bytes());
+                        st.active_occlusion_query = None;
+                        st.query_acc.capture_occlusion = false;
+                    }
+                    2 => {
+                        let ns = runner
+                            .query_gpu_timestamp_ns()
+                            .unwrap_or_else(|_| self.epoch.elapsed().as_nanos() as u64);
+                        mem.write(*va, &ns.to_le_bytes());
+                    }
+                    3 => {
+                        let bytes: Vec<u8> = st
+                            .query_acc
+                            .pipeline_stats
+                            .iter()
+                            .flat_map(|c| c.to_le_bytes())
+                            .collect();
+                        mem.write(*va, &bytes);
+                        st.active_stats_query = None;
+                        st.query_acc.capture_pipeline_stats = false;
+                    }
+                    _ => {
+                        mem.write(*va, &0u64.to_le_bytes());
+                    }
+                },
+                ThinCommand::DispatchRays {
+                    raygen,
+                    miss,
+                    hit,
+                    callable,
+                    width,
+                    height,
+                    depth,
+                } => {
+                    self.dispatch_rays(
+                        runner,
+                        &mem,
+                        active_pso,
+                        &shadow,
+                        &st,
+                        *raygen,
+                        *miss,
+                        *hit,
+                        *callable,
+                        [*width, *height, *depth],
+                    );
+                }
+                ThinCommand::ResolveSubresourceRegion {
+                    dst,
+                    dst_origin,
+                    src,
+                    src_rect,
+                    sample_count,
+                } => {
+                    let w = src_rect[2];
+                    let h = src_rect[3];
+                    let sc = (*sample_count).max(1);
+                    let dst_row_bytes = u64::from(w) * u64::from(dst.bpe);
+                    let src_row_bytes = u64::from(w) * u64::from(src.bpe) * u64::from(sc);
+                    for y in 0..h {
+                        let s_va = src.va
+                            + u64::from(src_rect[1] + y) * src.row_pitch
+                            + u64::from(src_rect[0]) * u64::from(src.bpe) * u64::from(sc);
+                        let d_va = dst.va
+                            + u64::from(dst_origin[1] + y) * dst.row_pitch
+                            + u64::from(dst_origin[0]) * u64::from(dst.bpe);
+                        if y == 0 {
+                            mem.sync_for_read(runner, s_va, u64::from(h) * src.row_pitch);
+                        }
+                        if sc > 1 && src.bpe == 4 && dst.bpe == 4 {
+                            if let Some(b) = mem.read(s_va, src_row_bytes as usize) {
+                                let mut resolved = vec![0u8; dst_row_bytes as usize];
+                                strata_gpu::readback::resolve_msaa_rgba8(&b, sc, &mut resolved);
+                                mem.write(d_va, &resolved);
+                            }
+                        } else if let Some(b) = mem.read(s_va, dst_row_bytes as usize) {
+                            mem.write(d_va, &b);
+                        }
+                    }
+                }
+                ThinCommand::CopyTiles {
+                    tiled_va,
+                    buffer_va,
+                    tile_count,
+                    tile_bytes,
+                    to_tiled,
+                } => {
+                    let len = u64::from(*tile_count) * u64::from(*tile_bytes);
+                    let (src, dst) = if *to_tiled {
+                        (*buffer_va, *tiled_va)
+                    } else {
+                        (*tiled_va, *buffer_va)
+                    };
+                    mem.sync_for_read(runner, src, len);
+                    if let Some(b) = mem.read(src, len as usize) {
+                        mem.write(dst, &b);
+                    }
+                }
+                ThinCommand::WriteSamplerFeedback {
+                    target_va,
+                    mip_level,
+                    tile_x,
+                    tile_y,
+                } => {
+                    let off = (u64::from(*tile_y) * 64 + u64::from(*tile_x)) & 0xffff;
+                    let va = target_va.saturating_add(off);
+                    let cur = mem
+                        .read(va, 1)
+                        .and_then(|b| b.first().copied())
+                        .unwrap_or(0xff);
+                    if *mip_level < cur {
+                        mem.write(va, &[*mip_level]);
+                    }
+                }
+                ThinCommand::CopyBufferRegion {
+                    dst_va,
+                    dst_offset,
+                    src_va,
+                    src_offset,
+                    num_bytes,
+                } => {
+                    let (dst, src) = (dst_va + dst_offset, src_va + src_offset);
+                    let gpu_done = self
+                        .uma
+                        .as_ref()
+                        .and_then(|u| {
+                            u.lock()
+                                .unwrap()
+                                .gpu_copy_buffer(runner, dst, src, *num_bytes)
+                                .ok()
+                        })
+                        .unwrap_or(false);
+                    if !gpu_done {
+                        mem.sync_for_read(runner, src, *num_bytes);
+                        match mem.read(src, *num_bytes as usize) {
+                            Some(b) if mem.write(dst, &b) => {}
+                            _ => self.log_once("CopyBufferRegion: a range is not title memory"),
+                        }
+                    }
+                }
+                ThinCommand::UpdateTileMappings {
+                    resource_va,
+                    start_tile,
+                    tile_count,
+                    unbind,
+                    ..
+                } => {
+                    if let Some(uma) = &self.uma {
+                        uma.lock().unwrap().update_tile_mappings(
+                            *resource_va,
+                            *start_tile,
+                            *tile_count,
+                            *unbind,
+                        );
+                    }
+                }
+                ThinCommand::CopyTileMappings {
+                    dst_va,
+                    src_va,
+                    tile_count,
+                } => {
+                    if let Some(uma) = &self.uma {
+                        uma.lock()
+                            .unwrap()
+                            .copy_tile_mappings(*dst_va, *src_va, *tile_count);
+                    }
+                }
+                // Execution is in order and every submission is waited on:
+                // barriers have nothing left to order.
+                ThinCommand::ResourceBarrier { .. } => {}
+            }
+        }
+    }
+
+    /// One draw, honouring predication and the root/vertex tables.
+    #[allow(clippy::too_many_arguments)]
+    fn draw(
+        &self,
+        runner: &ComputeRunner,
+        mem: &TitleMemory<'_>,
+        active_pso: Option<PipelineKey>,
+        shadow: &[u32; 256],
+        st: &mut DrawState,
+        args: DrawArgs,
+        indexed: Option<i32>,
+    ) {
+        if self.predicated(mem, runner, st) {
+            return;
+        }
+        let sgprs = self.push_sgprs(runner, mem, shadow, st);
+        let pipes = self.pipelines.lock().unwrap();
+        if let Some(entry) = active_pso.and_then(|k| pipes.get(&k))
+            && self.run_draw(runner, entry, &sgprs, args, indexed, st)
+        {
+            self.executed_draws.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn dispatch_mesh(
+        &self,
+        runner: &ComputeRunner,
+        mem: &TitleMemory<'_>,
+        active_pso: Option<PipelineKey>,
+        shadow: &[u32; 256],
+        st: &mut DrawState,
+        groups: [u32; 3],
+    ) {
+        if self.predicated(mem, runner, st) {
+            return;
+        }
+        let sgprs = self.push_sgprs(runner, mem, shadow, st);
+        let pipes = self.pipelines.lock().unwrap();
+        if let Some(entry) = active_pso.and_then(|k| pipes.get(&k))
+            && self.run_mesh(runner, entry, &sgprs, groups, st)
+        {
+            self.executed_draws.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Executes `DispatchRays` under Strata's No-API model: pushes the raygen,
+    /// miss, hit-group, and callable SBT BDA ranges and ray dispatch dimensions
+    /// into user SGPRs and dispatches the state object's translated raygen
+    /// compute shader over `(ceil(w/8), ceil(h/8), d)` groups (walking Strata's
+    /// BDA BVH directly via `image_bvh64_intersect_ray`).
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_rays(
+        &self,
+        runner: &ComputeRunner,
+        mem: &TitleMemory<'_>,
+        active_pso: Option<PipelineKey>,
+        shadow: &[u32; 256],
+        st: &DrawState,
+        raygen: (u64, u64),
+        miss: (u64, u64, u64),
+        hit: (u64, u64, u64),
+        callable: (u64, u64, u64),
+        dims: [u32; 3],
+    ) {
+        if self.predicated(mem, runner, st) || dims[0] == 0 || dims[1] == 0 || dims[2] == 0 {
+            return;
+        }
+        let mut sgprs = self.push_sgprs(runner, mem, shadow, st);
+        // Pack SBT descriptor pointers + dispatch dimensions in the high user SGPRs
+        // (s16..s31) so No-API raygen shaders can fetch SBT records directly via BDA.
+        sgprs[16] = dims[0];
+        sgprs[17] = dims[1];
+        sgprs[18] = dims[2];
+        sgprs[20] = raygen.0 as u32;
+        sgprs[21] = (raygen.0 >> 32) as u32;
+        sgprs[22] = miss.0 as u32;
+        sgprs[23] = (miss.0 >> 32) as u32;
+        sgprs[24] = hit.0 as u32;
+        sgprs[25] = (hit.0 >> 32) as u32;
+        sgprs[26] = callable.0 as u32;
+        sgprs[27] = (callable.0 >> 32) as u32;
+        let groups = [dims[0].div_ceil(8), dims[1].div_ceil(8), dims[2].max(1)];
+        let pipes = self.pipelines.lock().unwrap();
+        if let Some(entry) = active_pso.and_then(|k| pipes.get(&k))
+            && self.run_dispatch(runner, entry, &sgprs, groups)
+        {
+            self.executed_gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn clear(
+        &self,
+        runner: &ComputeRunner,
+        mem: &TitleMemory<'_>,
+        words: &[u32; 8],
+        aspects: strata_gpu::thin_list::ClearAspects,
+        color: [u32; 4],
+        depth: u32,
+        stencil: u32,
+    ) {
+        let read = |a: u64, n: usize| mem.read(a, n);
+        let write = |a: u64, b: &[u8]| mem.write(a, b);
+        let depth_fmt = (aspects.depth || aspects.stencil).then(|| {
+            let raw = crate::d3d12_types::trailer(words).map_or(0, |t| t.1);
+            if raw == 0 {
+                ash::vk::Format::D32_SFLOAT
+            } else {
+                ash::vk::Format::from_raw(raw)
+            }
+        });
+        let mut textures = self.textures.lock().unwrap();
+        if let Err(e) = textures.clear(
+            runner,
+            *words,
+            depth_fmt,
+            color,
+            f32::from_bits(depth),
+            stencil,
+            &write,
+            &read,
+        ) {
+            crate::crash::log_line(&format!("clear: {e}"));
+        }
+    }
+
+    fn copy_texture(
+        &self,
+        runner: &ComputeRunner,
+        mem: &TitleMemory<'_>,
+        c: &strata_gpu::thin_list::TextureCopy,
+    ) {
+        let row_bytes = u64::from(c.extent[0]) * u64::from(c.src.bpe);
+        for z in 0..c.extent[2] {
+            for y in 0..c.extent[1] {
+                let s = c.src.va
+                    + u64::from(c.src_origin[2] + z) * c.src.slice_pitch
+                    + u64::from(c.src_origin[1] + y) * c.src.row_pitch
+                    + u64::from(c.src_origin[0]) * u64::from(c.src.bpe);
+                let d = c.dst.va
+                    + u64::from(c.dst_origin[2] + z) * c.dst.slice_pitch
+                    + u64::from(c.dst_origin[1] + y) * c.dst.row_pitch
+                    + u64::from(c.dst_origin[0]) * u64::from(c.dst.bpe);
+                if z == 0 && y == 0 {
+                    let span = u64::from(c.extent[2]) * c.src.slice_pitch.max(c.src.row_pitch);
+                    mem.sync_for_read(runner, s, span.max(row_bytes));
+                }
+                match mem.read(s, row_bytes as usize) {
+                    Some(b) if mem.write(d, &b) => {}
+                    _ => {
+                        self.log_once("CopyTextureRegion: a row is not title memory");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_indirect(
+        &self,
+        runner: &ComputeRunner,
+        mem: &TitleMemory<'_>,
+        active_pso: Option<PipelineKey>,
+        shadow: &mut [u32; 256],
+        st: &mut DrawState,
+        layout: &strata_gpu::thin_list::IndirectLayout,
+        max_count: u32,
+        args_va: u64,
+        count_va: u64,
+    ) {
+        use strata_gpu::thin_list::IndirectArg;
+        let count = if count_va != 0 {
+            mem.sync_for_read(runner, count_va, 4);
+            mem.dwords(count_va, 1).map_or(0, |d| d[0]).min(max_count)
+        } else {
+            max_count
+        };
+        let stride = u64::from(layout.stride.max(1));
+        mem.sync_for_read(runner, args_va, stride * u64::from(count));
+        for i in 0..u64::from(count) {
+            let mut at = args_va + i * stride;
+            for arg in &layout.args {
+                let n = (arg.bytes() / 4) as usize;
+                let Some(d) = mem.dwords(at, n) else {
+                    self.log_once("ExecuteIndirect: arguments are not title memory");
+                    return;
+                };
+                match *arg {
+                    IndirectArg::Draw => {
+                        let args = DrawArgs {
+                            vertex_count: d[0],
+                            instance_count: d[1],
+                            first_vertex: d[2],
+                            first_instance: d[3],
+                        };
+                        self.draw(runner, mem, active_pso, shadow, st, args, None);
+                    }
+                    IndirectArg::DrawIndexed => {
+                        let args = DrawArgs {
+                            vertex_count: d[0],
+                            instance_count: d[1],
+                            first_vertex: d[2],
+                            first_instance: d[4],
+                        };
+                        self.draw(runner, mem, active_pso, shadow, st, args, Some(d[3] as i32));
+                    }
+                    IndirectArg::Dispatch => {
+                        if !self.predicated(mem, runner, st) {
+                            let sgprs = self.push_sgprs(runner, mem, shadow, st);
+                            let pipes = self.pipelines.lock().unwrap();
+                            if let Some(entry) = active_pso.and_then(|k| pipes.get(&k))
+                                && self.run_dispatch(runner, entry, &sgprs, [d[0], d[1], d[2]])
+                            {
+                                self.executed_gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    IndirectArg::DispatchMesh => {
+                        self.dispatch_mesh(runner, mem, active_pso, shadow, st, [d[0], d[1], d[2]]);
+                    }
+                    IndirectArg::DispatchRays => {
+                        let q = |k: usize| u64::from(d[k]) | (u64::from(d[k + 1]) << 32);
+                        self.dispatch_rays(
+                            runner,
+                            mem,
+                            active_pso,
+                            shadow,
+                            st,
+                            (q(0), q(2)),
+                            (q(4), q(6), q(8)),
+                            (q(10), q(12), q(14)),
+                            (q(16), q(18), q(20)),
+                            [d[22], d[23], d[24]],
+                        );
+                    }
+                    IndirectArg::VertexBuffer { slot } => {
+                        let s = slot as usize;
+                        if st.vertex_buffers.len() <= s {
+                            st.vertex_buffers.resize(s + 1, None);
+                        }
+                        let va = u64::from(d[0]) | (u64::from(d[1]) << 32);
+                        st.vertex_buffers[s] = (va != 0).then_some((va, d[2], d[3]));
+                    }
+                    IndirectArg::IndexBuffer => {
+                        let va = u64::from(d[0]) | (u64::from(d[1]) << 32);
+                        st.index = (va != 0).then_some((va, d[2], d[3] == 42));
+                    }
+                    IndirectArg::Constants { sgpr, .. } => {
+                        for (k, &v) in d.iter().enumerate() {
+                            if let Some(s) = shadow.get_mut(sgpr as usize + k) {
+                                *s = v;
+                            }
+                        }
+                    }
+                    IndirectArg::RootAddress { sgpr } => {
+                        for (k, &v) in d.iter().take(2).enumerate() {
+                            if let Some(s) = shadow.get_mut(sgpr as usize + k) {
+                                *s = v;
+                            }
+                        }
+                    }
+                }
+                at += u64::from(arg.bytes());
+            }
+        }
+    }
+}
+
+/// Title memory as the acceleration-structure builder reads and writes it.
+fn mem_reader<'a>(
+    mem: &'a TitleMemory<'a>,
+    runner: &'a ComputeRunner,
+) -> crate::d3d12_rt::Memory<'a> {
+    crate::d3d12_rt::Memory {
+        read: Box::new(move |a, n| {
+            mem.sync_for_read(runner, a, n as u64);
+            mem.read(a, n)
+        }),
+        write: Box::new(move |a, b| mem.write(a, b)),
     }
 }
 
@@ -986,7 +2421,13 @@ unsafe extern "system" fn queue_release(this: *mut c_void) -> u32 {
         std::sync::atomic::fence(Ordering::Acquire);
         let q = unsafe { Box::from_raw(this as *mut D3D12CommandQueueX) };
         if let Some(runner) = &q.gpu_runner {
-            q.textures.lock().unwrap().destroy(runner);
+            // Images are shared by a device's queues: the last owner frees them.
+            if Arc::strong_count(&q.textures) == 1 {
+                q.textures.lock().unwrap().destroy(runner);
+            }
+            if let (Some(uma), Some((va, _, _))) = (&q.uma, *q.scratch.lock().unwrap()) {
+                uma.lock().unwrap().free_allocation(runner, va);
+            }
         }
         drop(q);
         0
@@ -1011,136 +2452,19 @@ unsafe extern "system" fn queue_execute_command_lists(
         }
         let cl = unsafe { &*(ptr as *const D3D12CommandListX) };
         let guard = cl.list.lock().unwrap();
-        queue.submitted_lists.fetch_add(1, Ordering::Relaxed);
-        queue
-            .submitted_commands
-            .fetch_add(guard.commands().len() as u32, Ordering::Relaxed);
-        queue
-            .hoisted_clamps
-            .fetch_add(guard.hoisted_clamps.len() as u32, Ordering::Relaxed);
-
-        // If a live Vulkan 1.3 BDA runner is attached, flush hoisted clamps + compute dispatches!
-        if let Some(runner) = &queue.gpu_runner {
-            // 0. The title's CPU writes since the last list reach the mirrors.
-            if let Some(uma) = &queue.uma
-                && let Ok(stats) = uma.lock().unwrap().sync_mirrors(runner)
-            {
-                queue.synced_bytes.fetch_add(stats.bytes, Ordering::Relaxed);
-            }
-
-            // 1. Batched pre-pass for all hoisted indirect draw clamps (single GPU dispatch)
-            if !guard.hoisted_clamps.is_empty() {
-                let count = guard.hoisted_clamps.len();
-                if let Ok(mut entries_buf) = runner.alloc_bda_buffer((count * 16) as u64) {
-                    unsafe {
-                        let dst = entries_buf.as_mut_slice::<u32>(count * 4);
-                        for (i, &(bda, max_c, max_i)) in guard.hoisted_clamps.iter().enumerate() {
-                            dst[i * 4] = bda as u32;
-                            dst[i * 4 + 1] = (bda >> 32) as u32;
-                            dst[i * 4 + 2] = max_c;
-                            dst[i * 4 + 3] = max_i;
-                        }
-                    }
-                    let mut pc = Vec::with_capacity(16);
-                    pc.extend_from_slice(&entries_buf.bda.to_le_bytes());
-                    pc.extend_from_slice(&(count as u32).to_le_bytes());
-                    pc.extend_from_slice(&0u32.to_le_bytes());
-                    let clamp_words: Vec<u32> = CLAMP_INDIRECT_SPV
-                        .chunks_exact(4)
-                        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                        .collect();
-                    let groups = (count as u32).div_ceil(64);
-                    let _ = runner.dispatch_spirv(&clamp_words, &pc, [groups, 1, 1]);
-                    runner.free_bda_buffer(entries_buf);
-                }
-            }
-
-            // 2. Replay recorded PushUserSgprs + Dispatch commands through registered SPIR-V pipelines
-            let pipes = queue.pipelines.lock().unwrap();
-            let mut active_pso: Option<PipelineKey> = None;
-            let mut sgprs = [0u32; 32];
-            let mut rts: Vec<RenderTargetDesc> = Vec::new();
-            for cmd in guard.commands() {
-                match cmd {
-                    ThinCommand::BindPipeline(k) => active_pso = Some(*k),
-                    ThinCommand::PushUserSgprs { offset_dw, values } => {
-                        for (i, &v) in values.iter().enumerate() {
-                            let idx = (*offset_dw as usize) + i;
-                            if idx < 32 {
-                                sgprs[idx] = v;
-                            }
-                        }
-                    }
-                    ThinCommand::Dispatch { x, y, z, .. } => {
-                        if let Some(entry) = active_pso.and_then(|k| pipes.get(&k))
-                            && queue.run_dispatch(runner, entry, &sgprs, [*x, *y, *z])
-                        {
-                            queue
-                                .executed_gpu_dispatches
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    ThinCommand::SetRenderTargets(r) => rts = r.clone(),
-                    ThinCommand::DrawInstanced {
-                        vertex_count,
-                        instance_count,
-                        start_vertex,
-                        start_instance,
-                    } => {
-                        if let Some(entry) = active_pso.and_then(|k| pipes.get(&k)) {
-                            let args = DrawArgs {
-                                vertex_count: *vertex_count,
-                                instance_count: *instance_count,
-                                first_vertex: *start_vertex,
-                                first_instance: *start_instance,
-                            };
-                            if queue.run_draw(runner, entry, &sgprs, args, &rts) {
-                                queue.executed_draws.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    ThinCommand::DispatchIndirect { args_va } => {
-                        let groups = indirect_args(queue.uma.as_deref(), runner, *args_va);
-                        if let (Some(g), Some(entry)) =
-                            (groups, active_pso.and_then(|k| pipes.get(&k)))
-                        {
-                            // Never clamped: dispatches split past the device limit.
-                            if queue.run_dispatch(runner, entry, &sgprs, g) {
-                                queue
-                                    .executed_gpu_dispatches
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    // Shader-written data the title's CPU code reads (e.g. ocean
-                    // height maps its physics samples) goes back to title memory.
-                    ThinCommand::ReadbackTexture {
-                        console_va,
-                        byte_len,
-                    } => {
-                        if let Some(uma) = &queue.uma
-                            && let Ok(n) =
-                                uma.lock().unwrap().readback(runner, *console_va, *byte_len)
-                        {
-                            queue.readback_bytes.fetch_add(n, Ordering::Relaxed);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        queue.execute_thin(&guard);
     }
 }
 
 unsafe extern "system" fn queue_present_x(
     this: *mut c_void,
-    _plane_count: u32,
-    _planes: *const c_void,
+    plane_count: u32,
+    planes: *const c_void,
     _params: *const c_void,
 ) -> i32 {
     let queue = unsafe { &*(this as *const D3D12CommandQueueX) };
     queue.frame_clock.lock().unwrap().record_present_x();
-    S_OK
+    unsafe { crate::thunks::present_frame(plane_count, planes) }
 }
 
 // ============================================================================

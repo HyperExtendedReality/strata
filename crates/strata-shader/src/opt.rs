@@ -356,41 +356,46 @@ fn rewrite_operands(op: &mut SsaOp, repl: &HashMap<ValueId, ValueId>) {
         | SsaOp::RoundEvenF32(a)
         | SsaOp::BdaLoad { addr: a, .. } => f(a),
         SsaOp::ImageSample {
-            u, v, lod, bias, ..
+            u, v, w, lod, bias, ..
         } => {
             f(u);
             f(v);
+            f(w);
             lod.iter_mut().for_each(&f);
             bias.iter_mut().for_each(&f);
         }
         SsaOp::ImageSampleDref {
-            u, v, dref, lod, ..
+            u, v, w, dref, lod, ..
         } => {
             f(u);
             f(v);
+            f(w);
             f(dref);
             lod.iter_mut().for_each(&f);
         }
-        SsaOp::ImageGather { u, v, .. } => {
+        SsaOp::ImageGather { u, v, w, .. } => {
             f(u);
             f(v);
+            f(w);
         }
         SsaOp::ImageQuerySize { lod, .. } => {
             f(lod);
         }
-        SsaOp::ImageFetch { x, y, lod, .. } => {
+        SsaOp::ImageFetch { x, y, z, lod, .. } => {
             f(x);
             f(y);
+            f(z);
             lod.iter_mut().for_each(&f);
         }
-        SsaOp::ImageStore { x, y, values, .. } => {
+        SsaOp::ImageStore {
+            x, y, z, values, ..
+        } => {
             f(x);
             f(y);
+            f(z);
             values.iter_mut().for_each(&f);
         }
-        SsaOp::BdaAtomic {
-            addr, val, cmp, ..
-        } => {
+        SsaOp::BdaAtomic { addr, val, cmp, .. } => {
             f(addr);
             f(val);
             cmp.iter_mut().for_each(&f);
@@ -460,6 +465,12 @@ fn rewrite_operands(op: &mut SsaOp, repl: &HashMap<ValueId, ValueId>) {
                 f(v);
             }
         }
+        SsaOp::WavePermute { value, aux, .. } => {
+            f(value);
+            if let Some(a) = aux {
+                f(a);
+            }
+        }
         SsaOp::Bvh64IntersectBox32 {
             node_addr,
             t_max,
@@ -525,40 +536,45 @@ fn for_each_operand(op: &SsaOp, mut f: impl FnMut(ValueId)) {
         | SsaOp::RoundEvenF32(a)
         | SsaOp::BdaLoad { addr: a, .. } => f(*a),
         SsaOp::ImageSample {
-            u, v, lod, bias, ..
+            u, v, w, lod, bias, ..
         } => {
             f(*u);
             f(*v);
+            f(*w);
             lod.iter().chain(bias.iter()).for_each(|&x| f(x));
         }
         SsaOp::ImageSampleDref {
-            u, v, dref, lod, ..
+            u, v, w, dref, lod, ..
         } => {
             f(*u);
             f(*v);
+            f(*w);
             f(*dref);
             lod.iter().for_each(|&x| f(x));
         }
-        SsaOp::ImageGather { u, v, .. } => {
+        SsaOp::ImageGather { u, v, w, .. } => {
             f(*u);
             f(*v);
+            f(*w);
         }
         SsaOp::ImageQuerySize { lod, .. } => {
             f(*lod);
         }
-        SsaOp::ImageFetch { x, y, lod, .. } => {
+        SsaOp::ImageFetch { x, y, z, lod, .. } => {
             f(*x);
             f(*y);
+            f(*z);
             lod.iter().for_each(|&l| f(l));
         }
-        SsaOp::ImageStore { x, y, values, .. } => {
+        SsaOp::ImageStore {
+            x, y, z, values, ..
+        } => {
             f(*x);
             f(*y);
+            f(*z);
             values.iter().for_each(|&v| f(v));
         }
-        SsaOp::BdaAtomic {
-            addr, val, cmp, ..
-        } => {
+        SsaOp::BdaAtomic { addr, val, cmp, .. } => {
             f(*addr);
             f(*val);
             cmp.iter().for_each(|&c| f(c));
@@ -626,6 +642,12 @@ fn for_each_operand(op: &SsaOp, mut f: impl FnMut(ValueId)) {
             f(*addr);
             for &v in values {
                 f(v);
+            }
+        }
+        SsaOp::WavePermute { value, aux, .. } => {
+            f(*value);
+            if let Some(a) = aux {
+                f(*a);
             }
         }
         SsaOp::Bvh64IntersectBox32 {

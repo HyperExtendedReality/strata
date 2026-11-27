@@ -6,6 +6,7 @@ use std::process::Command;
 
 const SHADERS: &[(&str, &str, &str, &str)] = &[
     ("dirty_hash.slang", "dirty_hash.spv", "main", "compute"),
+    ("mirror_diff.slang", "mirror_diff.spv", "main", "compute"),
     ("detile.slang", "detile.spv", "main", "compute"),
     ("bvh_oracle.slang", "bvh_oracle.spv", "main", "compute"),
     (
@@ -16,6 +17,8 @@ const SHADERS: &[(&str, &str, &str, &str)] = &[
     ),
     ("tex_convert.slang", "tex_convert.spv", "main", "compute"),
     ("mip_gen.slang", "mip_gen.spv", "main", "compute"),
+    ("compose_vs.slang", "compose_vs.spv", "main", "vertex"),
+    ("compose_fs.slang", "compose_fs.spv", "main", "fragment"),
     (
         "present_blit.slang",
         "present_blit_vs.spv",

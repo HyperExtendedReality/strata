@@ -1,3 +1,5 @@
+mod smoke;
+
 use strata_gpu::context::probe_capabilities;
 use strata_gpu::runner::ComputeRunner;
 use strata_gpu::uma::UmaManager;
@@ -18,6 +20,12 @@ fn main() {
         .unwrap_or_else(|| "selftest".to_string());
     match cmd.as_str() {
         "probe" => cmd_probe(),
+        "smoke" => {
+            if let Err(error) = smoke::command() {
+                eprintln!("[FAIL] {error}");
+                std::process::exit(1);
+            }
+        }
         "selftest" => cmd_selftest(),
         "gpu-test" => cmd_gpu_test(),
         "uma-test" => cmd_uma_test(),
@@ -45,7 +53,7 @@ fn main() {
         }
         "run" => {
             let path = std::env::args().nth(2).unwrap_or_else(|| {
-                eprintln!("Usage: strata-cli run <path-to-exe> [--unimplemented trap|zero|notimpl] [--mount D=C:/folder]... [--search-dir DIR] [--crash-log FILE]");
+                eprintln!("Usage: strata-cli run <path-to-exe> [--window] [--report FILE] [--capture FILE] [--capture-frame N] [--pipeline-cache FILE] [--no-prewarm|--cold-pipelines] [--unimplemented trap|zero|notimpl] [--mount D=C:/folder]... [--search-dir DIR] [--crash-log FILE]");
                 std::process::exit(1);
             });
             cmd_run(&path);
@@ -86,7 +94,7 @@ fn main() {
         }
         other => {
             eprintln!(
-                "Unknown command '{other}'. Usage: strata-cli [probe|selftest|gpu-test|uma-test|inspect|bind-check|map-test|run|warm|translate|census|shaders|replay|config]"
+                "Unknown command '{other}'. Usage: strata-cli [probe|smoke|selftest|gpu-test|uma-test|inspect|bind-check|map-test|run|warm|translate|census|shaders|replay|config]"
             );
             std::process::exit(1);
         }
@@ -173,54 +181,146 @@ fn cmd_shaders(path: &str, store_dir: Option<String>) {
 
 /// Inspect or diff deterministic `.scap` frame captures.
 fn cmd_replay() {
-    use strata_gpu::replay::{FrameCapture, diff_captures};
-    let sub = std::env::args().nth(2).unwrap_or_default();
+    if let Err(error) = replay_command() {
+        eprintln!("[FAIL] {error}");
+        std::process::exit(1);
+    }
+}
+
+fn replay_command() -> Result<(), String> {
+    use strata_gpu::replay::{ExecutableFrame, FrameCapture, diff_captures};
+    let mut args = std::env::args().skip(2);
+    let sub = args.next().unwrap_or_default();
+    let usage = "Usage: strata-cli replay inspect <capture> | diff <a> <b> | bisect <a> <b> | trace <capture> [out.json] | run <capture> [--out <rgba-file>]";
+    let path = args.next().ok_or(usage)?;
+    let read = |path: &str| -> Result<Vec<u8>, String> {
+        const LIMIT: u64 = 256 * 1024 * 1024;
+        let path = std::path::Path::new(path);
+        if path
+            .metadata()
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .len()
+            > LIMIT
+        {
+            return Err("capture exceeds 256 MiB".into());
+        }
+        std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
+    };
+    let trace = |bytes: &[u8]| {
+        FrameCapture::decode(bytes)
+            .or_else(|| ExecutableFrame::decode(bytes).map(|f| f.trace))
+            .ok_or_else(|| "invalid frame capture".to_string())
+    };
     match sub.as_str() {
         "inspect" => {
-            let file = std::env::args().nth(3).unwrap_or_else(|| {
-                eprintln!("Usage: strata-cli replay inspect <capture.scap>");
-                std::process::exit(1);
-            });
-            let bytes = std::fs::read(&file).unwrap_or_else(|e| {
-                eprintln!("Failed to read '{file}': {e}");
-                std::process::exit(1);
-            });
-            let cap = FrameCapture::decode(&bytes).unwrap_or_else(|| {
-                eprintln!("Invalid SCAP capture '{file}'");
-                std::process::exit(1);
-            });
+            let bytes = read(&path)?;
+            let cap = trace(&bytes)?;
             println!("Frame {}: {} recorded ops", cap.frame_index, cap.ops.len());
+            if let Some(frame) = ExecutableFrame::decode(&bytes) {
+                println!(
+                    "{} planes, {}x{} output ({:?})",
+                    frame.planes.len(),
+                    frame.output.width,
+                    frame.output.height,
+                    frame.output.format
+                );
+            }
             for (i, op) in cap.ops.iter().take(40).enumerate() {
                 println!("  [{i:>4}] {op:?}");
             }
         }
         "diff" => {
-            let (Some(a_path), Some(b_path)) = (std::env::args().nth(3), std::env::args().nth(4))
-            else {
-                eprintln!("Usage: strata-cli replay diff <a.scap> <b.scap>");
-                std::process::exit(1);
-            };
-            let a_bytes = std::fs::read(&a_path).unwrap_or_else(|e| {
-                eprintln!("Failed to read '{a_path}': {e}");
-                std::process::exit(1);
-            });
-            let b_bytes = std::fs::read(&b_path).unwrap_or_else(|e| {
-                eprintln!("Failed to read '{b_path}': {e}");
-                std::process::exit(1);
-            });
-            let a = FrameCapture::decode(&a_bytes).expect("invalid SCAP file A");
-            let b = FrameCapture::decode(&b_bytes).expect("invalid SCAP file B");
-            let d = diff_captures(&a, &b);
+            let other = args.next().ok_or(usage)?;
+            let a_bytes = read(&path)?;
+            let b_bytes = read(&other)?;
+            let d = diff_captures(&trace(&a_bytes)?, &trace(&b_bytes)?);
             println!(
                 "Capture diff: ops_a={}, ops_b={}, differing_ops={}, first_divergence={:?}",
                 d.ops_a, d.ops_b, d.differing_ops, d.first_divergence
             );
+            if let (Some(a), Some(b)) = (
+                ExecutableFrame::decode(&a_bytes),
+                ExecutableFrame::decode(&b_bytes),
+            ) {
+                if (a.output.width, a.output.height, a.output.format)
+                    == (b.output.width, b.output.height, b.output.format)
+                {
+                    let diff = strata_gpu::replay::diff_rgba8(&a.output.pixels, &b.output.pixels);
+                    println!(
+                        "Output diff: {} of {} pixels, max byte delta {}",
+                        diff.differing_pixels, diff.total_pixels, diff.max_channel_delta
+                    );
+                } else {
+                    println!("Output dimensions or formats differ");
+                }
+            }
         }
-        _ => {
-            eprintln!("Usage: strata-cli replay <inspect <a.scap> | diff <a.scap> <b.scap>>");
-            std::process::exit(1);
+        "bisect" => {
+            let other = args.next().ok_or(usage)?;
+            let a = trace(&read(&path)?)?;
+            let b = trace(&read(&other)?)?;
+            let rep = strata_gpu::replay::bisect_captures(&a, &b);
+            println!(
+                "Bisect: compared {} ops, first_divergence={:?}",
+                rep.ops_compared, rep.first_divergence_index
+            );
+            if let Some(idx) = rep.first_divergence_index {
+                println!("  [{idx}] left:  {:?}", rep.left_op);
+                println!("  [{idx}] right: {:?}", rep.right_op);
+            }
         }
+        "trace" => {
+            let cap = trace(&read(&path)?)?;
+            let json = strata_gpu::replay::export_chrome_trace(&cap);
+            if let Some(out_path) = args.next() {
+                std::fs::write(&out_path, &json)
+                    .map_err(|e| format!("failed to write {out_path}: {e}"))?;
+                println!(
+                    "Wrote Chrome Trace JSON ({} bytes) to {out_path}",
+                    json.len()
+                );
+            } else {
+                println!("{json}");
+            }
+        }
+        "run" => {
+            let out = match args.next().as_deref() {
+                None => None,
+                Some("--out") => Some(args.next().ok_or(usage)?),
+                _ => return Err(usage.into()),
+            };
+            let archive = ExecutableFrame::decode(&read(&path)?)
+                .ok_or("capture has no executable presentation data")?;
+            let runner = ComputeRunner::new().map_err(|e| e.to_string())?;
+            let result = archive.replay(&runner).map_err(|e| e.to_string())?;
+            println!(
+                "Replay: {:.2} ms composition and readback, differing pixels {}/{}, first divergent pixel {:?}, max byte delta {}",
+                result.compose_and_readback_ms,
+                result.diff.differing_pixels,
+                result.diff.total_pixels,
+                result.first_divergent_pixel,
+                result.diff.max_channel_delta
+            );
+            for (index, timing) in result.plane_timings.iter().enumerate() {
+                println!(
+                    "Plane {index}: {:.3} ms wall, GPU {}",
+                    timing.wall_ms,
+                    timing
+                        .gpu_ms
+                        .map_or_else(|| "unavailable".into(), |ms| format!("{ms:.3} ms"))
+                );
+            }
+            if let Some(out) = out {
+                strata_gpu::present::write_atomic(std::path::Path::new(&out), &result.pixels)
+                    .map_err(|e| e.to_string())?;
+            }
+            if result.diff.differing_pixels > 0 {
+                return Err("replay output differs from the captured frame".into());
+            }
+        }
+        _ => return Err(usage.into()),
     }
+    Ok(())
 }
 
 /// Print resolved `strata.toml` + `STRATA_*` configuration and policy status.
@@ -406,6 +506,7 @@ fn cmd_probe() {
             println!("64-bit BDA Pointers:   {}", caps.buffer_device_address);
             println!("Dynamic Rendering:     {}", caps.dynamic_rendering);
             println!("Bindless Indexing:     {}", caps.descriptor_indexing);
+            println!("Image Slots Per Kind:  {}", caps.image_slots);
             println!(
                 "Subgroup Size:         {} (min={}, max={}, native_wave64={})",
                 caps.subgroup_size,
@@ -1119,10 +1220,24 @@ fn cmd_run(path: &str) {
         ..Default::default()
     };
     let mut enable_window = false;
+    let mut prewarm = true;
+    let mut use_cache = true;
+    let mut cache_seed = None;
+    let mut capture = None;
+    let mut capture_frame = 1u64;
+    let mut report = None;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--window" {
             enable_window = true;
+            i += 1;
+            continue;
+        }
+        if args[i] == "--cold-pipelines" || args[i] == "--no-prewarm" {
+            prewarm = false;
+            if args[i] == "--cold-pipelines" {
+                use_cache = false;
+            }
             i += 1;
             continue;
         }
@@ -1148,6 +1263,15 @@ fn cmd_run(path: &str) {
             }
             "--search-dir" => opts.search_dir = Some(value.into()),
             "--crash-log" => opts.crash_reporter = Some(Some(value.into())),
+            "--report" => report = Some(std::path::PathBuf::from(value)),
+            "--pipeline-cache" => cache_seed = Some(std::path::PathBuf::from(value)),
+            "--capture" => capture = Some(std::path::PathBuf::from(value)),
+            "--capture-frame" => {
+                capture_frame = value.parse().ok().filter(|&n| n > 0).unwrap_or_else(|| {
+                    eprintln!("--capture-frame requires a positive frame number");
+                    std::process::exit(1);
+                })
+            }
             other => {
                 eprintln!("unknown option {other}");
                 std::process::exit(1);
@@ -1155,27 +1279,40 @@ fn cmd_run(path: &str) {
         }
         i += 2;
     }
-    if enable_window {
-        #[cfg(windows)]
-        if let Some(win) = strata_gpu::window::Win32Window::create("Strata", 1280, 720) {
-            struct SendWin(strata_gpu::window::Win32Window);
-            // SAFETY: Win32Window is owned exclusively inside the PresentX hook Mutex.
-            unsafe impl Send for SendWin {}
-            impl SendWin {
-                fn pump(&self) -> bool {
-                    self.0.pump_messages()
-                }
+    let capture_requested = capture.is_some();
+    if let Some(path) = capture {
+        enable_window = true;
+        strata_hle::frame_capture::arm(path, capture_frame);
+    }
+    let cache_dir = use_cache.then(|| {
+        strata_hle::config::StrataConfig::load()
+            .cache_dir
+            .join("pipelines")
+    });
+    if !use_cache && cache_seed.is_some() {
+        eprintln!("--pipeline-cache requires pipeline caching to be enabled");
+        std::process::exit(1);
+    }
+    strata_hle::pipeline_cache::configure(cache_dir, prewarm, cache_seed);
+    let metrics = std::sync::Arc::new(std::sync::Mutex::new((None, Vec::new())));
+    let start = std::time::Instant::now();
+    if report.is_some() {
+        let data = metrics.clone();
+        strata_hle::thunks::set_present_hook(move |_| {
+            let mut metrics = data.lock().unwrap();
+            let (_, shown) = strata_hle::thunks::frame_counts();
+            if shown as usize > metrics.1.len() {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                metrics.0.get_or_insert(ms);
+                metrics.1.push(ms);
             }
-            let win = SendWin(win);
-            println!(
-                "[INFO] Desktop Win32 window created (1280x720) with Slang present shaders (vs={} B, fs={} B) wired to PresentX",
-                strata_runtime_shaders::PRESENT_BLIT_VS_SPV.len(),
-                strata_runtime_shaders::PRESENT_BLIT_FS_SPV.len(),
-            );
-            strata_hle::thunks::set_present_hook(move |_frame_idx| {
-                let _ = win.pump();
-            });
-        }
+        });
+    }
+    if enable_window {
+        // The window opens on the title's first PresentX, sized to its back
+        // buffer; frames are blitted into a swapchain (Alt+Enter: fullscreen).
+        strata_hle::thunks::enable_window(true);
+        println!("[INFO] Presenting to a desktop window (opens on the first PresentX)");
     }
     let title =
         strata_hle::title::load_title(std::path::Path::new(path), &opts).unwrap_or_else(|e| {
@@ -1202,7 +1339,47 @@ fn cmd_run(path: &str) {
         "[INFO] Running {} (unimplemented imports: {:?})...",
         title.main.name, opts.unimplemented
     );
-    match title.run() {
+    let result = title.run();
+    let capture_error = if capture_requested {
+        match strata_hle::frame_capture::take_result() {
+            Some(Ok(_)) => None,
+            Some(Err(error)) => Some(error),
+            None => Some(format!("title did not capture frame {capture_frame}")),
+        }
+    } else {
+        None
+    };
+    strata_hle::pipeline_cache::flush();
+    if let Some(report_path) = report {
+        let (present_calls, frames_shown) = strata_hle::thunks::frame_counts();
+        let metrics = metrics.lock().unwrap();
+        let intervals: Vec<_> = metrics.1.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        let devices: Vec<_> = strata_hle::pipeline_cache::stats().into_iter().map(|device| {
+            let s = device.pipelines;
+            let uma = device.transfers;
+            serde_json::json!({"adapter": device.adapter, "driver_version_raw": device.driver_version,
+                "driver_cache_loaded": s.driver_cache_loaded, "prewarmed": s.prewarmed, "warmup_ms": s.warmup_ms,
+                "created_compute": s.created_compute, "created_graphics": s.created_graphics, "pipeline_stall_ms": s.creation_ms,
+                "upload_bytes": uma.upload_bytes, "readback_requested_bytes": uma.readback_requested_bytes,
+                "readback_bytes": uma.readback_bytes, "mirror_wait_ms": uma.sync_wait_ns as f64 / 1_000_000.0})
+        }).collect();
+        let data = serde_json::json!({"title": path, "status": if result.is_ok() && capture_error.is_none() { "finished" } else { "failed" },
+            "capture_error": capture_error,
+            "exit_code": result.as_ref().ok(), "title_error": result.as_ref().err().map(ToString::to_string),
+            "unimplemented_stub_calls": strata_hle::thunks::unimplemented_stub_call_count(),
+            "present_calls": present_calls, "frames_shown": frames_shown, "first_visible_frame_ms": metrics.0,
+            "frame_ms_p50": smoke::percentile(&intervals, 0.50), "frame_ms_p95": smoke::percentile(&intervals, 0.95),
+            "devices": devices});
+        if let Err(error) = smoke::write_report(Some(&report_path), &data) {
+            eprintln!("[FAIL] Run report: {error}");
+            std::process::exit(1);
+        }
+    }
+    if let Some(error) = capture_error {
+        eprintln!("[FAIL] Frame capture: {error}");
+        std::process::exit(1);
+    }
+    match result {
         Ok(exit_code) => {
             println!(
                 "[PASS] Title exited with code {exit_code} (unimplemented_stubs={}, audio_stubs={})",

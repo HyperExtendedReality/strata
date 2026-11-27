@@ -13,7 +13,9 @@
 use std::collections::HashMap;
 
 use crate::rdna2::{AtomicOp, CmpOp, CmpType};
-use crate::ssa::{ExportTarget, SsaModule, SsaOp, Stage, StageInput, Terminator, Ty, ValueId};
+use crate::ssa::{
+    ExportTarget, ImageDim, SsaModule, SsaOp, Stage, StageInput, Terminator, Ty, ValueId,
+};
 
 // SPIR-V header constants
 const SPIRV_MAGIC: u32 = 0x0723_0203;
@@ -138,6 +140,7 @@ const OP_GROUP_NON_UNIFORM_ANY: u16 = 335;
 const OP_GROUP_NON_UNIFORM_BROADCAST_FIRST: u16 = 338;
 const OP_GROUP_NON_UNIFORM_BALLOT: u16 = 339;
 const OP_GROUP_NON_UNIFORM_SHUFFLE: u16 = 345;
+const OP_GROUP_NON_UNIFORM_SHUFFLE_XOR: u16 = 346;
 const OP_GROUP_NON_UNIFORM_QUAD_BROADCAST: u16 = 365;
 const OP_GROUP_NON_UNIFORM_QUAD_SWAP: u16 = 366;
 
@@ -192,11 +195,98 @@ const IMG_OP_BIAS: u32 = 0x1;
 const IMG_OP_LOD: u32 = 0x2;
 
 /// Descriptor set 0 bindings images use (the runner's global layout).
+/// Each image class is its own binding (a SPIR-V image type fixes its
+/// dimensionality); a slot index means the same image in every class, and a
+/// slot is only ever read through the class its instruction names.
 pub const BINDING_TEXTURES: u32 = 0;
 pub const BINDING_SAMPLERS: u32 = 1;
 pub const BINDING_STORAGE_IMAGES: u32 = 2;
+pub const BINDING_TEXTURES_3D: u32 = 3;
+pub const BINDING_TEXTURES_CUBE: u32 = 4;
+pub const BINDING_TEXTURES_ARRAY: u32 = 5;
+pub const BINDING_STORAGE_3D: u32 = 6;
+pub const BINDING_STORAGE_ARRAY: u32 = 7;
+
+/// The sampled-image binding of an image class.
+pub fn texture_binding(dim: ImageDim) -> u32 {
+    match dim {
+        ImageDim::D2 => BINDING_TEXTURES,
+        ImageDim::D3 => BINDING_TEXTURES_3D,
+        ImageDim::Cube => BINDING_TEXTURES_CUBE,
+        ImageDim::D2Array => BINDING_TEXTURES_ARRAY,
+    }
+}
+
+/// The storage-image binding of an image class (cubes are written as arrays).
+pub fn storage_binding(dim: ImageDim) -> u32 {
+    match dim.for_storage() {
+        ImageDim::D3 => BINDING_STORAGE_3D,
+        ImageDim::D2Array | ImageDim::Cube => BINDING_STORAGE_ARRAY,
+        ImageDim::D2 => BINDING_STORAGE_IMAGES,
+    }
+}
+
+/// All image classes, in the order the emitter indexes them.
+pub const IMAGE_DIMS: [ImageDim; 4] = [
+    ImageDim::D2,
+    ImageDim::D3,
+    ImageDim::Cube,
+    ImageDim::D2Array,
+];
+
+fn dim_index(d: ImageDim) -> usize {
+    match d {
+        ImageDim::D2 => 0,
+        ImageDim::D3 => 1,
+        ImageDim::Cube => 2,
+        ImageDim::D2Array => 3,
+    }
+}
+
+/// `OpTypeImage` `Dim` and `Arrayed` operands of a class.
+fn spirv_dim(d: ImageDim) -> (u32, u32) {
+    match d {
+        ImageDim::D2 => (1, 0),
+        ImageDim::D3 => (2, 0),
+        ImageDim::Cube => (3, 0),
+        ImageDim::D2Array => (1, 1),
+    }
+}
 /// Array length of each binding.
 pub const IMAGE_ARRAY_LEN: u32 = crate::resource::MAX_IMAGE_SLOTS;
+
+const OP_MODULE_PROCESSED: u16 = 330;
+const IMAGE_SLOTS_TAG: &str = "strata-image-slots=";
+
+/// Descriptor-array capacity required by a Strata-translated module.
+pub fn required_image_slots(words: &[u32]) -> Option<u32> {
+    let mut rest = words.get(5..)?;
+    while let Some(&word) = rest.first() {
+        let len = (word >> 16) as usize;
+        if len == 0 {
+            return None;
+        }
+        let (inst, tail) = rest.split_at_checked(len)?;
+        if word as u16 == OP_FUNCTION {
+            break;
+        }
+        if word as u16 == OP_MODULE_PROCESSED {
+            let bytes: Vec<_> = inst[1..]
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .take_while(|&b| b != 0)
+                .collect();
+            if let Some(slots) = std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|s| s.strip_prefix(IMAGE_SLOTS_TAG))
+            {
+                return slots.parse().ok();
+            }
+        }
+        rest = tail;
+    }
+    None
+}
 
 // GLSL.std.450 opcodes
 const GLSL_ROUND_EVEN: u32 = 2;
@@ -225,8 +315,33 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     w.inst(OP_CAPABILITY, &[CAP_GROUP_NON_UNIFORM_QUAD]);
     w.inst(OP_CAPABILITY, &[CAP_IMAGE_QUERY]);
     w.inst(OP_CAPABILITY, &[CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES]);
-    let uses_textures = module.texture_slots > 0;
-    let uses_storage = module.storage_slots > 0;
+    // Which image classes the live code reads (sampled) and writes (storage).
+    let mut tex_dims = [false; 4];
+    let mut stor_dims = [false; 4];
+    for i in module
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| !i.dead)
+    {
+        match &i.op {
+            SsaOp::ImageSample { dim, .. }
+            | SsaOp::ImageSampleDref { dim, .. }
+            | SsaOp::ImageGather { dim, .. }
+            | SsaOp::ImageQuerySize { dim, .. }
+            | SsaOp::ImageFetch { dim, .. } => tex_dims[dim_index(*dim)] = true,
+            SsaOp::ImageStore { dim, .. } => stor_dims[dim_index(dim.for_storage())] = true,
+            _ => {}
+        }
+    }
+    let uses_textures = module.texture_slots > 0 || tex_dims.iter().any(|&b| b);
+    let uses_storage = module.storage_slots > 0 || stor_dims.iter().any(|&b| b);
+    if uses_textures && !tex_dims.iter().any(|&b| b) {
+        tex_dims[0] = true;
+    }
+    if uses_storage && !stor_dims.iter().any(|&b| b) {
+        stor_dims[0] = true;
+    }
     if uses_storage {
         w.inst(OP_CAPABILITY, &[CAP_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT]);
     }
@@ -286,9 +401,9 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
         None
     };
     let lds_var = if module.uses_lds { Some(w.id()) } else { None };
-    let tex_var = uses_textures.then(|| w.id());
+    let tex_vars: [Option<u32>; 4] = tex_dims.map(|u| u.then(|| w.id()));
     let samp_var = uses_textures.then(|| w.id());
-    let simg_var = uses_storage.then(|| w.id());
+    let simg_vars: [Option<u32>; 4] = stor_dims.map(|u| u.then(|| w.id()));
 
     let attr_vars: Vec<(u8, bool, u32)> = module
         .inputs
@@ -335,10 +450,11 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
         ep.push(v);
     }
     ep.extend(
-        tex_var
+        tex_vars
             .iter()
+            .flatten()
             .chain(samp_var.iter())
-            .chain(simg_var.iter())
+            .chain(simg_vars.iter().flatten())
             .copied(),
     );
     w.inst(OP_ENTRY_POINT, &ep);
@@ -365,6 +481,13 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
             }
         }
         Stage::Vertex => {}
+    }
+
+    let image_array_len = module.texture_slots.max(module.storage_slots).max(1);
+    if uses_textures || uses_storage {
+        let mut tag = Vec::new();
+        encode_str(&mut tag, &format!("{IMAGE_SLOTS_TAG}{image_array_len}"));
+        w.inst(OP_MODULE_PROCESSED, &tag);
     }
 
     // Types
@@ -416,21 +539,23 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     let t_bda_uvec4_field_ptr = w.id();
 
     let t_v2f = w.id();
+    let t_v3f = w.id();
     let t_v4f = w.id();
     let t_uv2 = w.id();
-    let t_img = w.id();
-    let t_simg = w.id();
+    // Per image class: image, sampled image, array, pointer to array, pointer.
+    let t_img: [u32; 4] = std::array::from_fn(|_| w.id());
+    let t_sampled: [u32; 4] = std::array::from_fn(|_| w.id());
+    let t_img_arr: [u32; 4] = std::array::from_fn(|_| w.id());
+    let t_ptr_img_arr: [u32; 4] = std::array::from_fn(|_| w.id());
+    let t_ptr_img: [u32; 4] = std::array::from_fn(|_| w.id());
+    let t_simg: [u32; 4] = std::array::from_fn(|_| w.id());
+    let t_simg_arr: [u32; 4] = std::array::from_fn(|_| w.id());
+    let t_ptr_simg_arr: [u32; 4] = std::array::from_fn(|_| w.id());
+    let t_ptr_simg: [u32; 4] = std::array::from_fn(|_| w.id());
     let t_sampler = w.id();
-    let t_sampled = w.id();
     let c_img_len = w.id();
-    let t_img_arr = w.id();
-    let t_simg_arr = w.id();
     let t_sampler_arr = w.id();
-    let t_ptr_img_arr = w.id();
-    let t_ptr_simg_arr = w.id();
     let t_ptr_sampler_arr = w.id();
-    let t_ptr_img = w.id();
-    let t_ptr_simg = w.id();
     let t_ptr_sampler = w.id();
 
     // Decorations
@@ -483,11 +608,19 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     w.inst(OP_MEMBER_DECORATE, &[t_bda_u32_struct, 0, DEC_OFFSET, 0]);
     w.inst(OP_DECORATE, &[t_bda_uvec4_struct, DEC_BLOCK]);
     w.inst(OP_MEMBER_DECORATE, &[t_bda_uvec4_struct, 0, DEC_OFFSET, 0]);
-    for (var, binding) in [
-        (tex_var, BINDING_TEXTURES),
-        (samp_var, BINDING_SAMPLERS),
-        (simg_var, BINDING_STORAGE_IMAGES),
-    ] {
+    let image_vars = IMAGE_DIMS
+        .iter()
+        .enumerate()
+        .map(|(i, &d)| (tex_vars[i], texture_binding(d)))
+        .chain(std::iter::once((samp_var, BINDING_SAMPLERS)))
+        .chain(
+            IMAGE_DIMS
+                .iter()
+                .enumerate()
+                .map(|(i, &d)| (simg_vars[i], storage_binding(d))),
+        )
+        .collect::<Vec<_>>();
+    for (var, binding) in image_vars {
         if let Some(v) = var {
             w.inst(OP_DECORATE, &[v, DEC_DESCRIPTOR_SET, 0]);
             w.inst(OP_DECORATE, &[v, DEC_BINDING, binding]);
@@ -575,30 +708,48 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     w.inst(OP_TYPE_POINTER, &[t_ptr_out_v4f, SC_OUTPUT, t_v4f]);
     w.inst(OP_TYPE_POINTER, &[t_ptr_out_f32, SC_OUTPUT, t_f32]);
     w.inst(OP_TYPE_VECTOR, &[t_uv2, t_u32, 2]);
+    w.inst(OP_TYPE_VECTOR, &[t_v3f, t_f32, 3]);
     if uses_textures || uses_storage {
-        // 2D float images; format Unknown (the view says what it is).
-        w.inst(OP_TYPE_IMAGE, &[t_img, t_f32, 1, 0, 0, 0, 1, 0]);
-        w.inst(OP_TYPE_IMAGE, &[t_simg, t_f32, 1, 0, 0, 0, 2, 0]);
+        // Float images of each class in use; format Unknown (the view says
+        // what it is).
+        w.inst(OP_CONSTANT, &[t_u32, c_img_len, image_array_len]);
+        for (i, &d) in IMAGE_DIMS.iter().enumerate() {
+            let (sdim, arrayed) = spirv_dim(d);
+            if tex_dims[i] {
+                w.inst(OP_TYPE_IMAGE, &[t_img[i], t_f32, sdim, 0, arrayed, 0, 1, 0]);
+                w.inst(OP_TYPE_SAMPLED_IMAGE, &[t_sampled[i], t_img[i]]);
+                w.inst(OP_TYPE_ARRAY, &[t_img_arr[i], t_img[i], c_img_len]);
+                w.inst(
+                    OP_TYPE_POINTER,
+                    &[t_ptr_img_arr[i], SC_UNIFORM_CONSTANT, t_img_arr[i]],
+                );
+                w.inst(
+                    OP_TYPE_POINTER,
+                    &[t_ptr_img[i], SC_UNIFORM_CONSTANT, t_img[i]],
+                );
+            }
+            if stor_dims[i] {
+                w.inst(
+                    OP_TYPE_IMAGE,
+                    &[t_simg[i], t_f32, sdim, 0, arrayed, 0, 2, 0],
+                );
+                w.inst(OP_TYPE_ARRAY, &[t_simg_arr[i], t_simg[i], c_img_len]);
+                w.inst(
+                    OP_TYPE_POINTER,
+                    &[t_ptr_simg_arr[i], SC_UNIFORM_CONSTANT, t_simg_arr[i]],
+                );
+                w.inst(
+                    OP_TYPE_POINTER,
+                    &[t_ptr_simg[i], SC_UNIFORM_CONSTANT, t_simg[i]],
+                );
+            }
+        }
         w.inst(OP_TYPE_SAMPLER, &[t_sampler]);
-        w.inst(OP_TYPE_SAMPLED_IMAGE, &[t_sampled, t_img]);
-        w.inst(OP_CONSTANT, &[t_u32, c_img_len, IMAGE_ARRAY_LEN]);
-        w.inst(OP_TYPE_ARRAY, &[t_img_arr, t_img, c_img_len]);
-        w.inst(OP_TYPE_ARRAY, &[t_simg_arr, t_simg, c_img_len]);
         w.inst(OP_TYPE_ARRAY, &[t_sampler_arr, t_sampler, c_img_len]);
-        w.inst(
-            OP_TYPE_POINTER,
-            &[t_ptr_img_arr, SC_UNIFORM_CONSTANT, t_img_arr],
-        );
-        w.inst(
-            OP_TYPE_POINTER,
-            &[t_ptr_simg_arr, SC_UNIFORM_CONSTANT, t_simg_arr],
-        );
         w.inst(
             OP_TYPE_POINTER,
             &[t_ptr_sampler_arr, SC_UNIFORM_CONSTANT, t_sampler_arr],
         );
-        w.inst(OP_TYPE_POINTER, &[t_ptr_img, SC_UNIFORM_CONSTANT, t_img]);
-        w.inst(OP_TYPE_POINTER, &[t_ptr_simg, SC_UNIFORM_CONSTANT, t_simg]);
         w.inst(
             OP_TYPE_POINTER,
             &[t_ptr_sampler, SC_UNIFORM_CONSTANT, t_sampler],
@@ -635,6 +786,9 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     let c_fzero = w.id();
     w.inst(OP_CONSTANT, &[t_f32, c_fzero, 0.0f32.to_bits()]);
     const_f32.insert(0.0f32.to_bits(), c_fzero);
+    let c_finf = w.id();
+    w.inst(OP_CONSTANT, &[t_f32, c_finf, f32::INFINITY.to_bits()]);
+    const_f32.insert(f32::INFINITY.to_bits(), c_finf);
 
     let c_fone = w.id();
     w.inst(OP_CONSTANT, &[t_f32, c_fone, 1.0f32.to_bits()]);
@@ -717,6 +871,21 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
             }
         }
     }
+    // Constants the image coordinate builders use (cube face decoding).
+    for val in [4u32, 7] {
+        const_u32.entry(val).or_insert_with(|| {
+            let id = w.id();
+            w.inst(OP_CONSTANT, &[t_u32, id, val]);
+            id
+        });
+    }
+    for val in [1.5f32, 2.0, -1.0] {
+        const_f32.entry(val.to_bits()).or_insert_with(|| {
+            let id = w.id();
+            w.inst(OP_CONSTANT, &[t_f32, id, val.to_bits()]);
+            id
+        });
+    }
     if needs_bvh_offsets {
         for off in (16u64..112).step_by(4) {
             const_u64.entry(off).or_insert_with(|| {
@@ -767,15 +936,41 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     if let Some(v) = lds_var {
         w.inst(OP_VARIABLE, &[t_ptr_wg_lds_arr, v, SC_WORKGROUP]);
     }
-    if let Some(v) = tex_var {
-        w.inst(OP_VARIABLE, &[t_ptr_img_arr, v, SC_UNIFORM_CONSTANT]);
+    for i in 0..4 {
+        if let Some(v) = tex_vars[i] {
+            w.inst(OP_VARIABLE, &[t_ptr_img_arr[i], v, SC_UNIFORM_CONSTANT]);
+        }
     }
     if let Some(v) = samp_var {
         w.inst(OP_VARIABLE, &[t_ptr_sampler_arr, v, SC_UNIFORM_CONSTANT]);
     }
-    if let Some(v) = simg_var {
-        w.inst(OP_VARIABLE, &[t_ptr_simg_arr, v, SC_UNIFORM_CONSTANT]);
+    for i in 0..4 {
+        if let Some(v) = simg_vars[i] {
+            w.inst(OP_VARIABLE, &[t_ptr_simg_arr[i], v, SC_UNIFORM_CONSTANT]);
+        }
     }
+
+    let img_ids = ImgIds {
+        t_img,
+        t_ptr_img,
+        t_sampled,
+        tex_vars,
+        t_sampler,
+        t_ptr_sampler,
+        samp_var,
+    };
+    let cube_ids = CoordIds {
+        t_f32,
+        t_u32,
+        t_bool,
+        t_v2f,
+        t_v3f,
+        c_half3: const_f32[&1.5f32.to_bits()],
+        c_ftwo: const_f32[&2.0f32.to_bits()],
+        c_fone,
+        c_fmone: const_f32[&(-1.0f32).to_bits()],
+        c_u: [0u32, 1, 2, 3, 4, 5, 7].map(|k| const_u32[&k]),
+    };
 
     // Function body with multi-block labels
     w.inst(OP_FUNCTION, &[t_void, main_fn, 0, t_fn]);
@@ -1323,33 +1518,21 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                 }
                 SsaOp::ImageSample {
                     slot,
+                    dim,
                     u,
                     v,
+                    w: wc,
                     lod,
                     bias,
                     implicit,
                 } => {
-                    let pi = w.id();
-                    w.inst(
-                        OP_ACCESS_CHAIN,
-                        &[t_ptr_img, pi, tex_var.unwrap(), const_u32[slot]],
-                    );
-                    let img = w.id();
-                    w.inst(OP_LOAD, &[t_img, img, pi]);
-                    let ps = w.id();
-                    w.inst(
-                        OP_ACCESS_CHAIN,
-                        &[t_ptr_sampler, ps, samp_var.unwrap(), const_u32[slot]],
-                    );
-                    let smp = w.id();
-                    w.inst(OP_LOAD, &[t_sampler, smp, ps]);
-                    let si = w.id();
-                    w.inst(OP_SAMPLED_IMAGE, &[t_sampled, si, img, smp]);
-                    let uv = w.id();
-                    w.inst(OP_COMPOSITE_CONSTRUCT, &[t_v2f, uv, val_map[u], val_map[v]]);
+                    let di = dim_index(*dim);
+                    let si = sampled_image(&mut w, &img_ids, di, *slot, &const_u32);
+                    let coord =
+                        sample_coord(&mut w, &cube_ids, *dim, val_map[u], val_map[v], val_map[wc]);
                     let texel = w.id();
                     if *implicit {
-                        let mut ops = vec![t_v4f, texel, si, uv];
+                        let mut ops = vec![t_v4f, texel, si, coord];
                         if let Some(b) = bias {
                             ops.extend([IMG_OP_BIAS, val_map[b]]);
                         }
@@ -1367,7 +1550,7 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                         };
                         w.inst(
                             OP_IMAGE_SAMPLE_EXPLICIT_LOD,
-                            &[t_v4f, texel, si, uv, IMG_OP_LOD, lod_id],
+                            &[t_v4f, texel, si, coord, IMG_OP_LOD, lod_id],
                         );
                     }
                     let res = w.id();
@@ -1376,94 +1559,89 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                 }
                 SsaOp::ImageSampleDref {
                     slot,
+                    dim,
                     u,
                     v,
+                    w: wc,
                     dref,
                     lod,
                     implicit,
                 } => {
-                    let pi = w.id();
-                    w.inst(
-                        OP_ACCESS_CHAIN,
-                        &[t_ptr_img, pi, tex_var.unwrap(), const_u32[slot]],
-                    );
-                    let img = w.id();
-                    w.inst(OP_LOAD, &[t_img, img, pi]);
-                    let ps = w.id();
-                    w.inst(
-                        OP_ACCESS_CHAIN,
-                        &[t_ptr_sampler, ps, samp_var.unwrap(), const_u32[slot]],
-                    );
-                    let smp = w.id();
-                    w.inst(OP_LOAD, &[t_sampler, smp, ps]);
-                    let si = w.id();
-                    w.inst(OP_SAMPLED_IMAGE, &[t_sampled, si, img, smp]);
-                    let uv = w.id();
-                    w.inst(OP_COMPOSITE_CONSTRUCT, &[t_v2f, uv, val_map[u], val_map[v]]);
+                    let di = dim_index(*dim);
+                    let si = sampled_image(&mut w, &img_ids, di, *slot, &const_u32);
+                    let coord =
+                        sample_coord(&mut w, &cube_ids, *dim, val_map[u], val_map[v], val_map[wc]);
                     let res = w.id();
                     if *implicit {
                         w.inst(
                             OP_IMAGE_SAMPLE_DREF_IMPLICIT_LOD,
-                            &[t_f32, res, si, uv, val_map[dref]],
+                            &[t_f32, res, si, coord, val_map[dref]],
                         );
                     } else {
                         let lod_id = lod.map_or(c_fzero, |l| val_map[&l]);
                         w.inst(
                             OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD,
-                            &[t_f32, res, si, uv, val_map[dref], IMG_OP_LOD, lod_id],
+                            &[t_f32, res, si, coord, val_map[dref], IMG_OP_LOD, lod_id],
                         );
                     }
                     val_map.insert(inst.id, res);
                 }
-                SsaOp::ImageGather { slot, u, v, comp } => {
-                    let pi = w.id();
-                    w.inst(
-                        OP_ACCESS_CHAIN,
-                        &[t_ptr_img, pi, tex_var.unwrap(), const_u32[slot]],
-                    );
-                    let img = w.id();
-                    w.inst(OP_LOAD, &[t_img, img, pi]);
-                    let ps = w.id();
-                    w.inst(
-                        OP_ACCESS_CHAIN,
-                        &[t_ptr_sampler, ps, samp_var.unwrap(), const_u32[slot]],
-                    );
-                    let smp = w.id();
-                    w.inst(OP_LOAD, &[t_sampler, smp, ps]);
-                    let si = w.id();
-                    w.inst(OP_SAMPLED_IMAGE, &[t_sampled, si, img, smp]);
-                    let uv = w.id();
-                    w.inst(OP_COMPOSITE_CONSTRUCT, &[t_v2f, uv, val_map[u], val_map[v]]);
+                SsaOp::ImageGather {
+                    slot,
+                    dim,
+                    u,
+                    v,
+                    w: wc,
+                    comp,
+                } => {
+                    let di = dim_index(*dim);
+                    let si = sampled_image(&mut w, &img_ids, di, *slot, &const_u32);
+                    let coord =
+                        sample_coord(&mut w, &cube_ids, *dim, val_map[u], val_map[v], val_map[wc]);
                     let texel = w.id();
-                    w.inst(OP_IMAGE_GATHER, &[t_v4f, texel, si, uv, const_u32[comp]]);
+                    w.inst(OP_IMAGE_GATHER, &[t_v4f, texel, si, coord, const_u32[comp]]);
                     let res = w.id();
                     w.inst(OP_BITCAST, &[t_uvec4, res, texel]);
                     val_map.insert(inst.id, res);
                 }
-                SsaOp::ImageQuerySize { slot, lod } => {
+                SsaOp::ImageQuerySize { slot, dim, lod } => {
+                    let di = dim_index(*dim);
                     let pi = w.id();
                     w.inst(
                         OP_ACCESS_CHAIN,
-                        &[t_ptr_img, pi, tex_var.unwrap(), const_u32[slot]],
+                        &[t_ptr_img[di], pi, tex_vars[di].unwrap(), const_u32[slot]],
                     );
                     let img = w.id();
-                    w.inst(OP_LOAD, &[t_img, img, pi]);
-                    let sz2 = w.id();
-                    w.inst(OP_IMAGE_QUERY_SIZE_LOD, &[t_uv2, sz2, img, val_map[lod]]);
-                    let sx = w.id();
-                    let sy = w.id();
-                    w.inst(OP_COMPOSITE_EXTRACT, &[t_u32, sx, sz2, 0]);
-                    w.inst(OP_COMPOSITE_EXTRACT, &[t_u32, sy, sz2, 1]);
+                    w.inst(OP_LOAD, &[t_img[di], img, pi]);
                     let res = w.id();
-                    w.inst(
-                        OP_COMPOSITE_CONSTRUCT,
-                        &[t_uvec4, res, sx, sy, c_one, c_one],
-                    );
+                    if matches!(dim, ImageDim::D3 | ImageDim::D2Array) {
+                        let sz = w.id();
+                        w.inst(OP_IMAGE_QUERY_SIZE_LOD, &[t_uvec3, sz, img, val_map[lod]]);
+                        let (sx, sy, sz3) = (w.id(), w.id(), w.id());
+                        w.inst(OP_COMPOSITE_EXTRACT, &[t_u32, sx, sz, 0]);
+                        w.inst(OP_COMPOSITE_EXTRACT, &[t_u32, sy, sz, 1]);
+                        w.inst(OP_COMPOSITE_EXTRACT, &[t_u32, sz3, sz, 2]);
+                        w.inst(OP_COMPOSITE_CONSTRUCT, &[t_uvec4, res, sx, sy, sz3, c_one]);
+                    } else {
+                        let sz2 = w.id();
+                        w.inst(OP_IMAGE_QUERY_SIZE_LOD, &[t_uv2, sz2, img, val_map[lod]]);
+                        let sx = w.id();
+                        let sy = w.id();
+                        w.inst(OP_COMPOSITE_EXTRACT, &[t_u32, sx, sz2, 0]);
+                        w.inst(OP_COMPOSITE_EXTRACT, &[t_u32, sy, sz2, 1]);
+                        w.inst(
+                            OP_COMPOSITE_CONSTRUCT,
+                            &[t_uvec4, res, sx, sy, c_one, c_one],
+                        );
+                    }
                     val_map.insert(inst.id, res);
                 }
                 SsaOp::BdaAtomic { op, addr, val, cmp } => {
                     let ptr_struct = w.id();
-                    w.inst(OP_CONVERT_U_TO_PTR, &[t_bda_u32_ptr, ptr_struct, val_map[addr]]);
+                    w.inst(
+                        OP_CONVERT_U_TO_PTR,
+                        &[t_bda_u32_ptr, ptr_struct, val_map[addr]],
+                    );
                     let ptr_field = w.id();
                     w.inst(
                         OP_ACCESS_CHAIN,
@@ -1474,7 +1652,16 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                         let cmp_id = cmp.map_or(c_zero, |c| val_map[&c]);
                         w.inst(
                             OP_ATOMIC_COMPARE_EXCHANGE,
-                            &[t_u32, res, ptr_field, c_one, c_zero, c_zero, val_map[val], cmp_id],
+                            &[
+                                t_u32,
+                                res,
+                                ptr_field,
+                                c_one,
+                                c_zero,
+                                c_zero,
+                                val_map[val],
+                                cmp_id,
+                            ],
                         );
                     } else {
                         let spv_op = match op {
@@ -1505,16 +1692,31 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                     );
                     val_map.insert(inst.id, res);
                 }
-                SsaOp::ImageFetch { slot, x, y, lod } => {
+                SsaOp::ImageFetch {
+                    slot,
+                    dim,
+                    x,
+                    y,
+                    z,
+                    lod,
+                } => {
+                    let di = dim_index(*dim);
                     let pi = w.id();
                     w.inst(
                         OP_ACCESS_CHAIN,
-                        &[t_ptr_img, pi, tex_var.unwrap(), const_u32[slot]],
+                        &[t_ptr_img[di], pi, tex_vars[di].unwrap(), const_u32[slot]],
                     );
                     let img = w.id();
-                    w.inst(OP_LOAD, &[t_img, img, pi]);
+                    w.inst(OP_LOAD, &[t_img[di], img, pi]);
                     let xy = w.id();
-                    w.inst(OP_COMPOSITE_CONSTRUCT, &[t_uv2, xy, val_map[x], val_map[y]]);
+                    if *dim == ImageDim::D2 {
+                        w.inst(OP_COMPOSITE_CONSTRUCT, &[t_uv2, xy, val_map[x], val_map[y]]);
+                    } else {
+                        w.inst(
+                            OP_COMPOSITE_CONSTRUCT,
+                            &[t_uvec3, xy, val_map[x], val_map[y], val_map[z]],
+                        );
+                    }
                     let texel = w.id();
                     let lod_id = lod.map_or(c_zero, |l| val_map[&l]);
                     w.inst(OP_IMAGE_FETCH, &[t_v4f, texel, img, xy, IMG_OP_LOD, lod_id]);
@@ -1522,16 +1724,31 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                     w.inst(OP_BITCAST, &[t_uvec4, res, texel]);
                     val_map.insert(inst.id, res);
                 }
-                SsaOp::ImageStore { slot, x, y, values } => {
+                SsaOp::ImageStore {
+                    slot,
+                    dim,
+                    x,
+                    y,
+                    z,
+                    values,
+                } => {
+                    let di = dim_index(dim.for_storage());
                     let pi = w.id();
                     w.inst(
                         OP_ACCESS_CHAIN,
-                        &[t_ptr_simg, pi, simg_var.unwrap(), const_u32[slot]],
+                        &[t_ptr_simg[di], pi, simg_vars[di].unwrap(), const_u32[slot]],
                     );
                     let img = w.id();
-                    w.inst(OP_LOAD, &[t_simg, img, pi]);
+                    w.inst(OP_LOAD, &[t_simg[di], img, pi]);
                     let xy = w.id();
-                    w.inst(OP_COMPOSITE_CONSTRUCT, &[t_uv2, xy, val_map[x], val_map[y]]);
+                    if dim.for_storage() == ImageDim::D2 {
+                        w.inst(OP_COMPOSITE_CONSTRUCT, &[t_uv2, xy, val_map[x], val_map[y]]);
+                    } else {
+                        w.inst(
+                            OP_COMPOSITE_CONSTRUCT,
+                            &[t_uvec3, xy, val_map[x], val_map[y], val_map[z]],
+                        );
+                    }
                     let bits = w.id();
                     w.inst(
                         OP_COMPOSITE_CONSTRUCT,
@@ -1740,6 +1957,7 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                     );
 
                     let mut out_ids = [0u32; 4];
+                    let mut out_dists = [0u32; 4];
                     for child in 0..4u32 {
                         let cid = w.id();
                         w.inst(OP_COMPOSITE_EXTRACT, &[t_u32, cid, children_vec, child]);
@@ -1815,13 +2033,73 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                         w.inst(OP_LOGICAL_AND, &[t_bool, hit, valid, slab_hit]);
                         let res_id = w.id();
                         w.inst(OP_SELECT, &[t_u32, res_id, hit, cid, c_invalid_node]);
+                        let res_dist = w.id();
+                        w.inst(OP_SELECT, &[t_f32, res_dist, hit, tmin, c_finf]);
                         out_ids[child as usize] = res_id;
+                        out_dists[child as usize] = res_dist;
+                    }
+                    // 5-comparator sorting network (nearest hit first):
+                    // (0,2), (1,3), (0,1), (2,3), (1,2)
+                    for (a, b) in [(0usize, 2usize), (1, 3), (0, 1), (2, 3), (1, 2)] {
+                        let swap = w.id();
+                        w.inst(
+                            OP_F_ORD_LESS_THAN,
+                            &[t_bool, swap, out_dists[b], out_dists[a]],
+                        );
+                        let min_d = w.id();
+                        w.inst(OP_SELECT, &[t_f32, min_d, swap, out_dists[b], out_dists[a]]);
+                        let max_d = w.id();
+                        w.inst(OP_SELECT, &[t_f32, max_d, swap, out_dists[a], out_dists[b]]);
+                        let min_id = w.id();
+                        w.inst(OP_SELECT, &[t_u32, min_id, swap, out_ids[b], out_ids[a]]);
+                        let max_id = w.id();
+                        w.inst(OP_SELECT, &[t_u32, max_id, swap, out_ids[a], out_ids[b]]);
+                        out_dists[a] = min_d;
+                        out_dists[b] = max_d;
+                        out_ids[a] = min_id;
+                        out_ids[b] = max_id;
                     }
                     let res = w.id();
                     w.inst(
                         OP_COMPOSITE_CONSTRUCT,
                         &[t_uvec4, res, out_ids[0], out_ids[1], out_ids[2], out_ids[3]],
                     );
+                    val_map.insert(inst.id, res);
+                }
+                SsaOp::WavePermute { op, value, aux } => {
+                    use crate::wave_ops::LanePermuteOp;
+                    let v = val_map[value];
+                    let res = w.id();
+                    match op {
+                        LanePermuteOp::ReadFirstLane => {
+                            w.inst(
+                                OP_GROUP_NON_UNIFORM_BROADCAST_FIRST,
+                                &[t_u32, res, c_scope_subgroup, v],
+                            );
+                        }
+                        LanePermuteOp::ReadLane { lane } => {
+                            let l = const_u32.get(lane).copied().unwrap_or(c_zero);
+                            w.inst(
+                                OP_GROUP_NON_UNIFORM_SHUFFLE,
+                                &[t_u32, res, c_scope_subgroup, v, l],
+                            );
+                        }
+                        LanePermuteOp::DsSwizzle { offset16 } => {
+                            let xor_mask = u32::from((offset16 >> 10) & 0x1F);
+                            let m = const_u32.get(&xor_mask).copied().unwrap_or(c_zero);
+                            w.inst(
+                                OP_GROUP_NON_UNIFORM_SHUFFLE_XOR,
+                                &[t_u32, res, c_scope_subgroup, v, m],
+                            );
+                        }
+                        _ => {
+                            let lane_id = aux.map_or(c_zero, |a| val_map[&a]);
+                            w.inst(
+                                OP_GROUP_NON_UNIFORM_SHUFFLE,
+                                &[t_u32, res, c_scope_subgroup, v, lane_id],
+                            );
+                        }
+                    }
                     val_map.insert(inst.id, res);
                 }
                 SsaOp::SpillLoad { slot } => {
@@ -1940,6 +2218,140 @@ fn block_order(module: &SsaModule) -> Vec<usize> {
     post.reverse();
     post.extend((0..n).filter(|&b| !seen[b]));
     post
+}
+
+/// Type and variable ids the sampled-image accesses need.
+struct ImgIds {
+    t_img: [u32; 4],
+    t_ptr_img: [u32; 4],
+    t_sampled: [u32; 4],
+    tex_vars: [Option<u32>; 4],
+    t_sampler: u32,
+    t_ptr_sampler: u32,
+    samp_var: Option<u32>,
+}
+
+/// `textures*[slot]` of class `di` combined with `samplers[slot]`.
+fn sampled_image(
+    w: &mut Writer,
+    ids: &ImgIds,
+    di: usize,
+    slot: u32,
+    const_u32: &HashMap<u32, u32>,
+) -> u32 {
+    let pi = w.id();
+    w.inst(
+        OP_ACCESS_CHAIN,
+        &[
+            ids.t_ptr_img[di],
+            pi,
+            ids.tex_vars[di].unwrap(),
+            const_u32[&slot],
+        ],
+    );
+    let img = w.id();
+    w.inst(OP_LOAD, &[ids.t_img[di], img, pi]);
+    let ps = w.id();
+    w.inst(
+        OP_ACCESS_CHAIN,
+        &[
+            ids.t_ptr_sampler,
+            ps,
+            ids.samp_var.unwrap(),
+            const_u32[&slot],
+        ],
+    );
+    let smp = w.id();
+    w.inst(OP_LOAD, &[ids.t_sampler, smp, ps]);
+    let si = w.id();
+    w.inst(OP_SAMPLED_IMAGE, &[ids.t_sampled[di], si, img, smp]);
+    si
+}
+
+/// Types and constants the coordinate builders use.
+struct CoordIds {
+    t_f32: u32,
+    t_u32: u32,
+    t_bool: u32,
+    t_v2f: u32,
+    t_v3f: u32,
+    c_half3: u32,
+    c_ftwo: u32,
+    c_fone: u32,
+    c_fmone: u32,
+    /// u32 constants 0, 1, 2, 3, 4, 5 and 7.
+    c_u: [u32; 7],
+}
+
+/// The coordinate vector a sample of class `dim` takes from `(u, v, w)`.
+///
+/// A cube address on RDNA2 is face-relative: `s, t` in `[1, 2]` (the
+/// `v_cubesc / |v_cubema| + 1.5` convention: `v_cubema` returns twice the
+/// major axis) and the face id. SPIR-V samples cubes by direction, so the
+/// direction is rebuilt from the face's (sc, tc, ma) assignment:
+/// +X (-z, -y), -X (+z, -y), +Y (+x, +z), -Y (+x, -z), +Z (+x, -y), -Z (-x, -y).
+fn sample_coord(w: &mut Writer, c: &CoordIds, dim: ImageDim, u: u32, v: u32, wc: u32) -> u32 {
+    match dim {
+        ImageDim::D2 => {
+            let uv = w.id();
+            w.inst(OP_COMPOSITE_CONSTRUCT, &[c.t_v2f, uv, u, v]);
+            uv
+        }
+        ImageDim::D3 | ImageDim::D2Array => {
+            let uvw = w.id();
+            w.inst(OP_COMPOSITE_CONSTRUCT, &[c.t_v3f, uvw, u, v, wc]);
+            uvw
+        }
+        ImageDim::Cube => {
+            let unbias = |w: &mut Writer, x: u32| {
+                let d = w.id();
+                w.inst(OP_F_SUB, &[c.t_f32, d, x, c.c_half3]);
+                let m = w.id();
+                w.inst(OP_F_MUL, &[c.t_f32, m, d, c.c_ftwo]);
+                m
+            };
+            let a = unbias(w, u);
+            let b = unbias(w, v);
+            let neg = |w: &mut Writer, x: u32| {
+                let n = w.id();
+                w.inst(OP_F_MUL, &[c.t_f32, n, x, c.c_fmone]);
+                n
+            };
+            let na = neg(w, a);
+            let nb = neg(w, b);
+            let fi = w.id();
+            w.inst(OP_CONVERT_F_TO_U, &[c.t_u32, fi, wc]);
+            let face = w.id();
+            w.inst(OP_BITWISE_AND, &[c.t_u32, face, fi, c.c_u[6]]);
+            let is = |w: &mut Writer, k: usize| {
+                let e = w.id();
+                w.inst(OP_I_EQUAL, &[c.t_bool, e, face, c.c_u[k]]);
+                e
+            };
+            let f: [u32; 6] = std::array::from_fn(|k| is(w, k));
+            let sel = |w: &mut Writer, cond: u32, t: u32, e: u32| {
+                let r = w.id();
+                w.inst(OP_SELECT, &[c.t_f32, r, cond, t, e]);
+                r
+            };
+            // x: +X 1, -X -1, -Z -a, else a.
+            let x = sel(w, f[5], na, a);
+            let x = sel(w, f[1], c.c_fmone, x);
+            let x = sel(w, f[0], c.c_fone, x);
+            // y: +Y 1, -Y -1, else -b.
+            let y = sel(w, f[3], c.c_fmone, nb);
+            let y = sel(w, f[2], c.c_fone, y);
+            // z: +X -a, -X a, +Y b, -Y -b, +Z 1, -Z -1.
+            let z = sel(w, f[4], c.c_fone, c.c_fmone);
+            let z = sel(w, f[3], nb, z);
+            let z = sel(w, f[2], b, z);
+            let z = sel(w, f[1], a, z);
+            let z = sel(w, f[0], na, z);
+            let dir = w.id();
+            w.inst(OP_COMPOSITE_CONSTRUCT, &[c.t_v3f, dir, x, y, z]);
+            dir
+        }
+    }
 }
 
 struct Writer {

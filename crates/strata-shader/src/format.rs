@@ -1,10 +1,10 @@
 //! The GFX10 unified data-format enumeration (RDNA2 `IMG_FORMAT` /
-//! `BUF_FMT`), as the public RDNA2 ISA documentation lists it, for the
-//! formats whose components are whole bits of 8, 16 or 32.
+//! `BUF_FMT`), as the public RDNA2 ISA documentation lists it.
 //!
-//! Packed formats (`10_11_11`, `11_11_10`, `10_10_10_2`, `2_10_10_10`),
-//! block-compressed and sRGB formats are not in the table: callers get
-//! `None` and must refuse them explicitly rather than read garbage.
+//! Regular whole-byte formats (8/16/32-bit components) are decoded by
+//! [`gfx10_format`]. Packed 32-bit and 16-bit formats (`10_11_11`, `11_11_10`,
+//! `10_10_10_2`, `2_10_10_10`, `5_9_9_9`, `5_6_5`, `1_5_5_5`, `4_4_4_4`) are
+//! decoded by [`gfx10_packed_format`].
 
 /// How a component's bits are read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -70,7 +70,7 @@ const RUNS: &[(u16, u8, u8, &[NumFormat])] = &[
     (14, 2, 8, &NUMS6),           // 8_8
     (20, 1, 32, &NUMS_INT_FLOAT), // 32
     (23, 2, 16, &NUMS7),          // 16_16
-    // 30..=55: packed 10/11-bit formats, not supported.
+    // 30..=55: packed 10/11-bit formats (handled by `gfx10_packed_format`).
     (56, 4, 8, &NUMS6),           // 8_8_8_8
     (62, 2, 32, &NUMS_INT_FLOAT), // 32_32
     (65, 4, 16, &NUMS7),          // 16_16_16_16
@@ -91,30 +91,53 @@ pub fn gfx10_format(code: u16) -> Option<FormatInfo> {
     })
 }
 
-/// Packed 32-bit GFX10 data formats (`10_11_11`, `11_11_10`, `10_10_10_2`, `2_10_10_10`).
+/// Packed 16-bit and 32-bit GFX10 data formats (`10_11_11`, `11_11_10`,
+/// `10_10_10_2`, `2_10_10_10`, `5_9_9_9`, `5_6_5`, `1_5_5_5`, `4_4_4_4`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PackedFormat {
     F10_11_11,
     F11_11_10,
     Unorm10_10_10_2,
+    Snorm10_10_10_2,
     Uint10_10_10_2,
+    Sint10_10_10_2,
     Unorm2_10_10_10,
     Snorm2_10_10_10,
     Uint2_10_10_10,
     Sint2_10_10_10,
+    F5_9_9_9,
+    Unorm5_6_5,
+    Unorm1_5_5_5,
+    Unorm4_4_4_4,
 }
 
-/// Decode GFX10 packed 10/11-bit format codes (`30..=55`).
+impl PackedFormat {
+    /// Bytes per packed element (2 for 16-bit packed formats, 4 for 32-bit).
+    pub const fn bytes_per_element(self) -> usize {
+        match self {
+            Self::Unorm5_6_5 | Self::Unorm1_5_5_5 | Self::Unorm4_4_4_4 => 2,
+            _ => 4,
+        }
+    }
+}
+
+/// Decode GFX10 packed format codes (`30..=55` and `79..=82`).
 pub fn gfx10_packed_format(code: u16) -> Option<PackedFormat> {
     match code {
         36 => Some(PackedFormat::F10_11_11),
         43 => Some(PackedFormat::F11_11_10),
         44 => Some(PackedFormat::Unorm10_10_10_2),
+        45 => Some(PackedFormat::Snorm10_10_10_2),
         48 => Some(PackedFormat::Uint10_10_10_2),
+        49 => Some(PackedFormat::Sint10_10_10_2),
         50 => Some(PackedFormat::Unorm2_10_10_10),
         51 => Some(PackedFormat::Snorm2_10_10_10),
         54 => Some(PackedFormat::Uint2_10_10_10),
         55 => Some(PackedFormat::Sint2_10_10_10),
+        79 => Some(PackedFormat::Unorm5_6_5),
+        80 => Some(PackedFormat::Unorm1_5_5_5),
+        81 => Some(PackedFormat::F5_9_9_9),
+        82 => Some(PackedFormat::Unorm4_4_4_4),
         _ => None,
     }
 }

@@ -6,6 +6,7 @@
 //! - [`xma`]: XMA / XMA2 packet parser and frame-level audio decoder.
 
 pub mod bcpack;
+pub mod opus;
 pub mod sgd5;
 pub mod texture;
 pub mod xma;

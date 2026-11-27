@@ -150,6 +150,157 @@ impl TextureAheadQueue {
     }
 }
 
+/// Dedicated background texture-heap worker (inspired by `VIctory-Fast`'s
+/// `heap_worker.rs`): drains [`TextureAheadQueue`] off title recording threads
+/// while allowing urgent material/bake uploads to bypass the queue.
+pub struct HeapTextureWorker {
+    queue: Arc<TextureAheadQueue>,
+    processed: Arc<std::sync::atomic::AtomicU64>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl HeapTextureWorker {
+    pub fn spawn<F>(queue: Arc<TextureAheadQueue>, on_upload: F) -> Self
+    where
+        F: Fn(&TextureUploadTicket) + Send + 'static,
+    {
+        let processed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let q = Arc::clone(&queue);
+        let p = Arc::clone(&processed);
+        let s = Arc::clone(&shutdown);
+        let handle = thread::Builder::new()
+            .name("strata-heap-worker".into())
+            .spawn(move || {
+                while !s.load(std::sync::atomic::Ordering::Acquire) {
+                    let batch = q.drain_ready(16);
+                    if batch.is_empty() {
+                        thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    for ticket in &batch {
+                        on_upload(ticket);
+                        p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            })
+            .ok();
+        Self {
+            queue,
+            processed,
+            shutdown,
+            handle,
+        }
+    }
+
+    pub fn enqueue(&self, ticket: TextureUploadTicket) {
+        self.queue.enqueue(ticket);
+    }
+
+    pub fn processed_count(&self) -> u64 {
+        self.processed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for HeapTextureWorker {
+    fn drop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Asynchronous background PSO compiler queue: lets title threads enqueue
+/// SPIR-V shader blobs to be warmed on worker threads without stalling draws.
+pub struct AsyncPsoCompiler {
+    pending: Arc<(Mutex<VecDeque<(u64, Vec<u32>)>>, Condvar)>,
+    compiled_count: Arc<std::sync::atomic::AtomicU64>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl AsyncPsoCompiler {
+    /// Spawns `num_workers` background compilation threads invoking `compile_fn`.
+    pub fn spawn<F>(num_workers: usize, compile_fn: F) -> Self
+    where
+        F: Fn(u64, &[u32]) + Send + Sync + 'static,
+    {
+        let pending = Arc::new((
+            Mutex::new(VecDeque::<(u64, Vec<u32>)>::new()),
+            Condvar::new(),
+        ));
+        let compiled_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let compile_fn = Arc::new(compile_fn);
+        let mut workers = Vec::new();
+        for i in 0..num_workers.max(1) {
+            let p = Arc::clone(&pending);
+            let c = Arc::clone(&compiled_count);
+            let s = Arc::clone(&shutdown);
+            let f = Arc::clone(&compile_fn);
+            if let Ok(h) = thread::Builder::new()
+                .name(format!("strata-pso-{i}"))
+                .spawn(move || {
+                    loop {
+                        let job = {
+                            let (lock, cv) = &*p;
+                            let mut q = lock.lock().unwrap();
+                            while q.is_empty() && !s.load(std::sync::atomic::Ordering::Acquire) {
+                                q = cv.wait(q).unwrap();
+                            }
+                            if q.is_empty() && s.load(std::sync::atomic::Ordering::Acquire) {
+                                break;
+                            }
+                            q.pop_front()
+                        };
+                        if let Some((key, words)) = job {
+                            f(key, &words);
+                            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                })
+            {
+                workers.push(h);
+            }
+        }
+        Self {
+            pending,
+            compiled_count,
+            shutdown,
+            workers,
+        }
+    }
+
+    pub fn enqueue(&self, key: u64, spirv: Vec<u32>) {
+        let (lock, cv) = &*self.pending;
+        lock.lock().unwrap().push_back((key, spirv));
+        cv.notify_one();
+    }
+
+    pub fn compiled_count(&self) -> u64 {
+        self.compiled_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending.0.lock().unwrap().len()
+    }
+}
+
+impl Drop for AsyncPsoCompiler {
+    fn drop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.pending.1.notify_all();
+        for h in self.workers.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

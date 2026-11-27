@@ -5,9 +5,11 @@
 //! `VkPipelineLayout`:
 //! - 128 bytes of push constants (32 x `u32` console user SGPRs), seen by the
 //!   compute, vertex and fragment stages
-//! - Set 0, binding 0: `SAMPLED_IMAGE[IMAGE_ARRAY_LEN]`
+//! - Set 0, binding 0: `SAMPLED_IMAGE[IMAGE_ARRAY_LEN]` (2D)
 //! - Set 0, binding 1: `SAMPLER[IMAGE_ARRAY_LEN]`
-//! - Set 0, binding 2: `STORAGE_IMAGE[IMAGE_ARRAY_LEN]`
+//! - Set 0, binding 2: `STORAGE_IMAGE[IMAGE_ARRAY_LEN]` (2D)
+//! - Set 0, bindings 3/4/5: `SAMPLED_IMAGE[IMAGE_ARRAY_LEN]` (3D, cube, 2D array)
+//! - Set 0, bindings 6/7: `STORAGE_IMAGE[IMAGE_ARRAY_LEN]` (3D, 2D array)
 //!
 //! The binding numbers and array length come from the shader translator, so
 //! the layout and the SPIR-V it emits cannot drift apart. Buffers, constant
@@ -16,24 +18,29 @@
 
 use ash::vk;
 use strata_shader::spirv::{
-    BINDING_SAMPLERS, BINDING_STORAGE_IMAGES, BINDING_TEXTURES, IMAGE_ARRAY_LEN,
+    BINDING_SAMPLERS, BINDING_STORAGE_3D, BINDING_STORAGE_ARRAY, BINDING_STORAGE_IMAGES,
+    BINDING_TEXTURES, BINDING_TEXTURES_3D, BINDING_TEXTURES_ARRAY, BINDING_TEXTURES_CUBE,
+    IMAGE_ARRAY_LEN,
 };
 
 pub const PUSH_CONSTANT_BYTES: u32 = 128;
 
 /// Stages that see the push constants and set 0. Every `vkCmdPushConstants`
-/// call passes exactly these flags.
-pub const PUSH_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::from_raw(
-    vk::ShaderStageFlags::COMPUTE.as_raw()
-        | vk::ShaderStageFlags::VERTEX.as_raw()
-        | vk::ShaderStageFlags::FRAGMENT.as_raw(),
-);
+/// call passes exactly these flags. `ALL` covers compute, vertex, fragment,
+/// tessellation, geometry, task, mesh, and ray-tracing stages under Strata's
+/// single No-API global layout.
+pub const PUSH_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::ALL;
 
 /// Set 0's bindings, in binding order.
-pub const SET0_BINDINGS: [(u32, vk::DescriptorType); 3] = [
+pub const SET0_BINDINGS: [(u32, vk::DescriptorType); 8] = [
     (BINDING_TEXTURES, vk::DescriptorType::SAMPLED_IMAGE),
     (BINDING_SAMPLERS, vk::DescriptorType::SAMPLER),
     (BINDING_STORAGE_IMAGES, vk::DescriptorType::STORAGE_IMAGE),
+    (BINDING_TEXTURES_3D, vk::DescriptorType::SAMPLED_IMAGE),
+    (BINDING_TEXTURES_CUBE, vk::DescriptorType::SAMPLED_IMAGE),
+    (BINDING_TEXTURES_ARRAY, vk::DescriptorType::SAMPLED_IMAGE),
+    (BINDING_STORAGE_3D, vk::DescriptorType::STORAGE_IMAGE),
+    (BINDING_STORAGE_ARRAY, vk::DescriptorType::STORAGE_IMAGE),
 ];
 
 pub struct GlobalLayout {
@@ -41,17 +48,35 @@ pub struct GlobalLayout {
     pub pipeline_layout: vk::PipelineLayout,
 }
 
+/// The single layout exposes four sampled and three storage image arrays,
+/// plus one sampler array, to each stage.
+pub fn image_capacity(limits: &vk::PhysicalDeviceLimits) -> u32 {
+    [
+        IMAGE_ARRAY_LEN,
+        limits.max_per_stage_descriptor_sampled_images / 4,
+        limits.max_per_stage_descriptor_storage_images / 3,
+        limits.max_per_stage_descriptor_samplers,
+        limits.max_descriptor_set_sampled_images / 4,
+        limits.max_descriptor_set_storage_images / 3,
+        limits.max_descriptor_set_samplers,
+        limits.max_per_stage_resources / 8,
+    ]
+    .into_iter()
+    .min()
+    .unwrap_or(0)
+}
+
 impl GlobalLayout {
     /// Creates the set-0 layout and the pipeline layout.
     ///
     /// # Safety
     /// `device` is a live device; the caller destroys both handles.
-    pub unsafe fn create(device: &ash::Device) -> Result<Self, vk::Result> {
+    pub unsafe fn create(device: &ash::Device, capacity: u32) -> Result<Self, vk::Result> {
         let bindings = SET0_BINDINGS.map(|(b, ty)| {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(b)
                 .descriptor_type(ty)
-                .descriptor_count(IMAGE_ARRAY_LEN)
+                .descriptor_count(capacity)
                 .stage_flags(PUSH_STAGES)
         });
         // SAFETY: forwarded from the caller.

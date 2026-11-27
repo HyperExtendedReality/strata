@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-pub const COMPILER_VERSION: u32 = 1;
+pub const COMPILER_VERSION: u32 = 2;
 
 pub fn hash_rdna2(words: &[u32]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ (COMPILER_VERSION as u64);

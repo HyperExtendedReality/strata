@@ -49,7 +49,7 @@ Instead of rebuilding legacy Direct3D 12 abstractions on top of console hardware
   <tr>
     <td width="33%" valign="top">
       <b>No-API Vulkan 1.3+ (Raw <code>ash</code>)</b><br><br>
-      No <code>wgpu</code>/<code>vulkano</code> wrappers, no <code>VkRenderPass</code>, no <code>VkFramebuffer</code>, and no vertex input layouts. Every shader shares <b>one global pipeline layout</b> (128 B push constants for User SGPRs + one image descriptor set: 16 sampled images, samplers and storage images) with <code>VK_KHR_dynamic_rendering</code>.
+      No <code>wgpu</code>/<code>vulkano</code> wrappers, no <code>VkRenderPass</code>, no <code>VkFramebuffer</code>, and no vertex input layouts. Every shader shares <b>one global pipeline layout</b> (128 B push constants for User SGPRs + one image descriptor set sized to device limits, up to 32 slots per image kind) with <code>VK_KHR_dynamic_rendering</code>.
     </td>
     <td width="33%" valign="top">
       <b>Real 64-bit GPU Pointers (BDA)</b><br><br>
@@ -117,12 +117,12 @@ Instead of rebuilding legacy Direct3D 12 abstractions on top of console hardware
 
 | Crate | Purpose |
 | :--- | :--- |
-| [`crates/strata-shader`](crates/strata-shader) | Pure-Rust RDNA2 decoder, SSA IR, optimizer (bitcast cancellation, CSE, DCE, 128-bit BDA load coalescing), Wave64 liveness, `DXBC`/`XBCH` (zlib)/`FSSM` container parser, CPU BVH reference, atomic SPIR-V disk cache, versioned shader store, and direct SPIR-V 1.6 (`PhysicalStorageBuffer64`) emitter. |
-| [`crates/strata-formats`](crates/strata-formats) | Clean-room console asset format decoders: `SGD5` shader archives, `BCPack`, `XMA2` audio frame decoder, and console texture format/swizzle tables. |
+| [`crates/strata-shader`](crates/strata-shader) | Pure-Rust RDNA2 decoder, SSA IR, optimizer (bitcast cancellation, CSE, DCE, 128-bit BDA load coalescing), Wave64 liveness & subgroup permutes (`wave_ops.rs`), `DXBC`/`XBCH` (zlib)/`FSSM` container parser, CPU BVH reference (Box16/Box32/Triangle/Instance), `SPV_KHR_ray_query` loop detector (`rayquery.rs`), `RectList` topology emulation (`rect.rs`), atomic SPIR-V disk cache, versioned shader store, and direct SPIR-V 1.6 (`PhysicalStorageBuffer64`) emitter. |
+| [`crates/strata-formats`](crates/strata-formats) | Clean-room console asset format decoders: `SGD5` shader archives, `BCPack`, `XMA2` audio frame decoder, RFC 6716 `Opus` TOC/frame decoder, and console texture format/swizzle tables. |
 | [`crates/strata-runtime-shaders`](crates/strata-runtime-shaders) | Emulator-authored internal shaders written in **Slang** (`Ptr<T>`, generics, wave intrinsics) compiled offline via `slangc` in `build.rs` and embedded as SPIR-V 1.6 byte slices. |
-| [`crates/strata-gpu`](crates/strata-gpu) | Raw `ash` No-API Vulkan 1.3+ engine: capability probe, single global bindless + push-constant layout, 3-tier `UmaManager`, 64 KiB `SparseTilePool`, fence-gated `BindlessManager`, `ThinCommandList`, `FramePacingClock`, Win32 `SwapchainPresenter`, and live BDA `ComputeRunner`. |
-| [`crates/strata-hle`](crates/strata-hle) | Zero-dependency PE32+ parser/mapper (sections, DIR64 relocations, IAT, exports, static TLS), Zen 2 VEH emulator, `PhysicalPagePool` scatter mapper, VFS drive rewriter, `LoadLibrary`/`GetProcAddress` hooks, offline `DStorage`/GDK stubs, `xg_xs` swizzle layout computer, input mapper, and `d3d12_xs` COM vtables. |
-| [`crates/strata-cli`](crates/strata-cli) | Command-line tool for GPU capability probing, self-tests, live GPU & UMA hardware verification, and PE32+ import/mapping diagnostics. |
+| [`crates/strata-gpu`](crates/strata-gpu) | Raw `ash` No-API Vulkan 1.3+ engine: capability probe, single global bindless + push-constant layout, 3-tier `UmaManager` (`MEM_WRITE_WATCH` + `PAGE_GUARD` + 3-way dword-diff readback), 64 KiB `SparseTilePool`, fence-gated `BindlessManager`, `ThinCommandList` + `ThinTranslationPool`, `AsyncPsoCompiler` + `HeapTextureWorker`, OOM residency pressure tiers, F1/F3 stats `overlay`, SCAP replay/bisect/trace, `FramePacingClock`, `SwapchainPresenter`, and live BDA `ComputeRunner` with Vulkan timestamp queries. |
+| [`crates/strata-hle`](crates/strata-hle) | Zero-dependency PE32+ parser/mapper (sections, DIR64 relocations, IAT, exports, static TLS), Zen 2 + `PAGE_GUARD` VEH handler, `STRATA_STACKS` all-thread stack dumper, verified code patcher & write-site table, `PhysicalPagePool` scatter mapper, expanded VFS drive rewriter, `LoadLibrary`/`GetProcAddress` hooks, `DStorage`, `xgameruntime` (`QueryApiImpl` + full offline GDK/OS thunks: `ws2_32`, `winhttp`, `rpcrt4`, `mfplat`), `XboxBvhBuilder.dll` HLE, host upscaler bridge (`STRATA_UPSCALE`/`STRATA_AMBIENT`), `xg_xs` swizzle layout computer, `GameInput`, `XAudio2` (PCM/XMA2/Opus), and `d3d12_xs` COM vtables (incl. `ID3D12PipelineLibrary`). |
+| [`crates/strata-cli`](crates/strata-cli) | Command-line tool for GPU capability probing, self-tests, live GPU & UMA hardware verification, PE32+ import/mapping diagnostics, shader translation/warming, and SCAP frame replay/diff/bisect/trace. |
 
 ---
 
@@ -136,9 +136,9 @@ Strata is an early-stage research prototype. Subsystems below are verified on sy
 | Component | Status | Verified By / Current Scope |
 | :--- | :---: | :--- |
 | RDNA2 decoder (`SOPP`/`SOPC`/`SOP1`/`SOPK`/`SOP2`, `VOP1`/`VOPC`/`VOP2`/`VOP3`, `SMEM`, `FLAT`/`GLOBAL`/`SCRATCH`, `DS`, `MUBUF`/`MTBUF`, `MIMG`, `EXP`) | ✅ | Unit tests; 400+ opcode table across all 18 GFX10.3 encodings (`opcodes.rs`, incl. `VOP3P`/`VINTRP`/`SCRATCH`) + IR decoding for compute/ALU/memory/scratch/ray-tracing |
-| Direct RDNA2 → SSA → SPIR-V 1.6 (BDA, LDS incl. `ds_add_u32` atomics, VOP3, BVH64, `SCRATCH` spill frames), stores predicated on EXEC | ✅ | `spirv-val` + live GPU execution on synthetic RDNA2 kernels; `SpillFrame` (`spill.rs`) wired to `Function` scratch arrays + Wave64 permutes/waterfall (`wave_ops.rs`) |
+| Direct RDNA2 → SSA → SPIR-V 1.6 (BDA, LDS incl. `ds_add_u32` atomics, VOP3, nearest-first sorted BVH64 Box32 + Box16/Triangle/Instance reference, `SPV_KHR_ray_query` loop detector, `RectList` expansion, `SCRATCH` spill frames), stores predicated on EXEC | ✅ | `spirv-val` + live GPU execution on synthetic RDNA2 kernels; `SpillFrame` (`spill.rs`) wired to `Function` scratch arrays + Wave64 permutes (`wave_ops.rs` → `OpGroupNonUniformBroadcastFirst`/`Shuffle`/`ShuffleXor`) |
 | Typed buffers (`tbuffer_*`): GFX10 formats converted (UNORM `x/(2^n-1)`, SNORM clamped to -1, scaled, half, 32-bit), `idxen` record addressing | ✅ | `spirv-val` + live GPU results (RGBA8_UNORM, RG16_SNORM loads; RGBA8_UNORM store). Packed 10/11-bit formats and sub-dword typed stores return explicit errors |
-| Image & atomic instructions (`image_sample`/`_l`/`_b`/`_lz`/`_c*`, `image_gather4*`, `image_get_resinfo`, `image_load(_mip)`, `image_store`, `buffer_atomic_*`, `global_atomic_*`, `s_buffer_load_dword*`, `VOP3P` packed FP16/dot, `v_permlane16`/`ds_bpermute`) → set-0 `textures[16]`/`samplers[16]`/`storage_images[16]` & BDA atomics | ✅ | `spirv-val` + live GPU: all MIMG dims (1D/2D/3D/Cube/Array/MSAA), depth compare (`OpImageSampleDref*`), gather (`OpImageGather`), resinfo (`OpImageQuerySizeLod`), cross-lane shuffles (`OpGroupNonUniformShuffle`), and 64-bit BDA atomics |
+| Image & atomic instructions (`image_sample`/`_l`/`_b`/`_lz`/`_c*`, `image_gather4*`, `image_get_resinfo`, `image_load(_mip)`, `image_store`, `buffer_atomic_*`, `global_atomic_*`, `s_buffer_load_dword*`, `VOP3P` packed FP16/dot, `v_permlane16`/`ds_bpermute`) → set-0 image arrays and BDA atomics | ✅ | `spirv-val` + live GPU: all MIMG dims (1D/2D/3D/Cube/Array/MSAA), depth compare (`OpImageSampleDref*`), gather (`OpImageGather`), resinfo (`OpImageQuerySizeLod`), cross-lane shuffles (`OpGroupNonUniformShuffle`), and 64-bit BDA atomics |
 | Vertex / pixel / geometry / NGG mesh stages: `EXP` (`pos0`, `param0..31`, `mrt0..7`, `mrtz`, compressed halves), `v_interp_p1/p2/mov`, `SPI_PS_INPUT_ENA` (`FragCoord`/`FrontFacing` VGPRs), RDNA2-to-SPIR-V GS (`translate_geometry_rdna2`: `s_sendmsg` → `OpEmitVertex`/`OpEndPrimitive`) & NGG/Mesh (`translate_mesh_rdna2`: `SPV_EXT_mesh_shader` / `OpSetMeshOutputsEXT`), implicit-LOD sampling, quad swizzles (`RequireFullQuadsKHR`) | ✅ | `spirv-val` + live GPU draws through the D3D12.X queue (GFX10 legacy VS layout + GS + `MeshEXT` SPIR-V emission validated by `spirv-val`) |
 | 128-bit BDA load coalescing & bitcast/CSE/DCE opt | ✅ | Unit test + live GPU execution |
 | RDNA2-translated Structured CFG (`s_and_saveexec_b64` + `s_cbranch_execz` → `OpSelectionMerge` + `OpPhi`) | ✅ | `spirv-val` + live GPU divergent-lane execution (forward branches) |
@@ -162,11 +162,11 @@ Strata is an early-stage research prototype. Subsystems below are verified on sy
 | Tier 3 `vkQueueBindSparse` 64 KiB Aliased 2D `VkImage`s | ✅ | Live GPU sparse bind test (2 `SPARSE_ALIASED` images sharing 1 tile) |
 | No-API `VK_KHR_dynamic_rendering` + Slang vertex-less `present_blit.slang` | ✅ | Live GPU render test (0 RenderPasses, 0 Framebuffers, 0 VertexBuffers) |
 | Fence-gated Bindless Slot Manager (`SHOW_AFTER` pattern) | ✅ | Unit test |
-| `ThinCommandList` (bind deduplication, integer-RT blend sanitization, hoisted clamps, draw/barrier/copy commands) | ✅ | Unit test + live COM → Vulkan compute execution |
+| `ThinCommandList` + `ThinTranslationPool` + `AsyncPsoCompiler` + `HeapTextureWorker` (parallel multi-list flattening, GPU-side `vkCmdCopyBuffer`, `DispatchX` thread-count conversion, `UpdateTileMappings`/`CopyTileMappings` → `SparseTilePool`, MSAA resolve, Vulkan `vk::QueryPool` GPU timestamps, `PressureTier` + 500 ms `OomBackoff`, F1/F3 stats overlay) | ✅ | Unit tests + live COM → Vulkan compute/graphics execution |
 | Dispatches over `maxComputeWorkGroupCount` split into `vkCmdDispatchBase` pieces (never clamped), direct and indirect (`DispatchIndirect` reads its group counts from title memory, after mirror read-back) | ✅ | Unit test + live GPU tests (every group of split direct and indirect dispatches runs) |
 | Textures from T#s in title memory (GFX10 formats → Vulkan incl. BC1–BC7 & Depth/Stencil, `DST_SEL` swizzles, linear, Morton `4KB`/`64KB_S`/`64KB_D`, and bank-XOR `64KB_S_X`/`D_X`/`R_X`, multi-mip detile/retile), re-uploaded when bytes change; samplers from S#s | ✅ | Unit + live GPU tests (`texture.rs`) |
 | Graphics draws: No-API `VK_KHR_dynamic_rendering` with full `GraphicsPsoState` (per-MRT blend, depth/stencil test & write, rasterizer cull/fill/depth bias/scissor, optional index buffers), D3D clip convention (flipped viewport), written back to title memory | ✅ | Live GPU draw test (`tests/draws.rs`) |
-| Shadowed Tier 2 mirrors: `MEM_WRITE_WATCH` host copy, page-exact upload of CPU writes, GPU→title read-back (`ReadbackTexture`) | ✅ | Live GPU test (dirty pages only, read-back restores VRAM bytes) |
+| Shadowed Tier 2 mirrors: `MEM_WRITE_WATCH` + `PAGE_GUARD` VEH tracker (`PageGuardTracker`), page-exact upload of CPU writes, 3-way dword-diff GPU→title read-back (`ReadbackTexture`) | ✅ | Live GPU & unit tests (dirty pages only, read-back restores VRAM bytes without clobbering concurrent CPU writes) |
 | Pipeline table + persistent atomic `VkPipelineCache` (compute & graphics), `PipelineLibrary` serialization, versioned shader store, `strata-cli warm` | ✅ | Shared `VkPipelineCache` used for compute and graphics pipelines, saved atomically (`.tmp` + rename); unit tests + `strata-cli warm` / `shaders` |
 | `FramePacingClock` + cross-platform `SurfaceHandle` / `SwapchainPresenter` (`Win32`, Linux `Xlib` / `Xcb` / `Wayland`; `acquire_next_image` / `present_image`) | ✅ | Windows (`VK_KHR_win32_surface`) + Linux X11/Wayland (`VK_KHR_xlib_surface`, `VK_KHR_xcb_surface`, `VK_KHR_wayland_surface`) surface creation + unit tests |
 
@@ -189,7 +189,7 @@ Strata is an early-stage research prototype. Subsystems below are verified on sy
 | Live Windows VEH (`clzero`, `rdpru` via QPC, `rdpid` via `GetCurrentProcessorNumber`, `monitorx`/`mwaitx`, `clwb`) | ✅ | Unit tests (note: `clwb`/`rdpid` are also present on modern Intel CPUs; VEH catches faults on older/non-AMD CPUs) |
 | `xmem.dll` (`XMemVirtualAlloc`/`Free`/`Protect`, `XMemAlloc`/`Free`, physical-page pool, scatter map/unmap, page-count & working-set stats, `XMemTransferMemory`) | ✅ | Wired to `UmaManager` + `PhysicalPagePool` (incl. `MEM_LARGE_PAGES` alignment, `MEM_RELEASE`/`MEM_DECOMMIT`, `XMemUnmapPhysicalPages`); unit + live UMA tests |
 | `d3d12_xs.dll` COM vtables (`Device`, `Queue`, `CommandList`, `Resource`, `Fence`, `ID3DBlob`), frame-pacing (`PresentX`, `RegisterFrameEventX`, `WaitFrameEventX`) & `xg_xs.dll` (`XGTextureAddressComputer`) | ✅ | `D3D12XboxCreateDevice` returns exact `d3d12.h` 44-slot `StandardDevice` backed by `UmaManager` (`VK_EXT_external_memory_host`), `ThinCommandList`, `ComputeRunner`, and `FramePacingClock`; `PresentX` wired to `Win32Window` via `strata-cli run --window` |
-| Audio (`xaudio2_9.dll` / `xapu.dll` / `AcpHal.dll`), `DStorageGetFactory`, `xgameruntime.dll` & `GameInput.dll` | ✅ | Real COM vtables (`ComXAudio2`/`ComXAudio2Voice`, `ComAcpHal`, `ComGameInput`/`ComGameInputReading`), shared global `Vfs` in `DStorageGetFactory`, real `XAsync`/`XUser`/`XGameSave`/`XPackage`/`XStore` thunks; unresolved console imports get per-import named stubs (`--unimplemented trap` / `zero` / `notimpl`) |
+| Audio (`xaudio2_9.dll` / `xapu.dll` / `AcpHal.dll` with PCM/XMA2/Opus), `DStorageGetFactory`, `xgameruntime.dll` (`QueryApiImpl` + full offline GDK), `XboxBvhBuilder.dll`, host upscaler bridge (`amd_fidelityfx_*` / `STRATA_UPSCALE` / `STRATA_AMBIENT`), `GameInput.dll`, `ws2_32`/`winhttp`/`rpcrt4`/`mfplat`, `STRATA_STACKS`, and safe code patching (`patch.rs`) | ✅ | Real COM vtables (`ComXAudio2`/`ComXAudio2Voice`, `ComAcpHal`, `ComGameInput`/`ComGameInputReading`, `ID3D12PipelineLibrary`), shared global `Vfs` in `DStorageGetFactory`, real `QueryApiImpl`/`XAsync`/`XUser`/`XGameSave`/`XPackage`/`XStore`/OS thunks; unresolved console imports get per-import named stubs (`--unimplemented trap` / `zero` / `notimpl`) |
 
 </details>
 
@@ -208,6 +208,12 @@ Strata is an early-stage research prototype. Subsystems below are verified on sy
 ```powershell
 # Run all unit tests (includes slangc compilation and spirv-val validation)
 cargo test --workspace
+
+# Require spirv-val and list reported hardware skips on Windows
+.\scripts\test.ps1
+
+# Verify scaled presentation planes and executable replay on the selected GPU
+cargo run -p strata-cli -- smoke --require-gpu
 
 # Inspect your GPU's No-API Vulkan 1.3+ capabilities
 cargo run -p strata-cli -- probe
@@ -237,7 +243,7 @@ strata-cli warm <shader-cache-dir> [pipeline-cache-file]   # Create every cached
 strata-cli translate <file-or-dir>     # Compile every shader found (SGD5/XBCH/FSSM); rank what blocks translation
 strata-cli census <file-or-dir>        # Print stage distribution and top RDNA2 instruction encodings
 strata-cli shaders <file-or-dir> [store-dir]               # Batch pre-translate shaders into persistent versioned store
-strata-cli replay <inspect <a.scap> | diff <a.scap> <b.scap>> # Inspect or diff deterministic SCAP frame captures
+strata-cli replay <inspect <a.scap> | diff <a> <b> | bisect <a> <b> | trace <a.scap> [out.json] | run <a.scap>> # Inspect, diff, bisect, trace, or replay deterministic SCAP frame captures
 strata-cli config                      # Print resolved strata.toml + STRATA_* env config and verify asset-path policy
 scripts\play.ps1 -Exe <path.exe> [-Console series-x|series-s] [-Adapter <idx|name>] [-Fsr4K quality|balanced|performance]
 cargo xtask asset-check                # Refuse game/console content in the repository (install-hook: pre-commit)
@@ -246,6 +252,12 @@ cargo xtask asset-check                # Refuse game/console content in the repo
 ---
 
 ## Testing & Verification
+
+`strata-cli smoke --window --require-gpu --report <file>` reports first visible frame, presents, frames shown, p50/p95 frame times, replay pixel differences, adapter capabilities, and skipped checks. Without `--window`, it exercises the compositor offscreen. For a test that starts at the PE loader and exercises both title-facing `PresentX` calls, run `cargo test -p strata-hle --test probe probe_title_presents_two_planes -- --ignored` on a Windows desktop with Vulkan.
+
+`strata-cli run <title> --window --report <file>` reports frame pacing, pipeline creation stalls, and mirrored-memory transfers. Normal launches use an adapter-specific Vulkan pipeline cache and warm a bounded set of previously seen compute and graphics pipelines. Use `--pipeline-cache <file>` to merge a cache produced by the standalone `warm` command. Use `--no-prewarm` to measure the driver cache by itself or `--cold-pipelines` for a launch without Strata's persistent pipeline cache. `smoke --pipeline-cache-dir <dir>` lets you compare two runs of the same synthetic workload.
+
+Set `STRATA_GPU_MIRROR_DIFF=1` to try GPU-side byte merging on queue-owned allocations of at least 1 MiB. This uses additional VRAM for the last synchronized state, and the run report distinguishes requested readback bytes from bytes changed. See [capture and replay](docs/replay.md) for the executable capture format and timing commands.
 
 Strata uses a **differential, hardware-in-the-loop verification strategy**:
 1. **Static SPIR-V Validation:** Every SPIR-V binary emitted by `strata-shader` is validated against Khronos `spirv-val --target-env vulkan1.3`.

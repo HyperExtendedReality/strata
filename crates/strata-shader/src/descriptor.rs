@@ -194,6 +194,14 @@ pub struct SamplerDescriptor {
     pub min_lod: f32,
     pub max_lod: f32,
     pub lod_bias: f32,
+    /// `DEPTH_COMPARE_FUNC` (`SQ_TEX_DEPTH_COMPARE_*`, the same order as
+    /// `VkCompareOp`: never, less, equal, less-equal, greater, not-equal,
+    /// greater-equal, always).
+    pub depth_compare_func: u8,
+    /// Set by the host when the sampler is used by a comparison sample
+    /// (`image_sample_c*`; RDNA2 picks comparison by instruction, Vulkan by
+    /// sampler): the compare op to create the sampler with.
+    pub compare: Option<u8>,
 }
 
 impl SamplerDescriptor {
@@ -228,7 +236,50 @@ impl SamplerDescriptor {
             min_lod: u4_8(w[1]),
             max_lod: u4_8(w[1] >> 12),
             lod_bias: bias,
+            depth_compare_func: ((w[0] >> 12) & 7) as u8,
+            compare: None,
         }
+    }
+
+    /// The dwords [`Self::decode`] reads back as `self` (`compare` is a host
+    /// choice and is not encoded).
+    pub fn encode(&self) -> [u32; 4] {
+        let clamp = |c: Clamp| match c {
+            Clamp::Wrap => 0,
+            Clamp::Mirror => 1,
+            Clamp::ClampToEdge => 2,
+            Clamp::MirrorOnceToEdge => 3,
+            Clamp::ClampToBorder => 6,
+            Clamp::MirrorOnceToBorder => 7,
+        };
+        let aniso = match self.max_aniso {
+            0 | 1 => 0,
+            2 => 1,
+            3 | 4 => 2,
+            5..=8 => 3,
+            _ => 4,
+        };
+        let fbits = |f: Filter| match f {
+            Filter::Point => 0,
+            Filter::Linear => 1,
+        };
+        let u4_8 = |v: f32| ((v.clamp(0.0, 15.996) * 256.0) as u32) & 0xfff;
+        let bias = ((self.lod_bias.clamp(-32.0, 31.996) * 256.0) as i32 as u32) & 0x3fff;
+        let mip = match self.mip {
+            None => 0,
+            Some(Filter::Point) => 1,
+            Some(Filter::Linear) => 2,
+        };
+        [
+            clamp(self.clamp[0])
+                | (clamp(self.clamp[1]) << 3)
+                | (clamp(self.clamp[2]) << 6)
+                | (aniso << 9)
+                | (u32::from(self.depth_compare_func & 7) << 12),
+            u4_8(self.min_lod) | (u4_8(self.max_lod) << 12),
+            bias | (fbits(self.mag) << 20) | (fbits(self.min) << 22) | (mip << 26),
+            0,
+        ]
     }
 }
 
@@ -274,5 +325,22 @@ mod tests {
             (Filter::Linear, Filter::Point, Some(Filter::Linear))
         );
         assert_eq!((s.min_lod, s.max_lod, s.lod_bias), (0.0, 13.0, -1.5));
+    }
+
+    #[test]
+    fn sampler_descriptor_round_trips() {
+        let s = SamplerDescriptor {
+            clamp: [Clamp::Wrap, Clamp::ClampToEdge, Clamp::Mirror],
+            max_aniso: 8,
+            mag: Filter::Linear,
+            min: Filter::Point,
+            mip: Some(Filter::Linear),
+            min_lod: 0.5,
+            max_lod: 12.0,
+            lod_bias: -1.5,
+            depth_compare_func: 3,
+            compare: None,
+        };
+        assert_eq!(SamplerDescriptor::decode(s.encode()), s);
     }
 }

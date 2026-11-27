@@ -11,13 +11,25 @@ use std::path::Path;
 /// Save raw `VkPipelineCache` bytes atomically (write `.tmp` then rename) so a
 /// live mapped cache file is never overwritten in place.
 pub fn save_pipeline_cache_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
+    write_atomic(path, data)
+}
+
+pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("vkcache.tmp");
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    let tmp = path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 pub fn load_pipeline_cache(path: &Path) -> Vec<u8> {

@@ -150,6 +150,23 @@ pub fn typed_store_rgba8_unorm() -> Vec<u32> {
     p
 }
 
+/// Thread `tid` reads `10_11_11_FLOAT` (R11G11B10) element `tid` of the V#
+/// in s[4:7] as four dwords (r, g, b, 1.0) to `s[0:1] + tid * 16`.
+pub fn typed_load_r11g11b10_float() -> Vec<u32> {
+    let mut p = tbuffer_load_format_idx(4, 4, 0, 4, 36, 0).to_vec();
+    store_v4_to_v7(&mut p);
+    p
+}
+
+/// Thread `tid` writes (0.5, 1.0, ..) as `format` element `tid` of the V#
+/// in s[4:7] (`count` components): a sub-dword store for 8/16-bit formats.
+pub fn typed_store_half_one(format: u8, count: u8) -> Vec<u32> {
+    let mut p = vec![v_mov_b32_sgpr(4, 240), v_mov_b32_sgpr(5, 242)];
+    p.extend_from_slice(&tbuffer_store_format_idx(4, count, 0, 4, format, 0));
+    p.push(s_endpgm());
+    p
+}
+
 /// Thread `tid` fetches texel `(tid & 7, tid >> 3)` of the 2D T# in
 /// s[8:15] and writes its four components to `s[0:1] + tid * 16`.
 pub fn image_fetch_8x8() -> Vec<u32> {

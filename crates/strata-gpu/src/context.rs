@@ -26,6 +26,8 @@ pub enum GpuError {
     Io(String),
     #[error("host memory allocation failed")]
     HostMemory,
+    #[error("shader needs {required} image slots but this adapter's layout provides {available}")]
+    ImageSlots { required: u32, available: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +44,7 @@ pub struct NoApiCapabilities {
     pub sparse_image_2d: bool,
     pub external_memory_host: bool,
     pub max_push_constants_size: u32,
+    pub image_slots: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +219,7 @@ pub fn probe_capabilities_for(selector: Option<&str>) -> Result<NoApiCapabilitie
             sparse_image_2d,
             external_memory_host: has_ext(ash::ext::external_memory_host::NAME),
             max_push_constants_size,
+            image_slots: crate::layout::image_capacity(&p.limits),
         };
 
         instance.destroy_instance(None);

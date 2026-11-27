@@ -41,7 +41,7 @@ impl BdaBuffer {
 pub use crate::layout::PUSH_STAGES;
 
 pub struct ComputeRunner {
-    _entry: ash::Entry,
+    pub(crate) _entry: ash::Entry,
     pub(crate) instance: ash::Instance,
     pub(crate) pdev: vk::PhysicalDevice,
     pub(crate) device: ash::Device,
@@ -55,23 +55,65 @@ pub struct ComputeRunner {
     desc_pool: Mutex<vk::DescriptorPool>,
     /// 1x1 image and sampler bound to every slot a dispatch leaves empty.
     default_image: Option<crate::images::GpuImage>,
+    /// 1-texel 3D and 1-cube (storage-capable) defaults for empty slots of
+    /// the 3D, cube and array classes.
+    default_3d: Option<crate::images::GpuImage>,
+    default_cube: Option<crate::images::GpuImage>,
+    default_cube_view: vk::ImageView,
     default_sampler: vk::Sampler,
     pub(crate) sampler_mirror_clamp_to_edge: bool,
+    /// `depthClamp` is enabled (D3D12 `DepthClipEnable = FALSE`).
+    pub(crate) depth_clamp: bool,
+    /// `depthBounds` is enabled (D3D12 `OMSetDepthBounds`).
+    pub(crate) depth_bounds: bool,
+    /// `tessellationShader` is enabled (Hull / Domain shaders).
+    pub tessellation_shader: bool,
+    /// `geometryShader` is enabled (Geometry shaders).
+    pub geometry_shader: bool,
+    /// `pipelineStatisticsQuery` is enabled (`VkQueryPool` pipeline stats).
+    pub pipeline_statistics_query: bool,
+    /// `VK_EXT_mesh_shader` device loader + feature flags.
+    pub(crate) ext_mesh_shader: Option<ash::ext::mesh_shader::Device>,
+    pub mesh_shader: bool,
+    pub task_shader: bool,
+    /// `VK_KHR_fragment_shading_rate` device loader + feature flag.
+    pub(crate) khr_fragment_shading_rate: Option<ash::khr::fragment_shading_rate::Device>,
+    pub fragment_shading_rate: bool,
+    /// `VK_EXT_transform_feedback` device loader + feature flag.
+    #[allow(dead_code)]
+    pub(crate) ext_transform_feedback: Option<ash::ext::transform_feedback::Device>,
+    pub transform_feedback: bool,
+    /// `VK_KHR_ray_tracing_pipeline` device loader + feature flag.
+    #[allow(dead_code)]
+    pub(crate) khr_ray_tracing_pipeline: Option<ash::khr::ray_tracing_pipeline::Device>,
+    pub ray_tracing_pipeline: bool,
+    /// Surfaces and swapchains are available (presenting to a window).
+    pub wsi: bool,
+    /// HDR swapchain colour spaces (`VK_EXT_swapchain_colorspace`).
+    pub hdr_colorspaces: bool,
+    pub(crate) queue_family: u32,
     /// `VK_KHR_shader_quad_control` is enabled: pixel shaders may require full quads.
     pub quad_control: bool,
     pub device_name: String,
+    pub driver_version: u32,
+    pub image_slots: u32,
+    pub(crate) timestamp_period: f32,
+    pub(crate) timestamp_bits: u32,
     pub subgroup_size: u32,
     pub min_subgroup_size: u32,
     pub max_subgroup_size: u32,
     pub native_wave64: bool,
+    pub native_wave64_stages: vk::ShaderStageFlags,
     pub subgroup_size_control: bool,
     /// `maxComputeWorkGroupCount`: dispatches beyond it are split.
     pub max_workgroup_count: [u32; 3],
     pipeline_cache: vk::PipelineCache,
+    pub(crate) pipeline_cache_lock: Mutex<()>,
+    pub(crate) pipeline_usage: Mutex<crate::pipeline_usage::Usage>,
     /// `(FNV-1a of the SPIR-V, required subgroup size or 0)` -> pipeline.
     pipelines: Mutex<HashMap<(u64, u32), (vk::ShaderModule, vk::Pipeline)>>,
     pub(crate) gfx_pipelines:
-        Mutex<HashMap<crate::graphics::GfxKey, (vk::ShaderModule, vk::ShaderModule, vk::Pipeline)>>,
+        Mutex<HashMap<crate::graphics::GfxKey, (Vec<vk::ShaderModule>, vk::Pipeline)>>,
 }
 
 /// FNV-1a over SPIR-V words: the pipeline table's key.
@@ -92,7 +134,32 @@ impl ComputeRunner {
             let app_info = vk::ApplicationInfo::default()
                 .application_name(&app_name)
                 .api_version(vk::API_VERSION_1_3);
-            let inst_ci = vk::InstanceCreateInfo::default().application_info(&app_info);
+            // Window-system integration when the loader offers it (presenting
+            // is optional: compute-only use works without).
+            let avail_inst = entry.enumerate_instance_extension_properties(None)?;
+            let has_inst = |n: &std::ffi::CStr| {
+                avail_inst
+                    .iter()
+                    .any(|e| std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == n)
+            };
+            let mut inst_exts: Vec<*const i8> = Vec::new();
+            #[cfg(windows)]
+            let wsi_inst =
+                has_inst(ash::khr::surface::NAME) && has_inst(ash::khr::win32_surface::NAME);
+            #[cfg(not(windows))]
+            let wsi_inst = false;
+            if wsi_inst {
+                inst_exts.push(ash::khr::surface::NAME.as_ptr());
+                #[cfg(windows)]
+                inst_exts.push(ash::khr::win32_surface::NAME.as_ptr());
+            }
+            let hdr_colorspaces = wsi_inst && has_inst(ash::ext::swapchain_colorspace::NAME);
+            if hdr_colorspaces {
+                inst_exts.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
+            }
+            let inst_ci = vk::InstanceCreateInfo::default()
+                .application_info(&app_info)
+                .enabled_extension_names(&inst_exts);
             let instance = entry.create_instance(&inst_ci, None)?;
 
             let pdev = instance
@@ -141,10 +208,17 @@ impl ComputeRunner {
                 .queue_priorities(&prio)];
 
             let exts = instance.enumerate_device_extension_properties(pdev)?;
-            let has_ext_host = exts.iter().any(|e| {
-                std::ffi::CStr::from_ptr(e.extension_name.as_ptr())
-                    == ash::ext::external_memory_host::NAME
-            });
+            let has_ext = |name: &std::ffi::CStr| {
+                exts.iter()
+                    .any(|e| std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == name)
+            };
+            let has_ext_host = has_ext(ash::ext::external_memory_host::NAME);
+            let has_mesh_ext = has_ext(ash::ext::mesh_shader::NAME);
+            let has_vrs_ext = has_ext(ash::khr::fragment_shading_rate::NAME);
+            let has_xfb_ext = has_ext(ash::ext::transform_feedback::NAME);
+            let has_rt_ext = has_ext(ash::khr::ray_tracing_pipeline::NAME)
+                && has_ext(ash::khr::acceleration_structure::NAME)
+                && has_ext(ash::khr::deferred_host_operations::NAME);
 
             let mut host_mem_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
             let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::default();
@@ -162,10 +236,11 @@ impl ComputeRunner {
             let mut avail_f12 = vk::PhysicalDeviceVulkan12Features::default();
             let mut avail_f13 = vk::PhysicalDeviceVulkan13Features::default();
             let mut avail_quad = vk::PhysicalDeviceShaderQuadControlFeaturesKHR::default();
-            let has_quad_ext = exts.iter().any(|e| {
-                std::ffi::CStr::from_ptr(e.extension_name.as_ptr())
-                    == ash::khr::shader_quad_control::NAME
-            });
+            let mut avail_mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
+            let mut avail_vrs = vk::PhysicalDeviceFragmentShadingRateFeaturesKHR::default();
+            let mut avail_xfb = vk::PhysicalDeviceTransformFeedbackFeaturesEXT::default();
+            let mut avail_rt = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default();
+            let has_quad_ext = has_ext(ash::khr::shader_quad_control::NAME);
             let mut avail_f11 = vk::PhysicalDeviceVulkan11Features::default();
             let mut avail_feats2 = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut avail_f11)
@@ -174,16 +249,32 @@ impl ComputeRunner {
             if has_quad_ext {
                 avail_feats2 = avail_feats2.push_next(&mut avail_quad);
             }
+            if has_mesh_ext {
+                avail_feats2 = avail_feats2.push_next(&mut avail_mesh);
+            }
+            if has_vrs_ext {
+                avail_feats2 = avail_feats2.push_next(&mut avail_vrs);
+            }
+            if has_xfb_ext {
+                avail_feats2 = avail_feats2.push_next(&mut avail_xfb);
+            }
+            if has_rt_ext {
+                avail_feats2 = avail_feats2.push_next(&mut avail_rt);
+            }
             instance.get_physical_device_features2(pdev, &mut avail_feats2);
             let sampler_mirror_clamp_to_edge = avail_f12.sampler_mirror_clamp_to_edge == vk::TRUE;
             // Quad control rides on maximal reconvergence in the spec.
-            let has_reconv_ext = exts.iter().any(|e| {
-                std::ffi::CStr::from_ptr(e.extension_name.as_ptr())
-                    == ash::khr::shader_maximal_reconvergence::NAME
-            });
+            let has_reconv_ext = has_ext(ash::khr::shader_maximal_reconvergence::NAME);
             let quad_control =
                 has_quad_ext && has_reconv_ext && avail_quad.shader_quad_control == vk::TRUE;
-            let subgroup_size_control = avail_f13.subgroup_size_control == vk::TRUE
+            let mesh_shader = has_mesh_ext && avail_mesh.mesh_shader == vk::TRUE;
+            let task_shader = mesh_shader && avail_mesh.task_shader == vk::TRUE;
+            let fragment_shading_rate =
+                has_vrs_ext && avail_vrs.pipeline_fragment_shading_rate == vk::TRUE;
+            let transform_feedback = has_xfb_ext && avail_xfb.transform_feedback == vk::TRUE;
+            let ray_tracing_pipeline = has_rt_ext && avail_rt.ray_tracing_pipeline == vk::TRUE;
+            let subgroup_size_control_enabled = avail_f13.subgroup_size_control == vk::TRUE;
+            let subgroup_size_control = subgroup_size_control_enabled
                 && subgroup_size_props
                     .required_subgroup_size_stages
                     .contains(vk::ShaderStageFlags::COMPUTE);
@@ -191,6 +282,10 @@ impl ComputeRunner {
             let mut enabled_exts: Vec<*const i8> = Vec::new();
             if has_ext_host {
                 enabled_exts.push(ash::ext::external_memory_host::NAME.as_ptr());
+            }
+            let wsi = wsi_inst && has_ext(ash::khr::swapchain::NAME);
+            if wsi {
+                enabled_exts.push(ash::khr::swapchain::NAME.as_ptr());
             }
             let mut quad_feats =
                 vk::PhysicalDeviceShaderQuadControlFeaturesKHR::default().shader_quad_control(true);
@@ -200,6 +295,34 @@ impl ComputeRunner {
             if quad_control {
                 enabled_exts.push(ash::khr::shader_quad_control::NAME.as_ptr());
                 enabled_exts.push(ash::khr::shader_maximal_reconvergence::NAME.as_ptr());
+            }
+            let mut mesh_feats = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
+                .mesh_shader(mesh_shader)
+                .task_shader(task_shader);
+            if mesh_shader {
+                enabled_exts.push(ash::ext::mesh_shader::NAME.as_ptr());
+            }
+            let mut vrs_feats = vk::PhysicalDeviceFragmentShadingRateFeaturesKHR::default()
+                .pipeline_fragment_shading_rate(true)
+                .attachment_fragment_shading_rate(
+                    avail_vrs.attachment_fragment_shading_rate == vk::TRUE,
+                );
+            if fragment_shading_rate {
+                enabled_exts.push(ash::khr::fragment_shading_rate::NAME.as_ptr());
+            }
+            let mut xfb_feats =
+                vk::PhysicalDeviceTransformFeedbackFeaturesEXT::default().transform_feedback(true);
+            if transform_feedback {
+                enabled_exts.push(ash::ext::transform_feedback::NAME.as_ptr());
+            }
+            let mut rt_feats = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default()
+                .ray_tracing_pipeline(true);
+            let mut as_feats = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
+                .acceleration_structure(true);
+            if ray_tracing_pipeline {
+                enabled_exts.push(ash::khr::ray_tracing_pipeline::NAME.as_ptr());
+                enabled_exts.push(ash::khr::acceleration_structure::NAME.as_ptr());
+                enabled_exts.push(ash::khr::deferred_host_operations::NAME.as_ptr());
             }
 
             // Slang's `SV_VertexID` lowering declares the DrawParameters capability.
@@ -212,11 +335,38 @@ impl ComputeRunner {
             let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
                 .synchronization2(true)
                 .dynamic_rendering(true)
-                .subgroup_size_control(subgroup_size_control);
+                .subgroup_size_control(subgroup_size_control_enabled);
+            // Fixed-function state D3D12 titles use: per-MRT blend, wireframe,
+            // depth clamp (DepthClipEnable = FALSE), depth bounds, tessellation,
+            // geometry shaders, pipeline statistics, cube arrays, and format-less
+            // storage writes (translated shaders declare images without a format).
+            let av = instance.get_physical_device_features(pdev);
+            let on = |b: vk::Bool32| b == vk::TRUE;
+            let depth_clamp = on(av.depth_clamp);
+            let depth_bounds = on(av.depth_bounds);
+            let tessellation_shader = on(av.tessellation_shader);
+            let geometry_shader = on(av.geometry_shader);
+            let pipeline_statistics_query = on(av.pipeline_statistics_query);
             let core_feats = vk::PhysicalDeviceFeatures::default()
                 .shader_int64(true)
                 .sparse_binding(true)
-                .sparse_residency_image2_d(true);
+                .sparse_residency_image2_d(true)
+                .independent_blend(on(av.independent_blend))
+                .fill_mode_non_solid(on(av.fill_mode_non_solid))
+                .depth_clamp(depth_clamp)
+                .depth_bounds(depth_bounds)
+                .depth_bias_clamp(on(av.depth_bias_clamp))
+                .tessellation_shader(tessellation_shader)
+                .geometry_shader(geometry_shader)
+                .pipeline_statistics_query(pipeline_statistics_query)
+                .occlusion_query_precise(on(av.occlusion_query_precise))
+                .image_cube_array(on(av.image_cube_array))
+                .shader_storage_image_write_without_format(on(
+                    av.shader_storage_image_write_without_format
+                ))
+                .shader_storage_image_read_without_format(on(
+                    av.shader_storage_image_read_without_format
+                ));
 
             let mut dev_ci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&q_ci)
@@ -230,10 +380,30 @@ impl ComputeRunner {
                     .push_next(&mut quad_feats)
                     .push_next(&mut reconv_feats);
             }
+            if mesh_shader {
+                dev_ci = dev_ci.push_next(&mut mesh_feats);
+            }
+            if fragment_shading_rate {
+                dev_ci = dev_ci.push_next(&mut vrs_feats);
+            }
+            if transform_feedback {
+                dev_ci = dev_ci.push_next(&mut xfb_feats);
+            }
+            if ray_tracing_pipeline {
+                dev_ci = dev_ci.push_next(&mut rt_feats).push_next(&mut as_feats);
+            }
 
             let device = instance.create_device(pdev, &dev_ci, None)?;
             let ext_host_mem = has_ext_host
                 .then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
+            let ext_mesh_shader =
+                mesh_shader.then(|| ash::ext::mesh_shader::Device::new(&instance, &device));
+            let khr_fragment_shading_rate = fragment_shading_rate
+                .then(|| ash::khr::fragment_shading_rate::Device::new(&instance, &device));
+            let ext_transform_feedback = transform_feedback
+                .then(|| ash::ext::transform_feedback::Device::new(&instance, &device));
+            let khr_ray_tracing_pipeline = ray_tracing_pipeline
+                .then(|| ash::khr::ray_tracing_pipeline::Device::new(&instance, &device));
             let queue = device.get_device_queue(qfamily, 0);
 
             let pool_ci = vk::CommandPoolCreateInfo::default()
@@ -241,11 +411,17 @@ impl ComputeRunner {
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
             let cmd_pool = device.create_command_pool(&pool_ci, None)?;
 
+            let n = crate::layout::image_capacity(&props.limits);
+            if n == 0 {
+                return Err(GpuError::ImageSlots {
+                    required: 1,
+                    available: 0,
+                });
+            }
             let crate::layout::GlobalLayout {
                 set_layout,
                 pipeline_layout: pipe_layout,
-            } = crate::layout::GlobalLayout::create(&device)?;
-            let n = strata_shader::spirv::IMAGE_ARRAY_LEN;
+            } = crate::layout::GlobalLayout::create(&device, n)?;
             let pool_sizes = crate::layout::SET0_BINDINGS.map(|(_, ty)| vk::DescriptorPoolSize {
                 ty,
                 descriptor_count: n * 8,
@@ -262,6 +438,22 @@ impl ComputeRunner {
             let min_subgroup_size = subgroup_size_props.min_subgroup_size;
             let max_subgroup_size = subgroup_size_props.max_subgroup_size;
             let native_wave64 = max_subgroup_size >= 64;
+            let native_wave64_stages = if native_wave64
+                && subgroup_props
+                    .supported_operations
+                    .contains(vk::SubgroupFeatureFlags::SHUFFLE)
+            {
+                if subgroup_size == 64 {
+                    subgroup_props.supported_stages
+                } else if subgroup_size_control_enabled {
+                    subgroup_props.supported_stages
+                        & subgroup_size_props.required_subgroup_size_stages
+                } else {
+                    vk::ShaderStageFlags::empty()
+                }
+            } else {
+                vk::ShaderStageFlags::empty()
+            };
             let max_workgroup_count = props.limits.max_compute_work_group_count;
             let pipeline_cache =
                 device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)?;
@@ -279,17 +471,44 @@ impl ComputeRunner {
                 set_layout,
                 desc_pool: Mutex::new(desc_pool),
                 default_image: None,
+                default_3d: None,
+                default_cube: None,
+                default_cube_view: vk::ImageView::null(),
                 default_sampler: vk::Sampler::null(),
                 sampler_mirror_clamp_to_edge,
+                depth_clamp,
+                depth_bounds,
+                tessellation_shader,
+                geometry_shader,
+                pipeline_statistics_query,
+                ext_mesh_shader,
+                mesh_shader,
+                task_shader,
+                khr_fragment_shading_rate,
+                fragment_shading_rate,
+                ext_transform_feedback,
+                transform_feedback,
+                khr_ray_tracing_pipeline,
+                ray_tracing_pipeline,
+                wsi,
+                hdr_colorspaces,
+                queue_family: qfamily,
                 quad_control,
                 device_name,
+                driver_version: props.driver_version,
+                image_slots: n,
+                timestamp_period: props.limits.timestamp_period,
+                timestamp_bits: qprops[qfamily as usize].timestamp_valid_bits,
                 subgroup_size,
                 min_subgroup_size,
                 max_subgroup_size,
                 native_wave64,
+                native_wave64_stages,
                 subgroup_size_control,
                 max_workgroup_count,
                 pipeline_cache,
+                pipeline_cache_lock: Mutex::new(()),
+                pipeline_usage: Mutex::default(),
                 pipelines: Mutex::new(HashMap::new()),
                 gfx_pipelines: Mutex::new(HashMap::new()),
             };
@@ -309,6 +528,44 @@ impl ComputeRunner {
         )?;
         self.upload_image(&img, &[0, 0, 0, 0])?;
         self.default_image = Some(img);
+        use crate::images::{ImageShape, ImageSpec};
+        for (shape, is_3d) in [
+            (ImageShape::D3 { depth: 1 }, true),
+            (ImageShape::Cube { cubes: 1 }, false),
+        ] {
+            let img = self.create_image(&ImageSpec {
+                format: vk::Format::R8G8B8A8_UNORM,
+                width: 1,
+                height: 1,
+                shape,
+                mips: 1,
+                storage: true,
+                components: vk::ComponentMapping::default(),
+            })?;
+            let zeros = vec![0u8; 4 * shape.slices() as usize];
+            self.upload_image_levels(&img, &zeros, 1)?;
+            if is_3d {
+                self.default_3d = Some(img);
+            } else {
+                // SAFETY: a view of an image we own, destroyed with the runner.
+                self.default_cube_view = unsafe {
+                    self.device.create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(img.image)
+                            .view_type(vk::ImageViewType::CUBE)
+                            .format(img.format)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .level_count(1)
+                                    .layer_count(6),
+                            ),
+                        None,
+                    )?
+                };
+                self.default_cube = Some(img);
+            }
+        }
         self.default_sampler = self.create_sampler(
             &strata_shader::descriptor::SamplerDescriptor::decode([0; 4]),
         )?;
@@ -323,19 +580,43 @@ impl ComputeRunner {
         &self,
         b: &crate::images::ImageBindings,
     ) -> Result<vk::DescriptorSet, GpuError> {
-        let default = self.default_image.as_ref().expect("defaults initialised");
-        let n = crate::images::IMAGE_SLOTS;
-        let tex: Vec<vk::DescriptorImageInfo> = (0..n)
-            .map(|i| {
-                let view = b
-                    .textures
-                    .get(i)
-                    .copied()
-                    .flatten()
-                    .map_or(default.view, |(v, _)| v);
-                vk::DescriptorImageInfo::default()
-                    .image_view(view)
-                    .image_layout(vk::ImageLayout::GENERAL)
+        use strata_shader::resource::ImageDim;
+        use strata_shader::spirv::{storage_binding, texture_binding};
+        let d2 = self.default_image.as_ref().expect("defaults initialised");
+        let d3 = self.default_3d.as_ref().expect("defaults initialised");
+        let cube = self.default_cube.as_ref().expect("defaults initialised");
+        let cube_array = cube.alt_views[1].expect("a cube has an array view");
+        // Storage-capable images have identity views; the cube's main view
+        // is its array view (a cube cannot be a storage view), so sampled
+        // cube slots use a dedicated cube view made at init.
+        let default_view = |dim: ImageDim, storage: bool| match dim {
+            ImageDim::D2 => d2.view,
+            ImageDim::D3 => d3.view,
+            ImageDim::Cube if !storage => self.default_cube_view,
+            ImageDim::Cube | ImageDim::D2Array => cube_array,
+        };
+        let n = self.image_slots as usize;
+        let info = |view: vk::ImageView| {
+            vk::DescriptorImageInfo::default()
+                .image_view(view)
+                .image_layout(vk::ImageLayout::GENERAL)
+        };
+        let tex: Vec<(u32, Vec<vk::DescriptorImageInfo>)> = strata_shader::spirv::IMAGE_DIMS
+            .iter()
+            .map(|&dim| {
+                let infos = (0..n)
+                    .map(|i| {
+                        let view = b
+                            .textures
+                            .get(i)
+                            .copied()
+                            .flatten()
+                            .filter(|t| t.2 == dim)
+                            .map_or(default_view(dim, false), |t| t.0);
+                        info(view)
+                    })
+                    .collect();
+                (texture_binding(dim), infos)
             })
             .collect();
         let samp: Vec<vk::DescriptorImageInfo> = (0..n)
@@ -345,19 +626,30 @@ impl ComputeRunner {
                     .get(i)
                     .copied()
                     .flatten()
-                    .and_then(|(_, s)| s)
+                    .and_then(|t| t.1)
                     .unwrap_or(self.default_sampler);
                 vk::DescriptorImageInfo::default().sampler(s)
             })
             .collect();
-        let stor: Vec<vk::DescriptorImageInfo> = (0..n)
-            .map(|i| {
-                let view = b.storage.get(i).copied().flatten().unwrap_or(default.view);
-                vk::DescriptorImageInfo::default()
-                    .image_view(view)
-                    .image_layout(vk::ImageLayout::GENERAL)
-            })
-            .collect();
+        let stor: Vec<(u32, Vec<vk::DescriptorImageInfo>)> =
+            [ImageDim::D2, ImageDim::D3, ImageDim::D2Array]
+                .iter()
+                .map(|&dim| {
+                    let infos = (0..n)
+                        .map(|i| {
+                            let view = b
+                                .storage
+                                .get(i)
+                                .copied()
+                                .flatten()
+                                .filter(|t| t.1 == dim)
+                                .map_or(default_view(dim, true), |t| t.0);
+                            info(view)
+                        })
+                        .collect();
+                    (storage_binding(dim), infos)
+                })
+                .collect();
         let pool = self.desc_pool.lock().unwrap_or_else(|e| e.into_inner());
         let layouts = [self.set_layout];
         // SAFETY: forwarded from the caller; the pool lock serialises its use.
@@ -367,23 +659,31 @@ impl ComputeRunner {
                     .descriptor_pool(*pool)
                     .set_layouts(&layouts),
             )?[0];
-            let writes = [
+            let mut writes = vec![
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .image_info(&tex),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(1)
+                    .dst_binding(strata_shader::spirv::BINDING_SAMPLERS)
                     .descriptor_type(vk::DescriptorType::SAMPLER)
                     .image_info(&samp),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(2)
-                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                    .image_info(&stor),
             ];
+            for (binding, infos) in &tex {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(*binding)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(infos),
+                );
+            }
+            for (binding, infos) in &stor {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(*binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(infos),
+                );
+            }
             self.device.update_descriptor_sets(&writes, &[]);
             Ok(set)
         }
@@ -405,6 +705,9 @@ impl ComputeRunner {
                 .size(size)
                 .usage(
                     vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::INDEX_BUFFER
+                        | vk::BufferUsageFlags::VERTEX_BUFFER
+                        | vk::BufferUsageFlags::INDIRECT_BUFFER
                         | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                         | vk::BufferUsageFlags::TRANSFER_SRC
                         | vk::BufferUsageFlags::TRANSFER_DST,
@@ -475,6 +778,9 @@ impl ComputeRunner {
                 .size(size)
                 .usage(
                     vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::INDEX_BUFFER
+                        | vk::BufferUsageFlags::VERTEX_BUFFER
+                        | vk::BufferUsageFlags::INDIRECT_BUFFER
                         | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                         | vk::BufferUsageFlags::TRANSFER_SRC
                         | vk::BufferUsageFlags::TRANSFER_DST,
@@ -541,6 +847,9 @@ impl ComputeRunner {
                 .size(size)
                 .usage(
                     vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::INDEX_BUFFER
+                        | vk::BufferUsageFlags::VERTEX_BUFFER
+                        | vk::BufferUsageFlags::INDIRECT_BUFFER
                         | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                         | vk::BufferUsageFlags::TRANSFER_SRC
                         | vk::BufferUsageFlags::TRANSFER_DST,
@@ -1102,6 +1411,17 @@ impl ComputeRunner {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
+            let prior_writes = [vk::MemoryBarrier2::default()
+                .src_stage_mask(
+                    vk::PipelineStageFlags2::ALL_COMMANDS | vk::PipelineStageFlags2::HOST,
+                )
+                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE | vk::AccessFlags2::HOST_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)];
+            self.device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&prior_writes),
+            );
             self.device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             self.device.cmd_bind_descriptor_sets(
@@ -1124,8 +1444,10 @@ impl ComputeRunner {
             let host_read = [vk::MemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::HOST)
-                .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+                .dst_stage_mask(
+                    vk::PipelineStageFlags2::HOST | vk::PipelineStageFlags2::ALL_COMMANDS,
+                )
+                .dst_access_mask(vk::AccessFlags2::HOST_READ | vk::AccessFlags2::MEMORY_READ)];
             self.device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().memory_barriers(&host_read),
@@ -1149,6 +1471,8 @@ impl ComputeRunner {
         if let Some(&(_, p)) = table.get(&key) {
             return Ok(p);
         }
+        self.check_shader_images(spirv_words)?;
+        let start = std::time::Instant::now();
         unsafe {
             let sm_ci = vk::ShaderModuleCreateInfo::default().code(spirv_words);
             let module = self.device.create_shader_module(&sm_ci, None)?;
@@ -1166,6 +1490,7 @@ impl ComputeRunner {
                 .flags(vk::PipelineCreateFlags::DISPATCH_BASE)
                 .stage(stage)
                 .layout(self.pipe_layout)];
+            let _cache = self.pipeline_cache_lock.lock().unwrap();
             let created = self
                 .device
                 .create_compute_pipelines(self.pipeline_cache, &pipe_ci, None)
@@ -1178,6 +1503,15 @@ impl ComputeRunner {
                 }
             };
             table.insert(key, (module, pipeline));
+            self.record_pipeline(
+                format!("cs-{:016x}-{}", key.0, key.1),
+                false,
+                start.elapsed(),
+                || crate::pipeline_usage::Recipe::Compute {
+                    code: spirv_words.to_vec(),
+                    subgroup: size,
+                },
+            );
             Ok(pipeline)
         }
     }
@@ -1196,6 +1530,36 @@ impl ComputeRunner {
         self.pipeline_cache
     }
 
+    pub(crate) fn check_shader_images(&self, words: &[u32]) -> Result<(), GpuError> {
+        if let Some(required) = strata_shader::spirv::required_image_slots(words)
+            && required > self.image_slots
+        {
+            return Err(GpuError::ImageSlots {
+                required,
+                available: self.image_slots,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn adapter_cache_key(&self) -> String {
+        let props = unsafe { self.instance.get_physical_device_properties(self.pdev) };
+        let uuid: String = props
+            .pipeline_cache_uuid
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!(
+            "{:04x}-{:04x}-{:08x}-{}-{}-{}",
+            props.vendor_id,
+            props.device_id,
+            props.driver_version,
+            uuid,
+            self.image_slots,
+            strata_shader::cache::COMPILER_VERSION
+        )
+    }
+
     pub fn cached_pipeline_count(&self) -> usize {
         self.pipelines
             .lock()
@@ -1206,10 +1570,29 @@ impl ComputeRunner {
     /// Merges a `VkPipelineCache` blob saved by [`Self::save_pipeline_cache`].
     /// A blob from another driver or device is rejected and ignored.
     pub fn load_pipeline_cache(&self, path: &Path) -> Result<bool, GpuError> {
+        if !path
+            .metadata()
+            .is_ok_and(|m| (32..=64 * 1024 * 1024).contains(&m.len()))
+        {
+            return Ok(false);
+        }
         let Ok(data) = std::fs::read(path) else {
             return Ok(false);
         };
-        let _table = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+        let props = unsafe { self.instance.get_physical_device_properties(self.pdev) };
+        let Some(header) = data.get(..32) else {
+            return Ok(false);
+        };
+        let word = |i: usize| u32::from_le_bytes(header[i..i + 4].try_into().unwrap());
+        if !(32..=data.len()).contains(&(word(0) as usize))
+            || word(4) != 1
+            || word(8) != props.vendor_id
+            || word(12) != props.device_id
+            || header[16..32] != props.pipeline_cache_uuid
+        {
+            return Ok(false);
+        }
+        let _cache = self.pipeline_cache_lock.lock().unwrap();
         unsafe {
             let ci = vk::PipelineCacheCreateInfo::default().initial_data(&data);
             let Ok(loaded) = self.device.create_pipeline_cache(&ci, None) else {
@@ -1227,16 +1610,11 @@ impl ComputeRunner {
     /// Writes the driver's pipeline cache atomically (`.tmp`, then rename).
     pub fn save_pipeline_cache(&self, path: &Path) -> Result<usize, GpuError> {
         let data = {
-            let _table = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+            let _cache = self.pipeline_cache_lock.lock().unwrap();
             unsafe { self.device.get_pipeline_cache_data(self.pipeline_cache)? }
         };
         let io = |e: std::io::Error| GpuError::Io(e.to_string());
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(io)?;
-        }
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &data).map_err(io)?;
-        std::fs::rename(&tmp, path).map_err(io)?;
+        crate::present::write_atomic(path, &data).map_err(io)?;
         Ok(data.len())
     }
 
@@ -1301,6 +1679,51 @@ impl ComputeRunner {
         }
     }
 
+    /// Reads a real calibrated GPU timestamp in nanoseconds using a Vulkan
+    /// `QueryType::TIMESTAMP` query pool and `vkCmdWriteTimestamp`.
+    pub fn query_gpu_timestamp_ns(&self) -> Result<u64, GpuError> {
+        unsafe {
+            let pool = self.device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(1),
+                None,
+            )?;
+            let cmd = self.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0];
+            self.device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            self.device.cmd_reset_query_pool(cmd, pool, 0, 1);
+            self.device
+                .cmd_write_timestamp(cmd, vk::PipelineStageFlags::ALL_COMMANDS, pool, 0);
+            self.device.end_command_buffer(cmd)?;
+            let submit_res = self.submit_and_wait(cmd);
+            let mut ticks = [0u64; 1];
+            let query_res = submit_res.and_then(|()| {
+                self.device
+                    .get_query_pool_results(
+                        pool,
+                        0,
+                        &mut ticks,
+                        vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                    )
+                    .map_err(Into::into)
+            });
+            self.device.destroy_query_pool(pool, None);
+            query_res?;
+            let props = self.instance.get_physical_device_properties(self.pdev);
+            let period_ns = f64::from(props.limits.timestamp_period.max(1.0));
+            Ok((ticks[0] as f64 * period_ns) as u64)
+        }
+    }
+
     /// # Safety
     /// `cmd` is a recorded primary command buffer from `cmd_pool`.
     pub(crate) unsafe fn submit_and_wait(&self, cmd: vk::CommandBuffer) -> Result<(), GpuError> {
@@ -1334,14 +1757,28 @@ impl Drop for ComputeRunner {
                 .gfx_pipelines
                 .get_mut()
                 .unwrap_or_else(|e| e.into_inner());
-            for (_, (vsm, psm, pipeline)) in gfx.drain() {
+            for (_, (modules, pipeline)) in gfx.drain() {
                 self.device.destroy_pipeline(pipeline, None);
-                self.device.destroy_shader_module(vsm, None);
-                self.device.destroy_shader_module(psm, None);
+                for m in modules {
+                    self.device.destroy_shader_module(m, None);
+                }
             }
             self.device
                 .destroy_pipeline_cache(self.pipeline_cache, None);
-            if let Some(img) = self.default_image.take() {
+            if self.default_cube_view != vk::ImageView::null() {
+                self.device.destroy_image_view(self.default_cube_view, None);
+            }
+            for img in [
+                self.default_image.take(),
+                self.default_3d.take(),
+                self.default_cube.take(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                for v in img.alt_views.into_iter().flatten() {
+                    self.device.destroy_image_view(v, None);
+                }
                 self.device.destroy_image_view(img.view, None);
                 self.device.destroy_image(img.image, None);
                 self.device.free_memory(img.memory, None);

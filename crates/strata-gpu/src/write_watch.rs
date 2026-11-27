@@ -20,11 +20,18 @@ unsafe extern "system" {
         granularity: *mut u32,
     ) -> u32;
     fn ResetWriteWatch(base: *mut c_void, size: usize) -> u32;
+    fn VirtualProtect(
+        addr: *mut c_void,
+        size: usize,
+        new_protect: u32,
+        old_protect: *mut u32,
+    ) -> i32;
 }
 
 const MEM_COMMIT_RESERVE_WATCH: u32 = 0x1000 | 0x2000 | 0x20_0000;
 const MEM_RELEASE: u32 = 0x8000;
 const PAGE_READWRITE: u32 = 0x04;
+const PAGE_GUARD: u32 = 0x100;
 const WRITE_WATCH_FLAG_RESET: u32 = 1;
 pub const PAGE: usize = 4096;
 
@@ -134,6 +141,65 @@ pub fn join_pages(offsets: &[usize], page: usize) -> Vec<(usize, usize)> {
         }
     }
     out
+}
+
+/// `PAGE_GUARD`-based dirty-page tracker for arbitrary title memory ranges
+/// that were not allocated with `MEM_WRITE_WATCH`.
+pub struct PageGuardTracker {
+    base: usize,
+    size: usize,
+    dirty_pages: std::sync::Mutex<Vec<usize>>,
+}
+
+impl PageGuardTracker {
+    pub fn new(base: usize, size: usize) -> Self {
+        Self {
+            base,
+            size: size.next_multiple_of(PAGE),
+            dirty_pages: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Arms `PAGE_GUARD` on every page in this range so the next CPU write
+    /// raises `STATUS_GUARD_PAGE_VIOLATION` and notifies [`Self::record_fault`].
+    #[cfg(windows)]
+    pub fn arm_guards(&self) -> bool {
+        if self.base == 0 || self.size == 0 {
+            return false;
+        }
+        let mut old = 0u32;
+        unsafe {
+            VirtualProtect(
+                self.base as *mut c_void,
+                self.size,
+                PAGE_READWRITE | PAGE_GUARD,
+                &mut old,
+            ) != 0
+        }
+    }
+
+    /// Records a `PAGE_GUARD` fault address if it falls inside this tracker's range.
+    pub fn record_fault(&self, fault_addr: usize) -> bool {
+        if fault_addr < self.base || fault_addr >= self.base.saturating_add(self.size) {
+            return false;
+        }
+        let page_off = (fault_addr - self.base) & !(PAGE - 1);
+        self.dirty_pages.lock().unwrap().push(page_off);
+        true
+    }
+
+    /// Drains all faulted pages since the last check, coalesced into contiguous ranges.
+    pub fn drain_dirty_ranges(&self) -> Vec<(usize, usize)> {
+        let mut guard = self.dirty_pages.lock().unwrap();
+        if guard.is_empty() {
+            return Vec::new();
+        }
+        guard.sort_unstable();
+        guard.dedup();
+        let ranges = join_pages(&guard, PAGE);
+        guard.clear();
+        ranges
+    }
 }
 
 #[cfg(all(test, windows))]

@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ash.workspace = true
+serde_json.workspace = true
 strata-shader = { path = "../strata-shader" }
 strata-runtime-shaders = { path = "../strata-runtime-shaders" }
 strata-gpu = { path = "../strata-gpu" }

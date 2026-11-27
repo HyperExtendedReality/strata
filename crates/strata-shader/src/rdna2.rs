@@ -696,7 +696,12 @@ fn decode_atomic_op(op: u32) -> Result<AtomicOp, DecodeError> {
         0x38 => AtomicOp::And,
         0x39 => AtomicOp::Or,
         0x3a => AtomicOp::Xor,
-        _ => return Err(DecodeError::Unsupported { word: op, offset: 0 }),
+        _ => {
+            return Err(DecodeError::Unsupported {
+                word: op,
+                offset: 0,
+            });
+        }
     })
 }
 
@@ -1059,7 +1064,11 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
             let s2 = ((w1 >> 18) & 0x1ff) as u16;
             let lit = if s0 == 255 || s1 == 255 || s2 == 255 {
                 len = 3;
-                Some(*words.get(pc + 2).ok_or(DecodeError::Truncated { offset: pc })?)
+                Some(
+                    *words
+                        .get(pc + 2)
+                        .ok_or(DecodeError::Truncated { offset: pc })?,
+                )
             } else {
                 None
             };
@@ -1680,14 +1689,54 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
             let dst = ((w >> 6) & 0x7f) as u8;
             let offset = (w1 & 0x1f_ffff) as i32;
             match op {
-                0x00 => Inst::SLoadDword { dst, count: 1, sbase, offset },
-                0x01 => Inst::SLoadDword { dst, count: 2, sbase, offset },
-                0x02 => Inst::SLoadDword { dst, count: 4, sbase, offset },
-                0x03 => Inst::SLoadDword { dst, count: 8, sbase, offset },
-                0x08 => Inst::SBufferLoadDword { dst, count: 1, srsrc: sbase, offset },
-                0x09 => Inst::SBufferLoadDword { dst, count: 2, srsrc: sbase, offset },
-                0x0a => Inst::SBufferLoadDword { dst, count: 4, srsrc: sbase, offset },
-                0x0b => Inst::SBufferLoadDword { dst, count: 8, srsrc: sbase, offset },
+                0x00 => Inst::SLoadDword {
+                    dst,
+                    count: 1,
+                    sbase,
+                    offset,
+                },
+                0x01 => Inst::SLoadDword {
+                    dst,
+                    count: 2,
+                    sbase,
+                    offset,
+                },
+                0x02 => Inst::SLoadDword {
+                    dst,
+                    count: 4,
+                    sbase,
+                    offset,
+                },
+                0x03 => Inst::SLoadDword {
+                    dst,
+                    count: 8,
+                    sbase,
+                    offset,
+                },
+                0x08 => Inst::SBufferLoadDword {
+                    dst,
+                    count: 1,
+                    srsrc: sbase,
+                    offset,
+                },
+                0x09 => Inst::SBufferLoadDword {
+                    dst,
+                    count: 2,
+                    srsrc: sbase,
+                    offset,
+                },
+                0x0a => Inst::SBufferLoadDword {
+                    dst,
+                    count: 4,
+                    srsrc: sbase,
+                    offset,
+                },
+                0x0b => Inst::SBufferLoadDword {
+                    dst,
+                    count: 8,
+                    srsrc: sbase,
+                    offset,
+                },
                 _ => {
                     return Err(DecodeError::Unsupported {
                         word: w,
@@ -2076,6 +2125,13 @@ pub mod encode {
         [w0, w1]
     }
 
+    pub fn ds_bpermute_b32(dst: u8, addr: u8, data: u8) -> [u32; 2] {
+        [
+            (0b1101_10 << 26) | (0xb1 << 18),
+            (u32::from(dst) << 24) | (u32::from(data) << 8) | u32::from(addr),
+        ]
+    }
+
     pub fn global_load_dword(dst: u8, vaddr: u8, saddr: u8, offset: u16) -> [u32; 2] {
         let w0 = (0b1101_11 << 26) | (0x0c << 18) | (offset as u32 & 0xfff);
         let w1 = ((dst as u32) << 24) | ((saddr as u32) << 16) | (vaddr as u32);
@@ -2133,6 +2189,28 @@ pub mod encode {
     /// `image_store v[data..], v[addr..addr+1], s[rsrc..+7] dmask dim:2D`.
     pub fn image_store_2d(data: u8, addr: u8, rsrc: u8, dmask: u8) -> [u32; 2] {
         mimg(0x08, 1, dmask, addr, data, rsrc, 0)
+    }
+
+    /// `image_sample_lz` with any MIMG `dim` (0..=7).
+    pub fn image_sample_lz_dim(
+        dim: u32,
+        dst: u8,
+        addr: u8,
+        rsrc: u8,
+        samp: u8,
+        dmask: u8,
+    ) -> [u32; 2] {
+        mimg(0x27, dim, dmask, addr, dst, rsrc, samp)
+    }
+
+    /// `image_load` with any MIMG `dim`.
+    pub fn image_load_dim(dim: u32, dst: u8, addr: u8, rsrc: u8, dmask: u8) -> [u32; 2] {
+        mimg(0x00, dim, dmask, addr, dst, rsrc, 0)
+    }
+
+    /// `image_store` with any MIMG `dim`.
+    pub fn image_store_dim(dim: u32, data: u8, addr: u8, rsrc: u8, dmask: u8) -> [u32; 2] {
+        mimg(0x08, dim, dmask, addr, data, rsrc, 0)
     }
 
     /// `tbuffer_load_format_{x,xy,xyz,xyzw}` (`count` 1..=4) with a typed

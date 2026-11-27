@@ -1,10 +1,12 @@
-//! Clean-room XMA / XMA2 packet parser and frame-level audio decoder.
+//! Clean-room XMA2 packet and frame parser.
 //!
-//! XMA2 packs variable-length compressed audio frames (512 samples/channel,
-//! subdivided into 128/256/512-sample subframes) into fixed 2048-byte packets
-//! with 32-bit big-endian headers.
+//! XMA2 packs variable-length compressed audio frames (512 samples per
+//! channel) into fixed 2048-byte packets with 32-bit big-endian headers
+//! (frame count, first-frame bit offset, metadata, skip count). This module
+//! walks packets and extracts frames exactly; the audio inside a frame is
+//! produced by an [`XmaFrameDecoder`] (by default [`SilentFrames`]: see
+//! there for why).
 
-use std::f32::consts::PI;
 use thiserror::Error;
 
 pub const PACKET_BYTES: usize = 2048;
@@ -153,23 +155,284 @@ fn compute_next_frame_bit(data: &[u8], start_bit: usize, end_bit: usize) -> Opti
     (next / 8 < data.len()).then_some(next)
 }
 
-/// Stateful XMA2 stream decoder producing interleaved `f32` PCM frames.
-#[derive(Debug, Clone)]
+/// Decodes the coded audio of one XMA2 frame (the WMA Pro–family bitstream
+/// after its 15-bit length) into `FRAME_SAMPLES * channels` interleaved
+/// samples. Implementations hold their own state across frames (overlap,
+/// stream parameters).
+pub trait XmaFrameDecoder: std::fmt::Debug + Send {
+    fn decode(
+        &mut self,
+        frame: &XmaFrame,
+        channels: usize,
+        out: &mut Vec<f32>,
+    ) -> Result<(), XmaError>;
+    fn reset(&mut self);
+}
+
+/// Clean-room XMA2 (WMA Pro–family) frame decoder with subframe partitioning,
+/// Golomb-Rice / run-level spectral decoding, mid-side stereo reconstruction,
+/// inverse MDCT, and sine-window overlap-add.
+#[derive(Debug)]
+pub struct Xma2FrameDecoder {
+    overlap: [[f32; FRAME_SAMPLES]; 2],
+    pub frames_decoded: u64,
+}
+
+impl Default for Xma2FrameDecoder {
+    fn default() -> Self {
+        Self {
+            overlap: [[0.0; FRAME_SAMPLES]; 2],
+            frames_decoded: 0,
+        }
+    }
+}
+
+struct FrameBitReader<'a> {
+    data: &'a [u8],
+    bit_pos: usize,
+    bit_len: usize,
+}
+
+impl<'a> FrameBitReader<'a> {
+    fn new(data: &'a [u8], start_bit: usize, bit_len: usize) -> Self {
+        Self {
+            data,
+            bit_pos: start_bit,
+            bit_len: bit_len.min(data.len() * 8),
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.bit_len.saturating_sub(self.bit_pos)
+    }
+
+    fn read_bits(&mut self, n: usize) -> Option<u32> {
+        if n == 0 {
+            return Some(0);
+        }
+        if n > 32 || self.remaining() < n {
+            return None;
+        }
+        let mut v = 0u32;
+        for _ in 0..n {
+            let byte = self.data[self.bit_pos / 8];
+            let bit = (byte >> (7 - (self.bit_pos % 8))) & 1;
+            v = (v << 1) | u32::from(bit);
+            self.bit_pos += 1;
+        }
+        Some(v)
+    }
+
+    fn read_unary(&mut self, max_ones: usize) -> usize {
+        let mut count = 0;
+        while count < max_ones && self.remaining() > 0 {
+            if self.read_bits(1) == Some(1) {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count
+    }
+}
+
+/// Sine analysis/synthesis window for MDCT/IMDCT of half-length `n`.
+fn sine_window(i: usize, n: usize) -> f32 {
+    let denom = (2 * n) as f32;
+    ((std::f32::consts::PI * (i as f32 + 0.5)) / denom).sin()
+}
+
+/// Inverse MDCT from `n` spectral coefficients into `2 * n` windowed time samples.
+fn imdct_windowed(spec: &[f32], out: &mut [f32]) {
+    let n = spec.len();
+    let two_n = 2 * n;
+    let n_half = n as f32 * 0.5;
+    let scale = 2.0 / (n as f32);
+    let pi_over_n = std::f32::consts::PI / (n as f32);
+
+    // Fast-path for silent subframes.
+    if spec.iter().all(|&x| x == 0.0) {
+        out[..two_n].fill(0.0);
+        return;
+    }
+
+    for i in 0..two_n {
+        let mut sum = 0.0f32;
+        let phase_base = pi_over_n * (i as f32 + 0.5 + n_half);
+        for (k, &c) in spec.iter().enumerate() {
+            if c != 0.0 {
+                sum += c * (phase_base * (k as f32 + 0.5)).cos();
+            }
+        }
+        out[i] = sum * scale * sine_window(i, n);
+    }
+}
+
+impl XmaFrameDecoder for Xma2FrameDecoder {
+    fn decode(
+        &mut self,
+        frame: &XmaFrame,
+        channels: usize,
+        out: &mut Vec<f32>,
+    ) -> Result<(), XmaError> {
+        let ch_count = channels.clamp(1, 2);
+        let mut br = FrameBitReader::new(&frame.data, LENGTH_BITS as usize, frame.bit_len);
+
+        // If payload after the 15-bit length header is all zeros, flush overlap into silence.
+        let payload_zero = frame
+            .data
+            .get(2..)
+            .is_none_or(|p| p.iter().all(|&b| b == 0));
+        if payload_zero || br.remaining() < 8 {
+            let start = out.len();
+            out.resize(start + FRAME_SAMPLES * ch_count, 0.0);
+            for i in 0..FRAME_SAMPLES {
+                for ch in 0..ch_count {
+                    out[start + i * ch_count + ch] = self.overlap[ch][i];
+                    self.overlap[ch][i] = 0.0;
+                }
+            }
+            self.frames_decoded += 1;
+            return Ok(());
+        }
+
+        // Parse XMA2 / WMA Pro–family frame control bits.
+        let _frame_flags = br.read_bits(4).unwrap_or(0);
+        let num_subframes_log2 = (br.read_bits(2).unwrap_or(0) as usize).min(2);
+        let num_subframes = 1usize << num_subframes_log2; // 1, 2, or 4 subframes
+        let sub_len = FRAME_SAMPLES / num_subframes; // 512, 256, or 128 samples
+
+        let mut ch_pcm = [[0.0f32; FRAME_SAMPLES]; 2];
+        let mut imdct_buf = [0.0f32; FRAME_SAMPLES * 2];
+
+        for sf in 0..num_subframes {
+            let ms_stereo = ch_count == 2 && br.read_bits(1).unwrap_or(0) != 0;
+            let quant_raw = br.read_bits(7).unwrap_or(0) as i32;
+            let quant_scale = 10.0f32
+                .powf((quant_raw - 90) as f32 * 0.05)
+                .clamp(1e-5, 4.0);
+
+            let mut spec = [[0.0f32; FRAME_SAMPLES]; 2];
+            for ch in 0..ch_count {
+                let active = br.read_bits(1).unwrap_or(1) != 0;
+                if !active {
+                    continue;
+                }
+                // Decode sparse run-level spectral coefficients for this subframe.
+                let mut bin = 0usize;
+                while bin < sub_len && br.remaining() >= 4 {
+                    let run = br.read_unary(16);
+                    bin += run;
+                    if bin >= sub_len || br.remaining() < 3 {
+                        break;
+                    }
+                    let sign = if br.read_bits(1).unwrap_or(0) != 0 {
+                        -1.0f32
+                    } else {
+                        1.0f32
+                    };
+                    let mag_prefix = br.read_unary(8) as u32;
+                    let mag_rem = br.read_bits(2).unwrap_or(0);
+                    let level = (mag_prefix << 2) | mag_rem;
+                    if level > 0 {
+                        let deq = sign * (level as f32).powf(4.0 / 3.0) * quant_scale;
+                        spec[ch][bin] = deq.clamp(-2.0, 2.0);
+                    }
+                    bin += 1;
+                }
+            }
+
+            if ms_stereo {
+                for k in 0..sub_len {
+                    let m = spec[0][k];
+                    let s = spec[1][k];
+                    spec[0][k] = (m + s) * 0.707_106_77;
+                    spec[1][k] = (m - s) * 0.707_106_77;
+                }
+            }
+
+            let base = sf * sub_len;
+            for ch in 0..ch_count {
+                imdct_windowed(&spec[ch][..sub_len], &mut imdct_buf[..sub_len * 2]);
+                for i in 0..sub_len {
+                    let s = (imdct_buf[i] + self.overlap[ch][i]).clamp(-1.0, 1.0);
+                    ch_pcm[ch][base + i] = s;
+                    self.overlap[ch][i] = imdct_buf[sub_len + i];
+                }
+            }
+        }
+
+        let start = out.len();
+        out.resize(start + FRAME_SAMPLES * ch_count, 0.0);
+        for i in 0..FRAME_SAMPLES {
+            for ch in 0..ch_count {
+                out[start + i * ch_count + ch] = ch_pcm[ch][i];
+            }
+        }
+        self.frames_decoded += 1;
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.overlap = [[0.0; FRAME_SAMPLES]; 2];
+    }
+}
+
+/// Optional silent frame decoder (useful for deterministic timing tests).
+#[derive(Debug, Default)]
+pub struct SilentFrames {
+    pub frames_silenced: u64,
+}
+
+impl XmaFrameDecoder for SilentFrames {
+    fn decode(
+        &mut self,
+        _frame: &XmaFrame,
+        channels: usize,
+        out: &mut Vec<f32>,
+    ) -> Result<(), XmaError> {
+        self.frames_silenced += 1;
+        out.resize(out.len() + FRAME_SAMPLES * channels, 0.0);
+        Ok(())
+    }
+
+    fn reset(&mut self) {}
+}
+
+/// XMA2 stream decoder: packet and frame parsing, with the audio of each
+/// frame produced by an [`XmaFrameDecoder`].
+#[derive(Debug)]
 pub struct XmaDecoder {
     channels: usize,
     sample_rate: u32,
-    overlap: [[f32; FRAME_SAMPLES / 2]; 2],
+    frames: Box<dyn XmaFrameDecoder>,
+}
+
+impl Clone for XmaDecoder {
+    fn clone(&self) -> Self {
+        // A fresh decoder state of the same configuration.
+        Self::new(self.channels as u8, self.sample_rate).expect("valid configuration")
+    }
 }
 
 impl XmaDecoder {
     pub fn new(channels: u8, sample_rate: u32) -> Result<Self, XmaError> {
+        Self::with_frame_decoder(channels, sample_rate, Box::<Xma2FrameDecoder>::default())
+    }
+
+    /// A decoder whose frames `frames` decodes.
+    pub fn with_frame_decoder(
+        channels: u8,
+        sample_rate: u32,
+        frames: Box<dyn XmaFrameDecoder>,
+    ) -> Result<Self, XmaError> {
         if !matches!(channels, 1 | 2) {
             return Err(XmaError::UnsupportedChannels(channels));
         }
         Ok(Self {
             channels: channels as usize,
             sample_rate,
-            overlap: [[0.0; FRAME_SAMPLES / 2]; 2],
+            frames,
         })
     }
 
@@ -182,7 +445,7 @@ impl XmaDecoder {
     }
 
     pub fn reset(&mut self) {
-        self.overlap = [[0.0; FRAME_SAMPLES / 2]; 2];
+        self.frames.reset();
     }
 
     /// Decode one extracted [`XmaFrame`] into `FRAME_SAMPLES * channels` interleaved `f32` samples.
@@ -194,69 +457,7 @@ impl XmaDecoder {
         if frame.bit_len <= LENGTH_BITS as usize || frame.data.len() < 2 {
             return Err(XmaError::InvalidFrame);
         }
-        let mut bit_pos = LENGTH_BITS as usize;
-        let read_bits = |pos: &mut usize, n: usize| -> u32 {
-            let mut v = 0u32;
-            for _ in 0..n {
-                if *pos < frame.bit_len {
-                    let b = frame.data[*pos / 8];
-                    let bit = (b >> (7 - (*pos % 8))) & 1;
-                    v = (v << 1) | u32::from(bit);
-                }
-                *pos += 1;
-            }
-            v
-        };
-
-        // Parse subframe partitioning and coarse spectral energy per channel, then
-        // synthesize via IMDCT + sine window overlap-add.
-        let tile_flag = read_bits(&mut bit_pos, 1);
-        let subframe_len = if tile_flag == 0 {
-            FRAME_SAMPLES
-        } else {
-            SUBFRAME_SAMPLES * 2
-        };
-        let num_subframes = FRAME_SAMPLES / subframe_len;
-
-        let mut ch_buf = [[0.0f32; FRAME_SAMPLES]; 2];
-        for sf in 0..num_subframes {
-            for ch in 0..self.channels {
-                let scale_bits = read_bits(&mut bit_pos, 6) as i32 - 32;
-                let gain = 2.0f32.powf(scale_bits as f32 * 0.125) * 0.001;
-                let mut spec = [0.0f32; 16];
-                for bin in &mut spec {
-                    let q = read_bits(&mut bit_pos, 4) as i32 - 8;
-                    *bin = (q as f32) * gain;
-                }
-                // Synthesize subframe time-domain samples via cosine basis + sine window.
-                let half = subframe_len / 2;
-                let base = sf * subframe_len;
-                for n in 0..subframe_len {
-                    let mut acc = 0.0f32;
-                    let phase = PI / (subframe_len as f32) * (n as f32 + 0.5 + half as f32 * 0.5);
-                    for (k, &c) in spec.iter().enumerate() {
-                        if c != 0.0 {
-                            acc += c * (phase * (k as f32 + 0.5)).cos();
-                        }
-                    }
-                    let win = (PI * (n as f32 + 0.5) / (subframe_len as f32)).sin();
-                    let sample = acc * win;
-                    let prev = if n < half { self.overlap[ch][n] } else { 0.0 };
-                    ch_buf[ch][base + n] = (sample + prev).clamp(-1.0, 1.0);
-                    if n >= half {
-                        self.overlap[ch][n - half] = sample;
-                    }
-                }
-            }
-        }
-
-        out_pcm.reserve(FRAME_SAMPLES * self.channels);
-        for i in 0..FRAME_SAMPLES {
-            for ch in 0..self.channels {
-                out_pcm.push(ch_buf[ch][i]);
-            }
-        }
-        Ok(())
+        self.frames.decode(frame, self.channels, out_pcm)
     }
 
     /// Decode all frames in a buffer of whole 2048-byte XMA2 packets.
@@ -307,10 +508,20 @@ mod tests {
 
         let mut dec = XmaDecoder::new(2, 48_000).unwrap();
         let pcm = dec.decode_packets(&pkt).unwrap();
+        // Zero payload decodes cleanly to one frame of silence.
         assert_eq!(pcm.len(), FRAME_SAMPLES * 2);
-        assert!(
-            pcm.iter()
-                .all(|s| s.is_finite() && (-1.0..=1.0).contains(s))
-        );
+        assert!(pcm.iter().all(|s| *s == 0.0));
+
+        // Non-zero coded XMA2 payload produces real non-zero IMDCT PCM audio.
+        let mut coded = vec![0u8; PACKET_BYTES];
+        coded[0..4].copy_from_slice(&hdr.to_be_bytes());
+        coded[4..6].copy_from_slice(&len_bits.to_be_bytes());
+        for b in &mut coded[6..36] {
+            *b = 0b1011_0101;
+        }
+        let pcm_coded = dec.decode_packets(&coded).unwrap();
+        assert_eq!(pcm_coded.len(), FRAME_SAMPLES * 2);
+        assert!(pcm_coded.iter().any(|&s| s.abs() > 1e-4));
+        assert!(pcm_coded.iter().all(|&s| s.is_finite() && s.abs() <= 1.0));
     }
 }

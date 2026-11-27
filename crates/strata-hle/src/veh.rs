@@ -7,6 +7,23 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use strata_gpu::write_watch::PageGuardTracker;
+
+#[cfg(windows)]
+const STATUS_GUARD_PAGE_VIOLATION: u32 = 0x8000_0001;
+
+fn guard_trackers() -> &'static Mutex<Vec<Arc<PageGuardTracker>>> {
+    static TRACKERS: OnceLock<Mutex<Vec<Arc<PageGuardTracker>>>> = OnceLock::new();
+    TRACKERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Registers a [`PageGuardTracker`] so `STATUS_GUARD_PAGE_VIOLATION` faults
+/// caught by Strata's VEH record dirty pages automatically.
+pub fn register_page_guard_tracker(tracker: Arc<PageGuardTracker>) {
+    guard_trackers().lock().unwrap().push(tracker);
+}
 
 #[cfg(windows)]
 unsafe extern "system" {
@@ -33,6 +50,9 @@ struct ExceptionRecord {
     exception_flags: u32,
     exception_record: *mut ExceptionRecord,
     exception_address: *mut c_void,
+    number_parameters: u32,
+    _pad: u32,
+    exception_information: [usize; 2],
 }
 
 /// Minimal x86-64 `CONTEXT` prefix up to `Rip` (offset 0xF8 on Windows x64).
@@ -152,6 +172,17 @@ unsafe extern "system" fn console_veh_handler(info: *mut ExceptionPointers) -> i
         return EXCEPTION_CONTINUE_SEARCH;
     }
     let rec = unsafe { &*(*info).exception_record };
+    if rec.exception_code == STATUS_GUARD_PAGE_VIOLATION && rec.number_parameters >= 2 {
+        let fault_va = rec.exception_information[1];
+        if let Ok(list) = guard_trackers().try_lock() {
+            for t in list.iter() {
+                if t.record_fault(fault_va) {
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     if rec.exception_code != EXCEPTION_ILLEGAL_INSTRUCTION {
         return EXCEPTION_CONTINUE_SEARCH;
     }

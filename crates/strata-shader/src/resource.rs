@@ -61,6 +61,48 @@ pub enum ResourceKind {
     Bvh,
 }
 
+/// The image dimensionality an instruction addresses, as the descriptor-set
+/// array it binds to (each class is its own SPIR-V image type and set-0
+/// binding).
+///
+/// MIMG `DIM` (public RDNA2 ISA): 0 1D, 1 2D, 2 3D, 3 Cube, 4 1D array,
+/// 5 2D array, 6 2D MSAA, 7 2D MSAA array. 1D images are 2D images one texel
+/// high; MSAA images are read as their sample 0 (a 2D / 2D-array view).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ImageDim {
+    #[default]
+    D2,
+    D3,
+    Cube,
+    D2Array,
+}
+
+impl ImageDim {
+    pub fn from_mimg(dim: u8) -> Self {
+        match dim & 7 {
+            2 => ImageDim::D3,
+            3 => ImageDim::Cube,
+            4 | 5 | 7 => ImageDim::D2Array,
+            _ => ImageDim::D2,
+        }
+    }
+
+    /// Whether the MIMG `dim` is one of the array forms whose layer is the
+    /// second address (1D array: `x, layer`).
+    pub fn mimg_is_1d_array(dim: u8) -> bool {
+        dim & 7 == 4
+    }
+
+    /// Storage images cannot be cube views, and texel fetches cannot address
+    /// cubes: a cube is fetched or written as the 2D array of its six faces.
+    pub fn for_storage(self) -> Self {
+        match self {
+            ImageDim::Cube => ImageDim::D2Array,
+            d => d,
+        }
+    }
+}
+
 /// One resource access and where its descriptors come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DescriptorUse {
@@ -71,6 +113,12 @@ pub struct DescriptorUse {
     /// Whether all its dwords come from one place, consecutively.
     pub contiguous: bool,
     pub sampler: Option<Origin>,
+    sampler_contiguous: bool,
+    /// The image class the instruction addresses (`D2` for non-images).
+    pub dim: ImageDim,
+    /// A depth-comparison sample (`image_sample_c*`): Vulkan needs a
+    /// comparison sampler for it.
+    pub compare: bool,
 }
 
 impl DescriptorUse {
@@ -99,38 +147,79 @@ pub enum ImageBinding {
 }
 
 /// Shaders bind at most this many images of each kind.
-pub const MAX_IMAGE_SLOTS: u32 = 16;
+pub const MAX_IMAGE_SLOTS: u32 = 32;
 
-/// The slot each image use binds to, in program order: the rule the SSA
-/// builder numbers image instructions by, so the host binds what each
-/// instruction reads. Non-image uses get `None`.
+/// Plan host bindings and shader slots together. Only reuse contiguous,
+/// statically traced descriptors when a linear SGPR trace is sufficient.
+pub fn planned_image_bindings(
+    program: &[DecodedInst],
+    uses: &[DescriptorUse],
+    texture_base: u32,
+    storage_base: u32,
+) -> Vec<Option<ImageBinding>> {
+    let linear = !program
+        .iter()
+        .any(|op| crate::ssa::is_branch(&op.inst).is_some());
+    allocate_image_slots(uses, texture_base, storage_base, linear)
+}
+
+/// The original sequential binding order, for callers with a descriptor list only.
 pub fn image_bindings(uses: &[DescriptorUse]) -> Vec<Option<ImageBinding>> {
     image_bindings_from(uses, 0, 0)
 }
 
-/// As [`image_bindings`], numbering from given first slots (a pixel
-/// shader's images follow its vertex shader's in the shared set).
 pub fn image_bindings_from(
     uses: &[DescriptorUse],
     texture_base: u32,
     storage_base: u32,
 ) -> Vec<Option<ImageBinding>> {
+    allocate_image_slots(uses, texture_base, storage_base, false)
+}
+
+fn allocate_image_slots(
+    uses: &[DescriptorUse],
+    texture_base: u32,
+    storage_base: u32,
+    linear: bool,
+) -> Vec<Option<ImageBinding>> {
+    let stable = |origin: &Origin| match origin {
+        Origin::User(_) => true,
+        Origin::Load { base, .. } => matches!(**base, Origin::User(_)),
+        _ => false,
+    };
+    let mut shared = HashMap::new();
     let (mut textures, mut storage) = (texture_base, storage_base);
     uses.iter()
-        .map(|u| match u.kind {
-            ResourceKind::SampledImage => {
-                textures += 1;
-                Some(ImageBinding::Sampled(textures - 1))
+        .map(|u| {
+            let key = (u.kind, &u.resource, &u.sampler, u.dim, u.compare);
+            let reuse = linear
+                && u.contiguous
+                && stable(&u.resource)
+                && u.sampler
+                    .as_ref()
+                    .is_none_or(|s| u.sampler_contiguous && stable(s));
+            if reuse && let Some(&binding) = shared.get(&key) {
+                return Some(binding);
             }
-            ResourceKind::LoadedImage => {
-                textures += 1;
-                Some(ImageBinding::Fetched(textures - 1))
+            let binding = match u.kind {
+                ResourceKind::SampledImage => {
+                    textures += 1;
+                    ImageBinding::Sampled(textures - 1)
+                }
+                ResourceKind::LoadedImage => {
+                    textures += 1;
+                    ImageBinding::Fetched(textures - 1)
+                }
+                ResourceKind::StorageImage => {
+                    storage += 1;
+                    ImageBinding::Storage(storage - 1)
+                }
+                ResourceKind::Buffer | ResourceKind::Bvh => return None,
+            };
+            if reuse {
+                shared.insert(key, binding);
             }
-            ResourceKind::StorageImage => {
-                storage += 1;
-                Some(ImageBinding::Storage(storage - 1))
-            }
-            ResourceKind::Buffer | ResourceKind::Bvh => None,
+            Some(binding)
         })
         .collect()
 }
@@ -237,36 +326,45 @@ pub fn trace_descriptors(program: &[DecodedInst]) -> Vec<DescriptorUse> {
             Inst::ImageSample {
                 rsrc_sgpr,
                 samp_sgpr,
+                dim,
+                mode,
                 ..
             } => {
-                uses.push(describe(
+                let mut u = describe(
                     &sgpr,
                     di.pc,
                     ResourceKind::SampledImage,
                     *rsrc_sgpr,
                     8,
                     Some(*samp_sgpr),
-                ));
+                );
+                u.dim = ImageDim::from_mimg(*dim);
+                u.compare = matches!(
+                    mode,
+                    crate::rdna2::SampleMode::Compare
+                        | crate::rdna2::SampleMode::CompareLod
+                        | crate::rdna2::SampleMode::CompareLodZero
+                );
+                uses.push(u);
             }
-            Inst::ImageLoad { rsrc_sgpr, .. } | Inst::ImageGetResInfo { rsrc_sgpr, .. } => {
-                uses.push(describe(
-                    &sgpr,
-                    di.pc,
-                    ResourceKind::LoadedImage,
-                    *rsrc_sgpr,
-                    8,
-                    None,
-                ));
+            Inst::ImageLoad { rsrc_sgpr, dim, .. }
+            | Inst::ImageGetResInfo { rsrc_sgpr, dim, .. } => {
+                let mut u = describe(&sgpr, di.pc, ResourceKind::LoadedImage, *rsrc_sgpr, 8, None);
+                // Cubes are fetched and queried as the array of their faces.
+                u.dim = ImageDim::from_mimg(*dim).for_storage();
+                uses.push(u);
             }
-            Inst::ImageStore { rsrc_sgpr, .. } => {
-                uses.push(describe(
+            Inst::ImageStore { rsrc_sgpr, dim, .. } => {
+                let mut u = describe(
                     &sgpr,
                     di.pc,
                     ResourceKind::StorageImage,
                     *rsrc_sgpr,
                     8,
                     None,
-                ));
+                );
+                u.dim = ImageDim::from_mimg(*dim).for_storage();
+                uses.push(u);
             }
             Inst::ImageBvh64IntersectRay { rsrc_sgpr, .. } => {
                 uses.push(describe(
@@ -315,24 +413,30 @@ fn describe(
 ) -> DescriptorUse {
     let get = |r: u8| sgpr.get(&r).cloned().unwrap_or(Origin::Unknown);
     let resource = get(first);
-    let contiguous = (1..dwords).all(|k| match (&resource, get(first + k)) {
-        (Origin::User(a), Origin::User(b)) => b == a + k,
-        (
-            Origin::Load { base, offset },
-            Origin::Load {
-                base: b2,
-                offset: o2,
-            },
-        ) => *base == b2 && o2 == offset + 4 * k as i32,
-        (Origin::Waterfall, Origin::Waterfall) => true,
-        _ => false,
-    });
+    let consecutive = |register: u8, words: u8| {
+        let first = get(register);
+        (1..words).all(|k| match (&first, get(register + k)) {
+            (Origin::User(a), Origin::User(b)) => b == a + k,
+            (
+                Origin::Load { base, offset },
+                Origin::Load {
+                    base: next,
+                    offset: next_offset,
+                },
+            ) => *base == next && next_offset == offset + 4 * i32::from(k),
+            (Origin::Waterfall, Origin::Waterfall) => true,
+            _ => false,
+        })
+    };
     DescriptorUse {
         pc,
         kind,
         resource,
-        contiguous,
+        contiguous: consecutive(first, dwords),
         sampler: sampler.map(get),
+        sampler_contiguous: sampler.is_some_and(|r| consecutive(r, 4)),
+        dim: ImageDim::D2,
+        compare: false,
     }
 }
 

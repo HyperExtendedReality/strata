@@ -397,6 +397,7 @@ impl Title {
             return Err(MapError::ExecFailed("image has no entry point".into()));
         }
         let _veh = crate::veh::VehGuard::install();
+        crate::stacks::schedule_from_env();
         let mut tid = 0u32;
         // SAFETY: `guest_main` takes the leaked module; 8 MiB like the console.
         let handle = unsafe {

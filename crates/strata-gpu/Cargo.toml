@@ -7,7 +7,10 @@ license.workspace = true
 [dependencies]
 ash.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 strata-shader = { path = "../strata-shader" }
+strata-runtime-shaders = { path = "../strata-runtime-shaders" }
 
 [lints]
 workspace = true

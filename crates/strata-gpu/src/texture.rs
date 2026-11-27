@@ -10,18 +10,22 @@
 //! (`64KB_S`/`64KB_D`) use Strata's 8×8 Morton micro-tile model, the one its
 //! own `XGTextureAddressComputer` reports to titles (`strata-hle::xg`). That
 //! model is not AMD's full address equation; other modes are refused.
-//! Only float-typed (`UNORM`/`SNORM`/`FLOAT`) formats are made, because
-//! translated shaders declare float images; integer formats are refused.
+//! Levels, array layers, cube faces and 3D slices follow one another (see
+//! [`SurfaceModel`]); BCn formats tile 4×4 blocks as elements.
+//! Only float-typed (`UNORM`/`SNORM`/`FLOAT`) and BCn formats are made,
+//! because translated shaders declare float images; integer formats are
+//! refused.
 
 use std::collections::HashMap;
 
 use ash::vk;
 use strata_shader::descriptor::{ImageDescriptor, ImageKind, SamplerDescriptor, Select};
 use strata_shader::format::{FormatInfo, NumFormat, gfx10_format};
+use strata_shader::resource::ImageDim;
 use thiserror::Error;
 
 use crate::context::GpuError;
-use crate::images::GpuImage;
+use crate::images::{GpuImage, ImageShape, ImageSpec, level_extent};
 use crate::runner::ComputeRunner;
 
 #[derive(Debug, Error)]
@@ -30,8 +34,10 @@ pub enum TextureError {
     Format(u16),
     #[error("integer image format {0}: translated shaders read float images")]
     IntegerFormat(u16),
-    #[error("{0:?} images are not supported (2D only)")]
+    #[error("image kind {0:?} is not one Strata reads")]
     Kind(ImageKind),
+    #[error("a {shape:?} image cannot be bound as a {dim:?} image")]
+    View { shape: ImageShape, dim: ImageDim },
     #[error("swizzle mode {0} is not modelled")]
     SwizzleMode(u8),
     #[error("cannot read {len} bytes of texels at 0x{addr:x}")]
@@ -85,44 +91,73 @@ fn swizzle(s: Select) -> vk::ComponentSwizzle {
     }
 }
 
-/// Extended Vulkan format lookup supporting BCn compressed and Depth/Stencil formats.
-pub fn vk_format_extended(dfmt: u16) -> Option<vk::Format> {
+/// The BCn format of a GFX10 `IMG_FORMAT` code (public RDNA2 ISA
+/// enumeration: `BC1_UNORM` = 109 through `BC7_SRGB` = 122).
+pub fn bc_format(code: u16) -> Option<vk::Format> {
     use vk::Format as F;
-    // GFX10 BCn compressed & depth/stencil IMG_DATA_FORMAT codes
-    match dfmt {
-        35 => Some(F::BC1_RGBA_UNORM_BLOCK),
-        36 => Some(F::BC2_UNORM_BLOCK),
-        37 => Some(F::BC3_UNORM_BLOCK),
-        38 => Some(F::BC4_UNORM_BLOCK),
-        39 => Some(F::BC5_UNORM_BLOCK),
-        40 => Some(F::BC6H_UFLOAT_BLOCK),
-        41 => Some(F::BC7_UNORM_BLOCK),
-        42 => Some(F::D16_UNORM),
-        43 => Some(F::D32_SFLOAT),
-        44 => Some(F::D24_UNORM_S8_UINT),
-        45 => Some(F::D32_SFLOAT_S8_UINT),
-        _ => gfx10_format(dfmt).and_then(|info| vk_format(&info)),
+    Some(match code {
+        109 => F::BC1_RGBA_UNORM_BLOCK,
+        110 => F::BC1_RGBA_SRGB_BLOCK,
+        111 => F::BC2_UNORM_BLOCK,
+        112 => F::BC2_SRGB_BLOCK,
+        113 => F::BC3_UNORM_BLOCK,
+        114 => F::BC3_SRGB_BLOCK,
+        115 => F::BC4_UNORM_BLOCK,
+        116 => F::BC4_SNORM_BLOCK,
+        117 => F::BC5_UNORM_BLOCK,
+        118 => F::BC5_SNORM_BLOCK,
+        119 => F::BC6H_UFLOAT_BLOCK,
+        120 => F::BC6H_SFLOAT_BLOCK,
+        121 => F::BC7_UNORM_BLOCK,
+        122 => F::BC7_SRGB_BLOCK,
+        _ => return None,
+    })
+}
+
+/// Vulkan format lookup for T# format codes: BCn block formats, packed 10/11-bit
+/// and 16-bit formats, and the whole-bit float formats of [`vk_format`].
+pub fn vk_format_extended(dfmt: u16) -> Option<vk::Format> {
+    use strata_shader::format::{PackedFormat, gfx10_packed_format};
+    if let Some(bc) = bc_format(dfmt) {
+        return Some(bc);
     }
+    if let Some(packed) = gfx10_packed_format(dfmt) {
+        return Some(match packed {
+            PackedFormat::F10_11_11 | PackedFormat::F11_11_10 => {
+                vk::Format::B10G11R11_UFLOAT_PACK32
+            }
+            PackedFormat::Unorm2_10_10_10 => vk::Format::A2B10G10R10_UNORM_PACK32,
+            PackedFormat::Snorm2_10_10_10 => vk::Format::A2B10G10R10_SNORM_PACK32,
+            PackedFormat::Uint2_10_10_10 => vk::Format::A2B10G10R10_UINT_PACK32,
+            PackedFormat::Sint2_10_10_10 => vk::Format::A2B10G10R10_SINT_PACK32,
+            PackedFormat::Unorm10_10_10_2 => vk::Format::A2R10G10B10_UNORM_PACK32,
+            PackedFormat::Snorm10_10_10_2 => vk::Format::A2R10G10B10_SNORM_PACK32,
+            PackedFormat::Uint10_10_10_2 => vk::Format::A2R10G10B10_UINT_PACK32,
+            PackedFormat::Sint10_10_10_2 => vk::Format::A2R10G10B10_SINT_PACK32,
+            PackedFormat::F5_9_9_9 => vk::Format::E5B9G9R9_UFLOAT_PACK32,
+            PackedFormat::Unorm5_6_5 => vk::Format::R5G6B5_UNORM_PACK16,
+            PackedFormat::Unorm1_5_5_5 => vk::Format::A1R5G5B5_UNORM_PACK16,
+            PackedFormat::Unorm4_4_4_4 => vk::Format::R4G4B4A4_UNORM_PACK16,
+        });
+    }
+    gfx10_format(dfmt).and_then(|info| vk_format(&info))
 }
 
 /// Returns `true` if `fmt` is a 4×4 BCn block-compressed format.
 pub fn is_block_compressed(fmt: vk::Format) -> bool {
-    matches!(
-        fmt,
-        vk::Format::BC1_RGBA_UNORM_BLOCK
-            | vk::Format::BC2_UNORM_BLOCK
-            | vk::Format::BC3_UNORM_BLOCK
-            | vk::Format::BC4_UNORM_BLOCK
-            | vk::Format::BC5_UNORM_BLOCK
-            | vk::Format::BC6H_UFLOAT_BLOCK
-            | vk::Format::BC7_UNORM_BLOCK
-    )
+    (vk::Format::BC1_RGB_UNORM_BLOCK.as_raw()..=vk::Format::BC7_SRGB_BLOCK.as_raw())
+        .contains(&fmt.as_raw())
 }
 
 /// Byte size of a single 4×4 BCn block (8 for BC1/BC4, 16 for BC2/BC3/BC5/BC6H/BC7).
 pub fn bcn_block_bytes(fmt: vk::Format) -> usize {
     match fmt {
-        vk::Format::BC1_RGBA_UNORM_BLOCK | vk::Format::BC4_UNORM_BLOCK => 8,
+        vk::Format::BC1_RGB_UNORM_BLOCK
+        | vk::Format::BC1_RGB_SRGB_BLOCK
+        | vk::Format::BC1_RGBA_UNORM_BLOCK
+        | vk::Format::BC1_RGBA_SRGB_BLOCK
+        | vk::Format::BC4_UNORM_BLOCK
+        | vk::Format::BC4_SNORM_BLOCK => 8,
         _ => 16,
     }
 }
@@ -158,7 +193,7 @@ pub fn source_layout(d: &ImageDescriptor, bpp: usize) -> Result<(Tiling, usize),
             Ok((Tiling::Linear { pitch }, pitch * h))
         }
         5 | 6 | 9 | 10 => Ok((Tiling::Morton, w.div_ceil(8) * h.div_ceil(8) * 64 * bpp)),
-        m @ (25 | 26 | 27) => Ok((
+        m @ 25..=27 => Ok((
             Tiling::MortonXor { mode: m },
             w.div_ceil(8) * h.div_ceil(8) * 64 * bpp,
         )),
@@ -356,17 +391,195 @@ pub type ReadFn<'a> = &'a dyn Fn(u64, usize) -> Option<Vec<u8>>;
 /// Writes bytes to title memory at an address (`false` if unwritable).
 pub type WriteFn<'a> = &'a dyn Fn(u64, &[u8]) -> bool;
 
+/// How a T# lays out in title memory, under Strata's texture model (the
+/// one `strata-hle::xg` reports to titles): levels from 0 one after another,
+/// each level its slices (array layers, cube faces, 3D slices) one after
+/// another, each slice a 2D surface in the descriptor's swizzle mode with
+/// 4×4 blocks as elements for BCn formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceModel {
+    pub desc: ImageDescriptor,
+    pub format: vk::Format,
+    /// Bytes per element (texel, or 4×4 block for BCn).
+    pub bpe: usize,
+    /// 4 for BCn formats, else 1.
+    pub block: u32,
+    pub shape: ImageShape,
+    /// Levels the image holds: `base_level..=last_level` of the resource.
+    pub first_level: u32,
+    pub levels: u32,
+}
+
+impl SurfaceModel {
+    /// Slices of resource level `m`.
+    fn slices(&self, m: u32) -> u32 {
+        match self.shape {
+            ImageShape::D3 { depth } => (depth >> m).max(1),
+            s => s.layers(),
+        }
+    }
+
+    /// The tiling and byte footprint of one slice of resource level `m`.
+    fn slice_layout(&self, m: u32) -> Result<(ImageDescriptor, Tiling, usize), TextureError> {
+        let (w, h) = level_extent(self.desc.width, self.desc.height, m);
+        let mut d = self.desc;
+        d.width = w.div_ceil(self.block);
+        d.height = h.div_ceil(self.block);
+        let (t, f) = source_layout(&d, self.bpe)?;
+        Ok((d, t, f))
+    }
+
+    /// Byte offset of resource level `m` from the base address.
+    fn level_offset(&self, m: u32) -> Result<usize, TextureError> {
+        let mut off = 0;
+        for l in 0..m {
+            off += self.slice_layout(l)?.2 * self.slices(l) as usize;
+        }
+        Ok(off)
+    }
+
+    /// Bytes from the base address to the end of the last level held.
+    pub fn footprint(&self) -> Result<usize, TextureError> {
+        self.level_offset(self.first_level + self.levels)
+    }
+
+    /// Title-memory bytes (from the base address, `footprint()` long) →
+    /// tightly packed levels in [`ComputeRunner::upload_image_levels`] order.
+    fn detile_all(&self, src: &[u8]) -> Result<Vec<u8>, TextureError> {
+        let mut out = Vec::new();
+        for m in self.first_level..self.first_level + self.levels {
+            let (d, tiling, foot) = self.slice_layout(m)?;
+            let mut at = self.level_offset(m)?;
+            for _ in 0..self.slices(m) {
+                let slice = src.get(at..at + foot).ok_or(TextureError::Read {
+                    addr: self.desc.base_address + at as u64,
+                    len: foot,
+                })?;
+                out.extend_from_slice(&detile(&d, self.bpe, tiling, slice));
+                at += foot;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The inverse of [`Self::detile_all`], into `dst` (keeps bytes the
+    /// model does not cover, such as linear row padding).
+    fn retile_all(&self, tight: &[u8], dst: &mut [u8]) -> Result<(), TextureError> {
+        let mut cursor = 0usize;
+        for m in self.first_level..self.first_level + self.levels {
+            let (d, tiling, foot) = self.slice_layout(m)?;
+            let tight_slice = (d.width * d.height) as usize * self.bpe;
+            let mut at = self.level_offset(m)?;
+            for _ in 0..self.slices(m) {
+                let src = tight
+                    .get(cursor..cursor + tight_slice)
+                    .ok_or(TextureError::Write(self.desc.base_address))?;
+                let out = dst
+                    .get_mut(at..at + foot)
+                    .ok_or(TextureError::Write(self.desc.base_address + at as u64))?;
+                retile(&d, self.bpe, tiling, src, out);
+                cursor += tight_slice;
+                at += foot;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `'ST'` in the top half of T# dword 5: a descriptor Strata built itself
+/// (D3D12 views), whose low half holds these flags and dword 6 a Vulkan
+/// depth format. Console T#s keep metadata there; only the host reads it.
+pub const TRAILER_MAGIC: u32 = 0x5354_0000;
+/// Bytes are B, G, R, A (the GFX10 format is `8_8_8_8` with swapped selects).
+pub const TRAILER_BGRA: u32 = 1;
+/// sRGB-encoded.
+pub const TRAILER_SRGB: u32 = 2;
+/// A depth format (dword 6: its `VkFormat`).
+pub const TRAILER_DEPTH: u32 = 4;
+
+/// Strata's trailer flags, when `w` carries them.
+pub fn trailer_flags(w: &[u32; 8]) -> Option<u32> {
+    (w[5] & 0xffff_0000 == TRAILER_MAGIC).then_some(w[5] & 0xffff)
+}
+
 /// Vulkan images and samplers for the descriptors titles use.
 #[derive(Default)]
 pub struct TextureCache {
-    /// By the T#'s first five dwords (address, format, size, tiling, selects).
-    textures: HashMap<[u32; 5], Entry>,
-    samplers: HashMap<[u32; 4], vk::Sampler>,
+    /// By the T#'s first five dwords (address, format, size, tiling, selects,
+    /// levels, depth) and, for depth targets, the depth format.
+    textures: HashMap<([u32; 5], i32), Entry>,
+    samplers: HashMap<([u32; 4], Option<u8>), vk::Sampler>,
     pub uploads: u64,
 }
 
-fn key(words: &[u32; 8]) -> [u32; 5] {
-    [words[0], words[1], words[2], words[3], words[4]]
+fn key(words: &[u32; 8], depth: Option<vk::Format>) -> ([u32; 5], i32) {
+    // The trailer's storage flags make a different Vulkan format.
+    let flags = trailer_flags(words).unwrap_or(0) as i32;
+    (
+        [words[0], words[1], words[2], words[3], words[4]],
+        depth.map_or(0, |f| f.as_raw()) ^ (flags << 24),
+    )
+}
+
+/// The Vulkan format a T#'s format code reads as, its element size and
+/// block size (`None`: Strata does not read it).
+pub fn texel_format(code: u16) -> Result<(vk::Format, usize, u32), TextureError> {
+    if let Some(f) = bc_format(code) {
+        return Ok((f, bcn_block_bytes(f), 4));
+    }
+    // Packed 32-bit formats with a Vulkan equivalent (component order:
+    // GFX10 names the high bits first; DXGI/Vulkan agree on the bit layout).
+    use strata_shader::format::{PackedFormat, gfx10_packed_format};
+    match gfx10_packed_format(code) {
+        Some(PackedFormat::F10_11_11 | PackedFormat::F11_11_10) => {
+            return Ok((vk::Format::B10G11R11_UFLOAT_PACK32, 4, 1));
+        }
+        Some(PackedFormat::Unorm2_10_10_10) => {
+            return Ok((vk::Format::A2B10G10R10_UNORM_PACK32, 4, 1));
+        }
+        Some(PackedFormat::Snorm2_10_10_10) => {
+            return Ok((vk::Format::A2B10G10R10_SNORM_PACK32, 4, 1));
+        }
+        Some(PackedFormat::Unorm10_10_10_2) => {
+            return Ok((vk::Format::A2R10G10B10_UNORM_PACK32, 4, 1));
+        }
+        Some(PackedFormat::Snorm10_10_10_2) => {
+            return Ok((vk::Format::A2R10G10B10_SNORM_PACK32, 4, 1));
+        }
+        Some(PackedFormat::F5_9_9_9) => {
+            return Ok((vk::Format::E5B9G9R9_UFLOAT_PACK32, 4, 1));
+        }
+        Some(PackedFormat::Unorm5_6_5) => {
+            return Ok((vk::Format::R5G6B5_UNORM_PACK16, 2, 1));
+        }
+        Some(PackedFormat::Unorm1_5_5_5) => {
+            return Ok((vk::Format::A1R5G5B5_UNORM_PACK16, 2, 1));
+        }
+        Some(PackedFormat::Unorm4_4_4_4) => {
+            return Ok((vk::Format::R4G4B4A4_UNORM_PACK16, 2, 1));
+        }
+        Some(_) => return Err(TextureError::IntegerFormat(code)),
+        None => {}
+    }
+    let info = gfx10_format(code).ok_or(TextureError::Format(code))?;
+    if !info.num.is_float() {
+        return Err(TextureError::IntegerFormat(code));
+    }
+    let fmt = vk_format(&info).ok_or(TextureError::Format(code))?;
+    Ok((fmt, info.bytes_per_element() as usize, 1))
+}
+
+/// The image shape a T# describes (`Cube`: `depth` counts cubes).
+pub fn shape_of(d: &ImageDescriptor) -> Result<ImageShape, TextureError> {
+    Ok(match d.kind {
+        ImageKind::Tex1D | ImageKind::Tex2D | ImageKind::Tex2DMsaa => ImageShape::D2 { layers: 1 },
+        ImageKind::Tex1DArray | ImageKind::Tex2DArray | ImageKind::Tex2DMsaaArray => {
+            ImageShape::D2 { layers: d.depth }
+        }
+        ImageKind::Tex3D => ImageShape::D3 { depth: d.depth },
+        ImageKind::Cube => ImageShape::Cube { cubes: d.depth },
+        k @ ImageKind::Other(_) => return Err(TextureError::Kind(k)),
+    })
 }
 
 impl TextureCache {
@@ -374,20 +587,149 @@ impl TextureCache {
         Self::default()
     }
 
-    fn check(words: &[u32; 8]) -> Result<(ImageDescriptor, FormatInfo, vk::Format), TextureError> {
+    /// The memory model of a T#, with `format` overriding its format (depth
+    /// targets).
+    pub fn model(
+        words: &[u32; 8],
+        depth: Option<vk::Format>,
+    ) -> Result<SurfaceModel, TextureError> {
         let d = ImageDescriptor::decode(*words);
-        if d.kind != ImageKind::Tex2D && !(d.kind == ImageKind::Tex2DArray && d.depth == 1) {
-            return Err(TextureError::Kind(d.kind));
-        }
-        let info = gfx10_format(d.format).ok_or(TextureError::Format(d.format))?;
-        if !info.num.is_float() {
-            return Err(TextureError::IntegerFormat(d.format));
-        }
-        let fmt = vk_format(&info).ok_or(TextureError::Format(d.format))?;
-        Ok((d, info, fmt))
+        let (format, bpe, block) = match depth {
+            Some(f) => (f, crate::images::element_bytes(f), 1),
+            None => texel_format(d.format)?,
+        };
+        // Host-built T#s say how the bytes are really stored (BGRA order,
+        // sRGB encoding) in Strata's trailer.
+        let format = match (trailer_flags(words), format) {
+            (Some(f), vk::Format::R8G8B8A8_UNORM) if f & TRAILER_BGRA != 0 => {
+                if f & TRAILER_SRGB != 0 {
+                    vk::Format::B8G8R8A8_SRGB
+                } else {
+                    vk::Format::B8G8R8A8_UNORM
+                }
+            }
+            (Some(f), vk::Format::R8G8B8A8_UNORM) if f & TRAILER_SRGB != 0 => {
+                vk::Format::R8G8B8A8_SRGB
+            }
+            (_, f) => f,
+        };
+        let first_level = u32::from(d.base_level);
+        let levels = u32::from(d.last_level).saturating_sub(first_level) + 1;
+        Ok(SurfaceModel {
+            desc: d,
+            format,
+            bpe,
+            block,
+            shape: shape_of(&d)?,
+            first_level,
+            levels,
+        })
     }
 
-    /// The image view for a T#, created or refreshed from title memory.
+    #[cfg(test)]
+    fn check(words: &[u32; 8]) -> Result<SurfaceModel, TextureError> {
+        Self::model(words, None)
+    }
+
+    /// The image for a T# (`depth`: as a depth/stencil target of that
+    /// format), created or refreshed from title memory. `storage`: a
+    /// shader writes it (the image gets `STORAGE` usage).
+    fn entry(
+        &mut self,
+        runner: &ComputeRunner,
+        words: [u32; 8],
+        storage: bool,
+        depth: Option<vk::Format>,
+        read: ReadFn<'_>,
+    ) -> Result<&GpuImage, TextureError> {
+        let model = Self::model(&words, depth)?;
+        let d = model.desc;
+        let footprint = model.footprint()?;
+        let src = read(d.base_address, footprint).ok_or(TextureError::Read {
+            addr: d.base_address,
+            len: footprint,
+        })?;
+        let hash = fnv(&src);
+        let k = key(&words, depth);
+
+        let reuse = match self.textures.get(&k) {
+            Some(e) => e.image.storage || !storage,
+            None => false,
+        };
+        if !reuse && let Some(old) = self.textures.remove(&k) {
+            // Needed as storage now: made again with STORAGE usage below.
+            runner.destroy_image(old.image);
+        }
+        if reuse {
+            let e = self.textures.get_mut(&k).expect("present");
+            if e.hash != hash {
+                runner.upload_image_levels(&e.image, &model.detile_all(&src)?, model.block)?;
+                e.hash = hash;
+                self.uploads += 1;
+            }
+            return Ok(&self.textures[&k].image);
+        }
+
+        let need = match (depth, storage) {
+            (Some(_), _) => vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT,
+            (None, true) => {
+                vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::STORAGE_IMAGE
+            }
+            (None, false) => vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        };
+        if !runner.format_supports(model.format, need) {
+            return Err(TextureError::Unsupported {
+                format: model.format,
+                what: match (depth, storage) {
+                    (Some(_), _) => "render depth to",
+                    (None, true) => "store to",
+                    (None, false) => "sample",
+                },
+            });
+        }
+        let components = if depth.is_some() {
+            vk::ComponentMapping::default()
+        } else {
+            vk::ComponentMapping {
+                r: swizzle(d.select[0]),
+                g: swizzle(d.select[1]),
+                b: swizzle(d.select[2]),
+                a: swizzle(d.select[3]),
+            }
+        };
+        let (w, h) = level_extent(d.width, d.height, model.first_level);
+        let shape = match model.shape {
+            ImageShape::D3 { depth } => ImageShape::D3 {
+                depth: (depth >> model.first_level).max(1),
+            },
+            s => s,
+        };
+        let image = runner.create_image(&ImageSpec {
+            format: model.format,
+            width: w,
+            height: h,
+            shape,
+            mips: model.levels,
+            storage,
+            components,
+        })?;
+        let tight = match model.detile_all(&src) {
+            Ok(t) => t,
+            Err(e) => {
+                runner.destroy_image(image);
+                return Err(e);
+            }
+        };
+        if let Err(e) = runner.upload_image_levels(&image, &tight, model.block) {
+            runner.destroy_image(image);
+            return Err(e.into());
+        }
+        self.uploads += 1;
+        self.textures.insert(k, Entry { image, hash });
+        Ok(&self.textures[&k].image)
+    }
+
+    /// The 2D image view for a T#, created or refreshed from title memory.
     /// `storage`: the shader writes it (the image gets `STORAGE` usage).
     pub fn texture(
         &mut self,
@@ -396,64 +738,51 @@ impl TextureCache {
         storage: bool,
         read: ReadFn<'_>,
     ) -> Result<vk::ImageView, TextureError> {
-        let (d, info, fmt) = Self::check(&words)?;
-        let bpp = info.bytes_per_element() as usize;
-        let (tiling, footprint) = source_layout(&d, bpp)?;
-        let src = read(d.base_address, footprint).ok_or(TextureError::Read {
-            addr: d.base_address,
-            len: footprint,
-        })?;
-        let hash = fnv(&src);
-        let k = key(&words);
+        self.texture_dim(runner, words, storage, ImageDim::D2, read)
+    }
 
-        if let Some(e) = self.textures.get_mut(&k) {
-            if e.image.storage || !storage {
-                if e.hash != hash {
-                    runner.upload_image(&e.image, &detile(&d, bpp, tiling, &src))?;
-                    e.hash = hash;
-                    self.uploads += 1;
-                }
-                return Ok(e.image.view);
-            }
-            // Needed as storage now: made again with STORAGE usage below.
-            let old = self.textures.remove(&k).expect("present");
-            runner.destroy_image(old.image);
-        }
+    /// The view of class `dim` for a T# (an instruction's class may differ
+    /// from the T#'s own kind: a 2D read of an array reads layer 0).
+    pub fn texture_dim(
+        &mut self,
+        runner: &ComputeRunner,
+        words: [u32; 8],
+        storage: bool,
+        dim: ImageDim,
+        read: ReadFn<'_>,
+    ) -> Result<vk::ImageView, TextureError> {
+        let img = self.entry(runner, words, storage, None, read)?;
+        img.view_for(dim).ok_or(TextureError::View {
+            shape: img.shape,
+            dim,
+        })
+    }
 
-        let need = if storage {
-            vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::STORAGE_IMAGE
-        } else {
-            vk::FormatFeatureFlags::SAMPLED_IMAGE
-        };
-        if !runner.format_supports(fmt, need) {
-            return Err(TextureError::Unsupported {
-                format: fmt,
-                what: if storage { "store to" } else { "sample" },
-            });
-        }
-        let components = vk::ComponentMapping {
-            r: swizzle(d.select[0]),
-            g: swizzle(d.select[1]),
-            b: swizzle(d.select[2]),
-            a: swizzle(d.select[3]),
-        };
-        let image = runner.create_image_2d(fmt, d.width, d.height, storage, components)?;
-        if let Err(e) = runner.upload_image(&image, &detile(&d, bpp, tiling, &src)) {
-            runner.destroy_image(image);
-            return Err(e.into());
-        }
-        self.uploads += 1;
-        let view = image.view;
-        self.textures.insert(k, Entry { image, hash });
-        Ok(view)
+    /// A depth/stencil target of `format` over the memory a T# names.
+    pub fn depth_target(
+        &mut self,
+        runner: &ComputeRunner,
+        words: [u32; 8],
+        format: vk::Format,
+        read: ReadFn<'_>,
+    ) -> Result<&GpuImage, TextureError> {
+        self.entry(runner, words, false, Some(format), read)
     }
 
     /// The image made for a T# (after [`Self::texture`]).
     pub fn image(&self, words: &[u32; 8]) -> Option<&GpuImage> {
-        self.textures.get(&key(words)).map(|e| &e.image)
+        self.textures.get(&key(words, None)).map(|e| &e.image)
     }
 
-    /// Copies a storage image back to the title memory its T# names.
+    /// The depth target made for a T# (after [`Self::depth_target`]).
+    pub fn depth_image(&self, words: &[u32; 8], format: vk::Format) -> Option<&GpuImage> {
+        self.textures
+            .get(&key(words, Some(format)))
+            .map(|e| &e.image)
+    }
+
+    /// Copies an image a shader or draw wrote back to the title memory its
+    /// T# names (every level and slice it holds).
     pub fn write_back(
         &mut self,
         runner: &ComputeRunner,
@@ -461,16 +790,49 @@ impl TextureCache {
         write: WriteFn<'_>,
         read: ReadFn<'_>,
     ) -> Result<(), TextureError> {
-        let (d, info, _) = Self::check(&words)?;
-        let bpp = info.bytes_per_element() as usize;
-        let (tiling, footprint) = source_layout(&d, bpp)?;
-        let Some(e) = self.textures.get_mut(&key(&words)) else {
+        self.write_back_as(runner, words, None, write, read)
+    }
+
+    /// [`Self::write_back`] for a depth target of `format`.
+    pub fn write_back_depth(
+        &mut self,
+        runner: &ComputeRunner,
+        words: [u32; 8],
+        format: vk::Format,
+        write: WriteFn<'_>,
+        read: ReadFn<'_>,
+    ) -> Result<(), TextureError> {
+        self.write_back_as(runner, words, Some(format), write, read)
+    }
+
+    fn write_back_as(
+        &mut self,
+        runner: &ComputeRunner,
+        words: [u32; 8],
+        depth: Option<vk::Format>,
+        write: WriteFn<'_>,
+        read: ReadFn<'_>,
+    ) -> Result<(), TextureError> {
+        let model = Self::model(&words, depth)?;
+        let d = model.desc;
+        let footprint = model.footprint()?;
+        let Some(e) = self.textures.get_mut(&key(&words, depth)) else {
             return Ok(());
         };
-        let tight = runner.read_image(&e.image, (d.width * d.height) as usize * bpp)?;
+        // Depth/stencil images read back their depth aspect only; packed
+        // depth-stencil formats are not written back (their stencil plane
+        // has no linear layout to copy).
+        if matches!(
+            model.format,
+            vk::Format::D24_UNORM_S8_UINT | vk::Format::D32_SFLOAT_S8_UINT
+        ) {
+            return Ok(());
+        }
+        let bytes = e.image.tight_bytes(model.bpe, model.block);
+        let tight = runner.read_image_levels(&e.image, bytes, model.block)?;
         // Keep the bytes between rows (linear padding) as they were.
         let mut dst = read(d.base_address, footprint).unwrap_or_else(|| vec![0; footprint]);
-        retile(&d, bpp, tiling, &tight, &mut dst);
+        model.retile_all(&tight, &mut dst)?;
         if !write(d.base_address, &dst) {
             return Err(TextureError::Write(d.base_address));
         }
@@ -478,17 +840,52 @@ impl TextureCache {
         Ok(())
     }
 
-    /// The sampler for an S#.
+    /// Fills the image a T# names with a clear value and writes it back to
+    /// title memory (`ClearRenderTargetView` / `ClearUnorderedAccessView*`
+    /// / `ClearDepthStencilView`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn clear(
+        &mut self,
+        runner: &ComputeRunner,
+        words: [u32; 8],
+        depth: Option<vk::Format>,
+        color: [u32; 4],
+        depth_value: f32,
+        stencil: u32,
+        write: WriteFn<'_>,
+        read: ReadFn<'_>,
+    ) -> Result<(), TextureError> {
+        let img = self.entry(runner, words, false, depth, read)?;
+        runner.clear_image(img, color, depth_value, stencil)?;
+        self.write_back_as(runner, words, depth, write, read)
+    }
+
+    /// The sampler for an S# (`compare`: for a depth-comparison sample).
     pub fn sampler(
         &mut self,
         runner: &ComputeRunner,
         words: [u32; 4],
     ) -> Result<vk::Sampler, TextureError> {
-        if let Some(&s) = self.samplers.get(&words) {
+        self.sampler_for(runner, words, false)
+    }
+
+    /// [`Self::sampler`], as a comparison sampler when `compare`.
+    pub fn sampler_for(
+        &mut self,
+        runner: &ComputeRunner,
+        words: [u32; 4],
+        compare: bool,
+    ) -> Result<vk::Sampler, TextureError> {
+        let mut desc = SamplerDescriptor::decode(words);
+        if compare {
+            desc.compare = Some(desc.depth_compare_func);
+        }
+        let k = (words, desc.compare);
+        if let Some(&s) = self.samplers.get(&k) {
             return Ok(s);
         }
-        let s = runner.create_sampler(&SamplerDescriptor::decode(words))?;
-        self.samplers.insert(words, s);
+        let s = runner.create_sampler(&desc)?;
+        self.samplers.insert(k, s);
         Ok(s)
     }
 
@@ -532,8 +929,19 @@ mod tests {
             retile(&d, 4, tiling, &tight, &mut mem);
             assert_eq!(detile(&d, 4, tiling, &mem), tight, "mode {mode}");
         }
-        assert!(is_block_compressed(vk_format_extended(41).unwrap()));
-        assert!(is_depth_stencil(vk_format_extended(43).unwrap()));
+        // GFX10 BC codes; 36..=55 are the packed 10/11-bit formats, not BCn.
+        assert!(is_block_compressed(vk_format_extended(121).unwrap()));
+        assert_eq!(bc_format(109), Some(vk::Format::BC1_RGBA_UNORM_BLOCK));
+        assert_eq!(
+            vk_format_extended(43),
+            Some(vk::Format::B10G11R11_UFLOAT_PACK32)
+        );
+        assert_eq!(
+            vk_format_extended(50),
+            Some(vk::Format::A2B10G10R10_UNORM_PACK32)
+        );
+        assert_eq!(vk_format_extended(200), None);
+        assert!(is_depth_stencil(vk::Format::D32_SFLOAT));
         assert_eq!(
             source_layout(&desc(8, 8, 0), 4).unwrap(),
             (Tiling::Linear { pitch: 256 }, 2048)
@@ -542,6 +950,41 @@ mod tests {
             source_layout(&desc(8, 8, 24), 4),
             Err(TextureError::SwizzleMode(24))
         ));
+    }
+
+    #[test]
+    fn surface_model_lays_levels_then_slices() {
+        // A 2D array of 3 layers, levels 0..=2, linear RGBA8: each slice's
+        // rows pad to 256 bytes; levels follow one another.
+        let mut d = desc(64, 16, 0);
+        d.kind = ImageKind::Tex2DArray;
+        d.depth = 3;
+        d.last_level = 2;
+        let m = TextureCache::model(&d.encode(), None).unwrap();
+        assert_eq!(m.shape, ImageShape::D2 { layers: 3 });
+        // Level 0: 256 B pitch x 16 rows x 3; level 1: 256 x 8 x 3; level 2: 256 x 4 x 3.
+        assert_eq!(m.footprint().unwrap(), 3 * 256 * (16 + 8 + 4));
+        let src: Vec<u8> = (0..m.footprint().unwrap()).map(|i| (i * 7) as u8).collect();
+        let tight = m.detile_all(&src).unwrap();
+        assert_eq!(tight.len(), 3 * 4 * (64 * 16 + 32 * 8 + 16 * 4));
+        let mut back = src.clone();
+        m.retile_all(&tight, &mut back).unwrap();
+        assert_eq!(back, src);
+
+        // A cube's depth counts cubes: 6 faces each.
+        let mut c = desc(8, 8, 9);
+        c.kind = ImageKind::Cube;
+        c.depth = 1;
+        let m = TextureCache::model(&c.encode(), None).unwrap();
+        assert_eq!(m.shape, ImageShape::Cube { cubes: 1 });
+        assert_eq!(m.footprint().unwrap(), 6 * 64 * 4);
+
+        // BC1: 4x4 blocks of 8 bytes are the elements.
+        let mut b = desc(16, 8, 0);
+        b.format = 109;
+        let m = TextureCache::model(&b.encode(), None).unwrap();
+        assert_eq!((m.bpe, m.block), (8, 4));
+        assert_eq!(m.footprint().unwrap(), 256 * 2);
     }
 
     #[test]

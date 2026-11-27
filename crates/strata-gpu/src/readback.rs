@@ -45,6 +45,54 @@ pub fn land_changed_dwords(gpu_shadow: &[u8], title_dst: &mut [u8]) -> LandingSt
     stats
 }
 
+/// Three-way dword merge: compares `gpu_shadow` against `baseline` and writes
+/// into `title_dst` **only** dwords that the GPU modified (`gpu_shadow != baseline`),
+/// preserving concurrent CPU writes on the same page and updating `baseline`.
+pub fn land_changed_dwords_against_baseline(
+    gpu_shadow: &[u8],
+    baseline: &mut [u8],
+    title_dst: &mut [u8],
+) -> LandingStats {
+    let len = gpu_shadow.len().min(baseline.len()).min(title_dst.len());
+    let dword_count = len / 4;
+    let mut stats = LandingStats {
+        dwords_scanned: dword_count,
+        dwords_changed: 0,
+        bytes_landed: 0,
+    };
+    for i in 0..dword_count {
+        let off = i * 4;
+        let g = u32::from_le_bytes(gpu_shadow[off..off + 4].try_into().unwrap());
+        let b = u32::from_le_bytes(baseline[off..off + 4].try_into().unwrap());
+        if g != b {
+            let bytes = g.to_le_bytes();
+            title_dst[off..off + 4].copy_from_slice(&bytes);
+            baseline[off..off + 4].copy_from_slice(&bytes);
+            stats.dwords_changed += 1;
+            stats.bytes_landed += 4;
+        }
+    }
+    stats
+}
+
+/// Multi-sample RGBA8 box-filter resolve (`sample_count` samples per pixel -> 1 pixel).
+pub fn resolve_msaa_rgba8(src_samples: &[u8], sample_count: u32, dst: &mut [u8]) {
+    let sc = (sample_count as usize).max(1);
+    let pixels = (src_samples.len() / (4 * sc)).min(dst.len() / 4);
+    for p in 0..pixels {
+        let mut acc = [0u32; 4];
+        for s in 0..sc {
+            let base = (p * sc + s) * 4;
+            for c in 0..4 {
+                acc[c] += u32::from(src_samples[base + c]);
+            }
+        }
+        for c in 0..4 {
+            dst[p * 4 + c] = (acc[c] / sc as u32) as u8;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

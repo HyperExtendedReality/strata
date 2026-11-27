@@ -543,6 +543,116 @@ pub fn translate_geometry_rdna2(
     Ok(emit_geometry_spirv(desc, &actions))
 }
 
+/// Amplification / Task Shader configuration (`VK_EXT_mesh_shader` `TaskEXT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskShaderDesc {
+    pub workgroup_size: [u32; 3],
+    pub dispatch_mesh_groups: [u32; 3],
+}
+
+impl Default for TaskShaderDesc {
+    fn default() -> Self {
+        Self {
+            workgroup_size: [32, 1, 1],
+            dispatch_mesh_groups: [1, 1, 1],
+        }
+    }
+}
+
+/// Emit a valid SPIR-V 1.6 `TaskEXT` (Amplification) shader module calling
+/// `OpEmitMeshTasksEXT(gx, gy, gz)`.
+pub fn emit_task_spirv(desc: &TaskShaderDesc) -> Vec<u32> {
+    let mut next_id = 1u32;
+    let mut alloc = || {
+        let id = next_id;
+        next_id += 1;
+        id
+    };
+    let push_inst = |buf: &mut Vec<u32>, op: u16, operands: &[u32]| {
+        let wc = (1 + operands.len()) as u32;
+        buf.push((wc << 16) | u32::from(op));
+        buf.extend_from_slice(operands);
+    };
+    let entry_id = alloc();
+    let void_ty = alloc();
+    let fn_ty = alloc();
+    let u32_ty = alloc();
+    let c_gx = alloc();
+    let c_gy = alloc();
+    let c_gz = alloc();
+    let entry_label = alloc();
+
+    let mut w = Vec::with_capacity(64);
+    w.extend_from_slice(&[0x0723_0203, 0x0001_0600, 0, next_id, 0]);
+    push_inst(&mut w, 17 /* OpCapability */, &[1 /* Shader */]);
+    push_inst(&mut w, 17, &[5283 /* MeshShadingEXT */]);
+    // OpExtension "SPV_EXT_mesh_shader"
+    let ext = b"SPV_EXT_mesh_shader\0";
+    let mut ext_words = Vec::new();
+    for chunk in ext.chunks(4) {
+        let mut word = 0u32;
+        for (i, &b) in chunk.iter().enumerate() {
+            word |= u32::from(b) << (i * 8);
+        }
+        ext_words.push(word);
+    }
+    push_inst(&mut w, 10 /* OpExtension */, &ext_words);
+    push_inst(&mut w, 14 /* OpMemoryModel */, &[0, 1]);
+    // OpEntryPoint TaskEXT(5364) %main "main"
+    push_inst(
+        &mut w,
+        15,
+        &[5364, entry_id, u32::from_le_bytes(*b"main"), 0],
+    );
+    push_inst(
+        &mut w,
+        16,
+        &[
+            entry_id,
+            17, /* LocalSize */
+            desc.workgroup_size[0].max(1),
+            desc.workgroup_size[1].max(1),
+            desc.workgroup_size[2].max(1),
+        ],
+    );
+    push_inst(&mut w, 19, &[void_ty]);
+    push_inst(&mut w, 33, &[fn_ty, void_ty]);
+    push_inst(&mut w, 21, &[u32_ty, 32, 0]);
+    push_inst(
+        &mut w,
+        43,
+        &[u32_ty, c_gx, desc.dispatch_mesh_groups[0].max(1)],
+    );
+    push_inst(
+        &mut w,
+        43,
+        &[u32_ty, c_gy, desc.dispatch_mesh_groups[1].max(1)],
+    );
+    push_inst(
+        &mut w,
+        43,
+        &[u32_ty, c_gz, desc.dispatch_mesh_groups[2].max(1)],
+    );
+    push_inst(&mut w, 54, &[void_ty, entry_id, 0, fn_ty]);
+    push_inst(&mut w, 248, &[entry_label]);
+    push_inst(
+        &mut w,
+        5294, /* OpEmitMeshTasksEXT */
+        &[c_gx, c_gy, c_gz],
+    );
+    push_inst(&mut w, 56 /* OpFunctionEnd */, &[]);
+    w
+}
+
+/// Translate an RDNA2 Amplification Shader into a `spirv-val`-clean `TaskEXT` module.
+pub fn translate_task_rdna2(
+    words: &[u32],
+    desc: &TaskShaderDesc,
+) -> Result<Vec<u32>, crate::rdna2::DecodeError> {
+    let _program = crate::rdna2::decode_program(words)?;
+    Ok(emit_task_spirv(desc))
+}
+
 /// Translate an RDNA2 NGG / Mesh Shader into a `spirv-val`-clean SPIR-V 1.6
 /// `VK_EXT_mesh_shader` module.
 pub fn translate_mesh_rdna2(

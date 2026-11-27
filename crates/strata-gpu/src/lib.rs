@@ -2,13 +2,17 @@
 
 pub mod async_submit;
 pub mod bindless;
+pub mod compression;
 pub mod context;
 pub mod descriptors;
+pub mod display;
 pub mod graphics;
 pub mod images;
 pub mod indirect_upload;
 pub mod layout;
 pub mod memory;
+pub mod overlay;
+pub mod pipeline_usage;
 pub mod present;
 pub mod readback;
 pub mod replay;

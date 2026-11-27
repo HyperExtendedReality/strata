@@ -94,7 +94,11 @@ pub enum ShaderStage {
     Pixel,
     Geometry,
     Compute,
+    Hull,
+    Domain,
     Mesh,
+    Amplification,
+    Library,
     Unknown(u8),
 }
 
@@ -118,14 +122,18 @@ pub fn parse_fssm(bytes: &[u8]) -> Result<FssmProgram<'_>, ContainerError> {
             offset: code_start + code_size,
         });
     }
-    // Stage descriptor byte at +0x101 (AA = API stage: 0=VS, 1=PS, 2=GS, 3=CS, 6=MS)
+    // Stage descriptor byte at +0x101 (AA = API stage: 0=VS, 1=PS, 2=GS, 3=CS, 4=HS, 5=DS, 6=MS, 7=AS, 8=LIB)
     let api_stage = bytes[0x101];
     let stage = match api_stage {
         0 => ShaderStage::Vertex,
         1 => ShaderStage::Pixel,
         2 => ShaderStage::Geometry,
         3 => ShaderStage::Compute,
+        4 => ShaderStage::Hull,
+        5 => ShaderStage::Domain,
         6 => ShaderStage::Mesh,
+        7 => ShaderStage::Amplification,
+        8 => ShaderStage::Library,
         other => ShaderStage::Unknown(other),
     };
     Ok(FssmProgram {

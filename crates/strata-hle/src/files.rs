@@ -110,8 +110,22 @@ wrap2!(move_file_ex_w, W, "kernel32.dll", "MoveFileExW", (flags: u32) -> i32);
 wrap2!(move_file_ex_a, A, "kernel32.dll", "MoveFileExA", (flags: u32) -> i32);
 wrap2!(copy_file_w, W, "kernel32.dll", "CopyFileW", (fail: i32) -> i32);
 wrap2!(copy_file_a, A, "kernel32.dll", "CopyFileA", (fail: i32) -> i32);
+wrap2!(move_file_w, W, "kernel32.dll", "MoveFileW", () -> i32);
+wrap2!(move_file_a, A, "kernel32.dll", "MoveFileA", () -> i32);
+wrap1!(set_file_attributes_w, W, "kernel32.dll", "SetFileAttributesW", (attrs: u32) -> i32);
+wrap1!(set_file_attributes_a, A, "kernel32.dll", "SetFileAttributesA", (attrs: u32) -> i32);
+wrap1!(get_full_path_name_w, W, "kernel32.dll", "GetFullPathNameW", (len: u32, buf: *mut u16, file_part: *mut *mut u16) -> u32);
+wrap1!(get_full_path_name_a, A, "kernel32.dll", "GetFullPathNameA", (len: u32, buf: *mut i8, file_part: *mut *mut i8) -> u32);
+wrap1!(get_disk_free_space_ex_w, W, "kernel32.dll", "GetDiskFreeSpaceExW", (avail: *mut u64, total: *mut u64, free: *mut u64) -> i32);
+wrap2!(create_directory_ex_w, W, "kernel32.dll", "CreateDirectoryExW", (sa: Ptr) -> i32);
 wrap1!(crt_fopen, A, "ucrtbase.dll", "fopen", (mode: *const i8) -> Ptr);
 wrap1!(crt_wfopen, W, "ucrtbase.dll", "_wfopen", (mode: *const u16) -> Ptr);
+wrap1!(crt_open, A, "ucrtbase.dll", "_open", (oflag: i32, pmode: i32) -> i32);
+wrap1!(crt_wopen, W, "ucrtbase.dll", "_wopen", (oflag: i32, pmode: i32) -> i32);
+wrap1!(crt_stat64, A, "ucrtbase.dll", "_stat64", (buf: Ptr) -> i32);
+wrap1!(crt_wstat64, W, "ucrtbase.dll", "_wstat64", (buf: Ptr) -> i32);
+wrap1!(crt_access, A, "ucrtbase.dll", "_access", (mode: i32) -> i32);
+wrap1!(crt_waccess, W, "ucrtbase.dll", "_waccess", (mode: i32) -> i32);
 
 unsafe extern "system" fn crt_fopen_s(out: *mut Ptr, path: *const i8, mode: *const i8) -> i32 {
     type F = unsafe extern "system" fn(*mut Ptr, *const i8, *const i8) -> i32;
@@ -168,10 +182,24 @@ pub(crate) fn file_override(dll: &str, func: &str) -> Option<usize> {
         "MoveFileExA" => move_file_ex_a as *const () as usize,
         "CopyFileW" => copy_file_w as *const () as usize,
         "CopyFileA" => copy_file_a as *const () as usize,
+        "MoveFileW" => move_file_w as *const () as usize,
+        "MoveFileA" => move_file_a as *const () as usize,
+        "SetFileAttributesW" => set_file_attributes_w as *const () as usize,
+        "SetFileAttributesA" => set_file_attributes_a as *const () as usize,
+        "GetFullPathNameW" => get_full_path_name_w as *const () as usize,
+        "GetFullPathNameA" => get_full_path_name_a as *const () as usize,
+        "GetDiskFreeSpaceExW" => get_disk_free_space_ex_w as *const () as usize,
+        "CreateDirectoryExW" => create_directory_ex_w as *const () as usize,
         "fopen" => crt_fopen as *const () as usize,
         "_wfopen" => crt_wfopen as *const () as usize,
         "fopen_s" => crt_fopen_s as *const () as usize,
         "_wfopen_s" => crt_wfopen_s as *const () as usize,
+        "_open" => crt_open as *const () as usize,
+        "_wopen" => crt_wopen as *const () as usize,
+        "_stat64" => crt_stat64 as *const () as usize,
+        "_wstat64" => crt_wstat64 as *const () as usize,
+        "_access" => crt_access as *const () as usize,
+        "_waccess" => crt_waccess as *const () as usize,
         _ => return None,
     };
     Some(f)

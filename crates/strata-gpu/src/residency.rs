@@ -122,6 +122,77 @@ impl ResidencyManager {
     }
 }
 
+/// Host memory pressure tier modeled on `VIctory-Fast`'s commit-headroom rules:
+/// distinguishes mild pressure (keep prefetch + 1 spare block alive) from
+/// critical commit starvation (`< 1536 MiB` free commit or upload refusal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressureTier {
+    Normal,
+    Mild,
+    Critical,
+}
+
+impl PressureTier {
+    pub const CRITICAL_COMMIT_BYTES: u64 = 1536 * 1024 * 1024;
+    pub const MILD_COMMIT_BYTES: u64 = 4096 * 1024 * 1024;
+
+    pub fn from_available_commit(avail_commit_bytes: u64, upload_refused: bool) -> Self {
+        if upload_refused || avail_commit_bytes < Self::CRITICAL_COMMIT_BYTES {
+            Self::Critical
+        } else if avail_commit_bytes < Self::MILD_COMMIT_BYTES {
+            Self::Mild
+        } else {
+            Self::Normal
+        }
+    }
+
+    /// Per-frame speculative staging admission cap (bytes). Required bake
+    /// uploads bypass this cap (`None` = unlimited).
+    pub fn speculative_staging_budget_bytes(self, is_required_bake: bool) -> Option<u64> {
+        if is_required_bake {
+            return None;
+        }
+        match self {
+            Self::Normal => Some(64 * 1024 * 1024),
+            Self::Mild => Some(32 * 1024 * 1024),
+            Self::Critical => Some(16 * 1024 * 1024),
+        }
+    }
+}
+
+/// 500 ms pool-growth backoff after an allocation failure (`E_OUTOFMEMORY`),
+/// preventing bursts of failing 64 MiB pool allocations while still allowing
+/// reuse of already-allocated pool space.
+#[derive(Debug)]
+pub struct OomBackoff {
+    cooldown: std::time::Duration,
+    last_failure: Option<std::time::Instant>,
+}
+
+impl Default for OomBackoff {
+    fn default() -> Self {
+        Self::new(std::time::Duration::from_millis(500))
+    }
+}
+
+impl OomBackoff {
+    pub fn new(cooldown: std::time::Duration) -> Self {
+        Self {
+            cooldown,
+            last_failure: None,
+        }
+    }
+
+    pub fn record_failure(&mut self) {
+        self.last_failure = Some(std::time::Instant::now());
+    }
+
+    pub fn can_grow(&self) -> bool {
+        self.last_failure
+            .is_none_or(|t| t.elapsed() >= self.cooldown)
+    }
+}
+
 // ============================================================================
 // Query Heaps (Occlusion, Timestamp, Pipeline Statistics)
 // ============================================================================

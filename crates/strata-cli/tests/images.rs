@@ -126,6 +126,78 @@ fn typed_buffer_loads_and_stores_convert_formats() {
     runner.free_bda_buffer(target);
 }
 
+/// R11G11B10 float element: 11-bit (5 exp, 6 mantissa) R and G, 10-bit B.
+fn r11g11b10(r: f32, g: f32, b: f32) -> u32 {
+    let enc = |v: f32, mbits: u32| -> u32 {
+        let bits = v.to_bits();
+        let e = (bits >> 23) & 0xff;
+        let m = (bits >> (23 - mbits)) & ((1 << mbits) - 1);
+        if e < 113 { 0 } else { ((e - 112) << mbits) | m }
+    };
+    enc(r, 6) | (enc(g, 6) << 11) | (enc(b, 5) << 22)
+}
+
+#[test]
+fn packed_float_loads_and_sub_dword_stores_run_on_the_gpu() {
+    let Some(runner) = runner() else { return };
+
+    // R11G11B10_FLOAT: element t = (t / 8, 2.0, 0.25).
+    let mut input = runner.alloc_bda_buffer(64 * 4).unwrap();
+    unsafe {
+        let w = input.as_mut_slice::<u32>(64);
+        for t in 0..64 {
+            w[t] = r11g11b10(t as f32 / 8.0, 2.0, 0.25);
+        }
+    }
+    let out = runner.alloc_bda_buffer(64 * 16).unwrap();
+    let spirv = compile_rdna2_to_spirv(&typed_load_r11g11b10_float(), [64, 1, 1])
+        .unwrap()
+        .spirv;
+    let mut push = [0u32; 32];
+    push[0] = out.bda as u32;
+    push[1] = (out.bda >> 32) as u32;
+    push[4..8].copy_from_slice(&buffer_descriptor(input.bda, 4, 64));
+    let bytes: Vec<u8> = push.iter().flat_map(|w| w.to_le_bytes()).collect();
+    runner.dispatch_spirv(&spirv, &bytes, [1, 1, 1]).unwrap();
+    let got = floats(unsafe { out.as_slice::<u32>(256) });
+    for t in 0..64usize {
+        let want = [t as f32 / 8.0, 2.0, 0.25, 1.0];
+        for k in 0..4 {
+            assert!(
+                close(got[t * 4 + k], want[k]),
+                "r11g11b10 t={t} k={k}: {} vs {}",
+                got[t * 4 + k],
+                want[k]
+            );
+        }
+    }
+
+    // 8_UNORM (1 byte) and 16_UNORM (2 bytes) stores: 4 and 2 lanes share each
+    // dword; every byte must land.
+    for (format, stride, want) in [(1u8, 1usize, vec![128u8]), (7, 2, vec![0x00, 0x80])] {
+        let target = runner.alloc_bda_buffer(256).unwrap();
+        let spirv = compile_rdna2_to_spirv(&typed_store_half_one(format, 1), [64, 1, 1])
+            .unwrap_or_else(|e| panic!("format {format}: {e}"))
+            .spirv;
+        let mut push = [0u32; 32];
+        push[4..8].copy_from_slice(&buffer_descriptor(target.bda, stride as u32, 64));
+        let bytes: Vec<u8> = push.iter().flat_map(|w| w.to_le_bytes()).collect();
+        runner.dispatch_spirv(&spirv, &bytes, [1, 1, 1]).unwrap();
+        let stored = unsafe { target.as_slice::<u8>(256).to_vec() };
+        for t in 0..64 {
+            let el = &stored[t * stride..t * stride + stride];
+            // 0.5 UNORM rounds to 128 (8-bit) / 32768 (16-bit).
+            assert!(
+                el.iter().zip(&want).all(|(a, b)| a.abs_diff(*b) <= 1),
+                "format {format} t={t}: {el:?}"
+            );
+        }
+        runner.free_bda_buffer(target);
+    }
+    runner.free_bda_buffer(input);
+    runner.free_bda_buffer(out);
+}
+
 /// Title memory for an 8x8 RGBA8 image: texel (x, y) = (32x, 32y, 7, 255).
 fn texel(x: usize, y: usize) -> [u8; 4] {
     [(x * 32) as u8, (y * 32) as u8, 7, 255]

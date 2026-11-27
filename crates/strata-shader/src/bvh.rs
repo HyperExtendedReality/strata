@@ -155,3 +155,112 @@ pub fn intersect_box16(ray: &Ray, node: &Box16Node) -> [u32; 4] {
     }
     intersect_box32(ray, &b32)
 }
+
+/// RDNA2 BVH node pointer kind encoded in the low 3 bits (`node_ptr & 0x7`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BvhNodeKind {
+    Triangle(u8),
+    Box16,
+    Box32,
+    Instance,
+    Procedural,
+}
+
+impl BvhNodeKind {
+    pub fn from_node_ptr(node_ptr: u32) -> Self {
+        match node_ptr & 0x7 {
+            t @ 0..=3 => Self::Triangle(t as u8),
+            4 => Self::Box16,
+            5 => Self::Box32,
+            6 => Self::Instance,
+            _ => Self::Procedural,
+        }
+    }
+}
+
+/// RDNA2 128-byte TLAS Instance node: 3x4 row-major inverse transform + BLAS root pointer.
+#[derive(Debug, Clone, Copy)]
+pub struct InstanceNode {
+    /// World-to-object 3x4 affine matrix (rows: x, y, z).
+    pub inv_transform: [[f32; 4]; 3],
+    pub blas_root_ptr: u32,
+    pub instance_id: u32,
+    pub instance_mask: u8,
+}
+
+/// Transforms `ray` into object space using `node.inv_transform` and returns
+/// `(transformed_ray, blas_root_ptr)` if `ray_mask & node.instance_mask != 0`.
+pub fn intersect_instance(ray: &Ray, node: &InstanceNode, ray_mask: u8) -> Option<(Ray, u32)> {
+    if (ray_mask & node.instance_mask) == 0 || node.blas_root_ptr == INVALID_NODE {
+        return None;
+    }
+    let m = &node.inv_transform;
+    let o = ray.origin;
+    let d = ray.dir;
+    let new_origin = [
+        m[0][0] * o[0] + m[0][1] * o[1] + m[0][2] * o[2] + m[0][3],
+        m[1][0] * o[0] + m[1][1] * o[1] + m[1][2] * o[2] + m[1][3],
+        m[2][0] * o[0] + m[2][1] * o[1] + m[2][2] * o[2] + m[2][3],
+    ];
+    let new_dir = [
+        m[0][0] * d[0] + m[0][1] * d[1] + m[0][2] * d[2],
+        m[1][0] * d[0] + m[1][1] * d[1] + m[1][2] * d[2],
+        m[2][0] * d[0] + m[2][1] * d[1] + m[2][2] * d[2],
+    ];
+    let inv = |v: f32| if v == 0.0 { f32::INFINITY } else { 1.0 / v };
+    Some((
+        Ray {
+            t_max: ray.t_max,
+            origin: new_origin,
+            dir: new_dir,
+            inv_dir: [inv(new_dir[0]), inv(new_dir[1]), inv(new_dir[2])],
+        },
+        node.blas_root_ptr,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn box32_sorts_hits_nearest_first_and_instance_transforms_ray() {
+        let ray = Ray {
+            t_max: 100.0,
+            origin: [0.0, 0.0, 0.0],
+            dir: [0.0, 0.0, 1.0],
+            inv_dir: [f32::INFINITY, f32::INFINITY, 1.0],
+        };
+        let node = Box32Node {
+            children: [10, 20, INVALID_NODE, 30],
+            bounds_min: [
+                [-1.0, -1.0, 10.0],
+                [-1.0, -1.0, 2.0],
+                [0.0, 0.0, 0.0],
+                [-1.0, -1.0, 5.0],
+            ],
+            bounds_max: [
+                [1.0, 1.0, 12.0],
+                [1.0, 1.0, 4.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 1.0, 6.0],
+            ],
+        };
+        assert_eq!(intersect_box32(&ray, &node), [20, 30, 10, INVALID_NODE]);
+
+        let inst = InstanceNode {
+            inv_transform: [
+                [1.0, 0.0, 0.0, -5.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ],
+            blas_root_ptr: 0x45,
+            instance_id: 7,
+            instance_mask: 0xFF,
+        };
+        let (tr, root) = intersect_instance(&ray, &inst, 0x01).unwrap();
+        assert_eq!(root, 0x45);
+        assert_eq!(tr.origin, [-5.0, 0.0, 0.0]);
+        assert_eq!(BvhNodeKind::from_node_ptr(0x45), BvhNodeKind::Box32);
+    }
+}

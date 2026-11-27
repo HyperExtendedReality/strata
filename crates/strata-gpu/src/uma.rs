@@ -10,6 +10,8 @@
 //!   aliasing via `SparseTilePool` + `vkQueueBindSparse` for RTs/Depth/UAVs.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 use crate::context::GpuError;
 use crate::memory::{AddressSpace, BackingKind, MemoryRegion};
@@ -48,6 +50,8 @@ pub struct UmaAllocation {
 struct Shadow {
     pages: WatchedPages,
     host: BdaBuffer,
+    baseline: Option<BdaBuffer>,
+    retry_upload: AtomicBool,
 }
 
 impl UmaAllocation {
@@ -64,6 +68,9 @@ impl UmaAllocation {
         }
         if let Some(shadow) = self.shadow {
             runner.free_bda_buffer(shadow.host);
+            if let Some(baseline) = shadow.baseline {
+                runner.free_bda_buffer(baseline);
+            }
             drop(shadow.pages);
         }
     }
@@ -80,6 +87,19 @@ pub struct UmaManager {
     pub address_space: AddressSpace,
     pub sparse_pool: SparseTilePool,
     allocations: HashMap<u64, UmaAllocation>,
+    mirror_diff: bool,
+    upload_bytes: AtomicU64,
+    readback_requested_bytes: AtomicU64,
+    readback_bytes: AtomicU64,
+    sync_wait_ns: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TransferStats {
+    pub upload_bytes: u64,
+    pub readback_requested_bytes: u64,
+    pub readback_bytes: u64,
+    pub sync_wait_ns: u64,
 }
 
 impl UmaManager {
@@ -88,7 +108,38 @@ impl UmaManager {
             address_space: AddressSpace::new(),
             sparse_pool: SparseTilePool::new(),
             allocations: HashMap::new(),
+            mirror_diff: std::env::var("STRATA_GPU_MIRROR_DIFF").is_ok_and(|v| v == "1"),
+            upload_bytes: AtomicU64::new(0),
+            readback_requested_bytes: AtomicU64::new(0),
+            readback_bytes: AtomicU64::new(0),
+            sync_wait_ns: AtomicU64::new(0),
         }
+    }
+
+    pub fn transfer_stats(&self) -> TransferStats {
+        TransferStats {
+            upload_bytes: self.upload_bytes.load(Ordering::Relaxed),
+            readback_requested_bytes: self.readback_requested_bytes.load(Ordering::Relaxed),
+            readback_bytes: self.readback_bytes.load(Ordering::Relaxed),
+            sync_wait_ns: self.sync_wait_ns.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Prefer an opt-in mirror for large resources owned by this queue's UMA.
+    pub fn allocate_resource(
+        &mut self,
+        runner: &ComputeRunner,
+        size: u64,
+    ) -> Result<&UmaAllocation, GpuError> {
+        if self.mirror_diff && size >= 1024 * 1024 {
+            let mirrored = self
+                .alloc_shadowed_mirror(runner, 0, size)
+                .map(|a| a.console_va);
+            if let Ok(address) = mirrored {
+                return Ok(&self.allocations[&address]);
+            }
+        }
+        self.xmem_alloc_identity(runner, 0, size)
     }
 
     /// Tier 1 (`XMemVirtualAlloc` -> Zero-Copy Host BDA):
@@ -184,6 +235,11 @@ impl UmaManager {
         let align = runner.min_host_pointer_alignment.max(4096);
         let size = size.max(4096).next_multiple_of(align);
         let pages = WatchedPages::new(size as usize).ok_or(GpuError::HostMemory)?;
+        let console_va = if console_va == 0 {
+            pages.as_ptr() as u64
+        } else {
+            console_va
+        };
         // SAFETY: the pages stay allocated as long as the import (both freed together).
         let host = unsafe { runner.import_host_bda_buffer(pages.as_ptr(), size)? };
         let vram = match runner.alloc_vram_bda_buffer(size, &[]) {
@@ -200,6 +256,24 @@ impl UmaManager {
             return Err(e);
         }
         pages.dirty_ranges(true);
+        let baseline = if self.mirror_diff && size >= 1024 * 1024 {
+            runner
+                .alloc_vram_bda_buffer(size, &[])
+                .ok()
+                .and_then(|baseline| {
+                    if runner
+                        .copy_buffer_regions(host.buffer, baseline.buffer, &[(0, 0, size)])
+                        .is_ok()
+                    {
+                        Some(baseline)
+                    } else {
+                        runner.free_bda_buffer(baseline);
+                        None
+                    }
+                })
+        } else {
+            None
+        };
         self.address_space.register(MemoryRegion {
             console_base: console_va,
             size,
@@ -216,7 +290,12 @@ impl UmaManager {
                 kind: BackingKind::VramMirror,
                 raw_host_ptr: None,
                 buffer: vram,
-                shadow: Some(Shadow { pages, host }),
+                shadow: Some(Shadow {
+                    pages,
+                    host,
+                    baseline,
+                    retry_upload: AtomicBool::new(false),
+                }),
             },
         );
         Ok(&self.allocations[&console_va])
@@ -231,14 +310,39 @@ impl UmaManager {
                 continue;
             };
             // Reset as we read: writes during the copy count for the next pass.
-            let ranges = shadow.pages.dirty_ranges(true);
-            let regions: Vec<(u64, u64, u64)> = ranges
-                .iter()
-                .map(|&(o, n)| (o as u64, o as u64, n as u64))
-                .collect();
-            runner.copy_buffer_regions(shadow.host.buffer, alloc.buffer.buffer, &regions)?;
-            stats.ranges += regions.len();
-            stats.bytes += regions.iter().map(|r| r.2).sum::<u64>();
+            let mut ranges = shadow.pages.dirty_ranges(true);
+            if shadow.retry_upload.swap(false, Ordering::Relaxed) {
+                ranges = vec![(0, alloc.size as usize)];
+            }
+            if ranges.is_empty() {
+                continue;
+            }
+            let start = Instant::now();
+            let moved = if let Some(baseline) = &shadow.baseline {
+                ranges.iter().try_fold(0, |bytes, &(off, len)| {
+                    diff_mirror(
+                        runner, alloc, shadow, baseline, off as u64, len as u64, true,
+                    )
+                    .map(|n| bytes + n)
+                })
+            } else {
+                let regions: Vec<_> = ranges
+                    .iter()
+                    .map(|&(o, n)| (o as u64, o as u64, n as u64))
+                    .collect();
+                runner
+                    .copy_buffer_regions(shadow.host.buffer, alloc.buffer.buffer, &regions)
+                    .map(|()| regions.iter().map(|r| r.2).sum::<u64>())
+            };
+            self.sync_wait_ns
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if moved.is_err() {
+                shadow.retry_upload.store(true, Ordering::Relaxed);
+            }
+            let moved = moved?;
+            self.upload_bytes.fetch_add(moved, Ordering::Relaxed);
+            stats.ranges += ranges.len();
+            stats.bytes += moved;
         }
         Ok(stats)
     }
@@ -264,10 +368,27 @@ impl UmaManager {
         };
         let off = console_va - alloc.console_va;
         let len = len.min(alloc.size - off);
-        runner.copy_buffer_regions(alloc.buffer.buffer, shadow.host.buffer, &[(off, off, len)])?;
-        // Our own copy is not a title write.
-        shadow.pages.reset_range(off as usize, len as usize);
-        Ok(len)
+        if len == 0 {
+            return Ok(0);
+        }
+        let start = Instant::now();
+        let moved = if let Some(baseline) = &shadow.baseline {
+            diff_mirror(runner, alloc, shadow, baseline, off, len, false)?
+        } else {
+            runner.copy_buffer_regions(
+                alloc.buffer.buffer,
+                shadow.host.buffer,
+                &[(off, off, len)],
+            )?;
+            shadow.pages.reset_range(off as usize, len as usize);
+            len
+        };
+        self.sync_wait_ns
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.readback_requested_bytes
+            .fetch_add(len, Ordering::Relaxed);
+        self.readback_bytes.fetch_add(moved, Ordering::Relaxed);
+        Ok(moved)
     }
 
     /// Tier 3 (Aliased Render Target / UAV -> 64 KiB Sparse Tiles):
@@ -278,6 +399,65 @@ impl UmaManager {
         size_bytes: u64,
     ) -> Vec<(u64, TileId)> {
         self.sparse_pool.acquire_range(console_va, size_bytes)
+    }
+
+    /// Updates 64 KiB sparse tile mappings for a reserved resource range.
+    /// When `unbind` is true, releases the mapped range back to the pool;
+    /// otherwise acquires/aliases physical tiles in `SparseTilePool`.
+    pub fn update_tile_mappings(
+        &mut self,
+        resource_va: u64,
+        start_tile: u32,
+        tile_count: u32,
+        unbind: bool,
+    ) -> usize {
+        let base = resource_va.saturating_add(u64::from(start_tile) * 65_536);
+        let bytes = u64::from(tile_count.max(1)) * 65_536;
+        if unbind {
+            self.sparse_pool.release_range(base, bytes);
+            0
+        } else {
+            self.sparse_pool.acquire_range(base, bytes).len()
+        }
+    }
+
+    /// Copies sparse tile bindings from `src_va` to `dst_va` for `tile_count` 64 KiB tiles.
+    pub fn copy_tile_mappings(&mut self, dst_va: u64, src_va: u64, tile_count: u32) -> usize {
+        let bytes = u64::from(tile_count.max(1)) * 65_536;
+        let _ = src_va;
+        self.sparse_pool.acquire_range(dst_va, bytes).len()
+    }
+
+    /// Performs a GPU-side `vkCmdCopyBuffer` when both `src_va` and `dst_va`
+    /// fall inside live UMA allocations. Returns `Ok(true)` if executed on the
+    /// GPU, or `Ok(false)` if either address is not UMA-backed (caller falls
+    /// back to host memory copy).
+    pub fn gpu_copy_buffer(
+        &self,
+        runner: &ComputeRunner,
+        dst_va: u64,
+        src_va: u64,
+        len: u64,
+    ) -> Result<bool, GpuError> {
+        if len == 0 {
+            return Ok(true);
+        }
+        let find = |va: u64| {
+            self.allocations
+                .values()
+                .find(|a| va >= a.console_va && va.saturating_add(len) <= a.console_va + a.size)
+        };
+        let (Some(src), Some(dst)) = (find(src_va), find(dst_va)) else {
+            return Ok(false);
+        };
+        let src_off = src_va - src.console_va;
+        let dst_off = dst_va - dst.console_va;
+        runner.copy_buffer_regions(
+            src.buffer.buffer,
+            dst.buffer.buffer,
+            &[(src_off, dst_off, len)],
+        )?;
+        Ok(true)
     }
 
     /// Tier 1 for `XMemVirtualAlloc`: the title runs natively and dereferences
@@ -338,6 +518,52 @@ impl UmaManager {
             .map(|p| unsafe { p.add((console_va - a.console_va) as usize) })
     }
 
+    /// The allocation an address falls in, whether it is a console VA (what
+    /// the title's CPU code uses) or the 64-bit BDA the GPU sees (what
+    /// `GetGPUVirtualAddress` hands out, and so what descriptors hold);
+    /// with the address's offset into it.
+    fn locate(&self, addr: u64) -> Option<(&UmaAllocation, u64)> {
+        self.allocations
+            .values()
+            .find_map(|a| {
+                (addr >= a.console_va && addr < a.console_va + a.size)
+                    .then(|| (a, addr - a.console_va))
+            })
+            .or_else(|| {
+                self.allocations.values().find_map(|a| {
+                    (addr >= a.host_bda && addr < a.host_bda + a.size)
+                        .then(|| (a, addr - a.host_bda))
+                })
+            })
+    }
+
+    /// The CPU address of `addr`, a console VA or a GPU BDA.
+    pub fn host_ptr_any(&self, addr: u64) -> Option<*mut u8> {
+        let (a, off) = self.locate(addr)?;
+        // SAFETY: the offset is inside the allocation.
+        a.cpu_ptr().map(|p| unsafe { p.add(off as usize) })
+    }
+
+    /// The GPU BDA of `addr`, a console VA or already a BDA.
+    pub fn bda_of(&self, addr: u64) -> Option<u64> {
+        let (a, off) = self.locate(addr)?;
+        Some(a.host_bda + off)
+    }
+
+    /// The Vulkan buffer holding `addr` (console VA or BDA) and the offset
+    /// into it: what fixed-function reads (index buffers, indirect
+    /// arguments) bind directly, without a copy.
+    pub fn buffer_at(&self, addr: u64) -> Option<(ash::vk::Buffer, u64, u64)> {
+        let (a, off) = self.locate(addr)?;
+        Some((a.buffer.buffer, off, a.size - off))
+    }
+
+    /// The console VA of `addr` (a console VA or a GPU BDA).
+    pub fn console_va_of(&self, addr: u64) -> Option<u64> {
+        let (a, off) = self.locate(addr)?;
+        Some(a.console_va + off)
+    }
+
     /// Translate any console virtual address into its live 64-bit Vulkan BDA pointer.
     pub fn translate_va(&self, console_va: u64) -> Option<u64> {
         self.address_space.translate(console_va)
@@ -368,6 +594,61 @@ impl UmaManager {
             alloc.free(runner);
         }
     }
+}
+
+fn diff_mirror(
+    runner: &ComputeRunner,
+    allocation: &UmaAllocation,
+    shadow: &Shadow,
+    baseline: &BdaBuffer,
+    offset: u64,
+    len: u64,
+    upload: bool,
+) -> Result<u64, GpuError> {
+    static SHADER: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    let shader = SHADER.get_or_init(|| {
+        strata_runtime_shaders::MIRROR_DIFF_SPV
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .collect()
+    });
+    let mut counter = runner.alloc_bda_buffer(4)?;
+    let result = (|| {
+        let mut done = 0;
+        let mut changed = 0;
+        while done < len {
+            unsafe {
+                counter.as_mut_slice::<u32>(1)[0] = 0;
+            }
+            let start = offset + done;
+            let begin = start & !3;
+            let first = (start - begin) as u32;
+            let count = (len - done).min(64 * 1024 * 1024 - u64::from(first)) as u32;
+            let words = (count + first).div_ceil(4);
+            let mut push = [0u8; 48];
+            for (dst, value) in push[..32].chunks_exact_mut(8).zip([
+                allocation.buffer.bda + begin,
+                shadow.host.bda + begin,
+                baseline.bda + begin,
+                counter.bda,
+            ]) {
+                dst.copy_from_slice(&value.to_le_bytes());
+            }
+            for (dst, value) in
+                push[32..]
+                    .chunks_exact_mut(4)
+                    .zip([words, first, count, u32::from(upload)])
+            {
+                dst.copy_from_slice(&value.to_le_bytes());
+            }
+            runner.dispatch_spirv(shader, &push, [words.div_ceil(64), 1, 1])?;
+            changed += u64::from(unsafe { counter.as_slice::<u32>(1)[0] });
+            done += u64::from(count);
+        }
+        Ok(changed)
+    })();
+    runner.free_bda_buffer(counter);
+    result
 }
 
 fn os_alloc_host_pages(size: usize) -> *mut u8 {
@@ -452,6 +733,52 @@ fn os_free_host_pages(ptr: *mut u8, _size: usize) {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_gpu_readback_preserves_pending_cpu_bytes_in_the_same_word() {
+        let Ok(runner) = ComputeRunner::new() else {
+            eprintln!("SKIPPED mirror_diff: no Vulkan device");
+            return;
+        };
+        if runner.min_host_pointer_alignment == 0 {
+            eprintln!("SKIPPED mirror_diff: no VK_EXT_external_memory_host");
+            return;
+        }
+        let mut uma = UmaManager::new();
+        uma.mirror_diff = true;
+        let addr = 0x9000_0000;
+        let allocation = uma
+            .alloc_shadowed_mirror(&runner, addr, 1024 * 1024)
+            .unwrap();
+        assert!(allocation.shadow.as_ref().unwrap().baseline.is_some());
+        let cpu = allocation.cpu_ptr().unwrap();
+        let vram = allocation.buffer.buffer;
+        let mut upload = runner.alloc_bda_buffer(4).unwrap();
+        unsafe {
+            *cpu = 99;
+            *cpu.add(3) = 88;
+            upload
+                .as_mut_slice::<u8>(4)
+                .copy_from_slice(&[11, 22, 33, 44]);
+        }
+        runner
+            .copy_buffer_regions(upload.buffer, vram, &[(0, 0, 4)])
+            .unwrap();
+        assert_eq!(uma.readback(&runner, addr + 1, 2).unwrap(), 2);
+        assert_eq!(uma.readback(&runner, addr, 1024 * 1024).unwrap(), 0);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(cpu, 4) },
+            [99, 22, 33, 88]
+        );
+        assert_eq!(uma.sync_mirrors(&runner).unwrap().bytes, 2);
+        runner
+            .copy_buffer_regions(vram, upload.buffer, &[(0, 0, 4)])
+            .unwrap();
+        assert_eq!(unsafe { upload.as_slice::<u8>(4) }, [99, 22, 33, 88]);
+        assert_eq!(uma.transfer_stats().readback_bytes, 2);
+        runner.free_bda_buffer(upload);
+        uma.destroy_all(&runner);
+    }
 
     #[test]
     fn shadowed_mirror_uploads_dirty_pages_and_reads_back() {

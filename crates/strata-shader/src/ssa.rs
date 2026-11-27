@@ -23,7 +23,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
 use crate::format::{FormatInfo, NumFormat, PackedFormat, gfx10_format, gfx10_packed_format};
-use crate::rdna2::{AtomicOp, CmpOp, CmpType, DecodedInst, Inst, InterpOp, Operand, SampleMode, Vop3pOp};
+use crate::rdna2::{
+    AtomicOp, CmpOp, CmpType, DecodedInst, Inst, InterpOp, Operand, SampleMode, Vop3pOp,
+};
+pub use crate::resource::ImageDim;
 use crate::resource::MAX_IMAGE_SLOTS;
 use crate::wave::WaveAnalysis;
 
@@ -310,8 +313,13 @@ pub enum SsaOp {
     /// shaders); otherwise `lod` (0 when `None`), plus `bias` if given.
     ImageSample {
         slot: u32,
+        /// Which `textures*` array (`dim` class) the slot indexes.
+        dim: ImageDim,
         u: ValueId,
         v: ValueId,
+        /// Third coordinate: 3D `r`, array layer, or cube face id (an
+        /// RDNA2 cube address is face-relative `(s, t, face)`).
+        w: ValueId,
         lod: Option<ValueId>,
         bias: Option<ValueId>,
         implicit: bool,
@@ -319,8 +327,10 @@ pub enum SsaOp {
     /// Depth/shadow comparison sample (`image_sample_c*`); returns `Ty::F32` comparison result.
     ImageSampleDref {
         slot: u32,
+        dim: ImageDim,
         u: ValueId,
         v: ValueId,
+        w: ValueId,
         dref: ValueId,
         lod: Option<ValueId>,
         implicit: bool,
@@ -328,27 +338,35 @@ pub enum SsaOp {
     /// 4-texel gather (`image_gather4*`); returns `Ty::U32x4`.
     ImageGather {
         slot: u32,
+        dim: ImageDim,
         u: ValueId,
         v: ValueId,
+        w: ValueId,
         comp: u32,
     },
     /// Texture dimensions query (`image_get_resinfo`); returns `Ty::U32x4`.
     ImageQuerySize {
         slot: u32,
+        dim: ImageDim,
         lod: ValueId,
     },
-    /// `textures[slot]` texel `(x, y)` at level `lod` (0 when `None`), as bits (`Ty::U32x4`).
+    /// `textures[slot]` texel `(x, y, z)` at level `lod` (0 when `None`), as
+    /// bits (`Ty::U32x4`); `z` is the 3D slice or array layer.
     ImageFetch {
         slot: u32,
+        dim: ImageDim,
         x: ValueId,
         y: ValueId,
+        z: ValueId,
         lod: Option<ValueId>,
     },
-    /// Writes four component bit patterns to `storage_images[slot]` at `(x, y)`.
+    /// Writes four component bit patterns to `storage_images*[slot]` at `(x, y, z)`.
     ImageStore {
         slot: u32,
+        dim: ImageDim,
         x: ValueId,
         y: ValueId,
+        z: ValueId,
         values: [ValueId; 4],
     },
 
@@ -359,6 +377,14 @@ pub enum SsaOp {
     Export {
         target: ExportTarget,
         values: [ValueId; 4],
+    },
+
+    /// Cross-lane Wave64 permute (`v_permlane16`, `ds_swizzle`, `v_readfirstlane`, etc.)
+    /// lowered via [`crate::wave_ops::LanePermuteOp`].
+    WavePermute {
+        op: crate::wave_ops::LanePermuteOp,
+        value: ValueId,
+        aux: Option<ValueId>,
     },
 
     /// Inline ray-AABB Box32 node intersection (`image_bvh64_intersect_ray`).
@@ -571,7 +597,7 @@ struct OpenLoop {
     break_edges: Vec<(usize, HashMap<LoopReg, ValueId>)>,
 }
 
-fn is_branch(inst: &Inst) -> Option<usize> {
+pub(crate) fn is_branch(inst: &Inst) -> Option<usize> {
     match inst {
         Inst::SCBranchExecz { target_dw }
         | Inst::SCBranchExecnz { target_dw }
@@ -659,6 +685,7 @@ struct Builder {
     extra_phis: HashMap<usize, BTreeSet<LoopReg>>,
     missing: HashMap<usize, BTreeSet<LoopReg>>,
     spill_frame: crate::spill::SpillFrame,
+    image_slots: HashMap<usize, u32>,
 }
 
 impl Builder {
@@ -877,11 +904,9 @@ impl Builder {
                     let v = break_regs.get(&r).copied().unwrap_or(header_phi);
                     incoming.push((*break_blk, v));
                 }
-                let merge_phi = self.m.emit(
-                    open.merge_block,
-                    Self::reg_ty(r),
-                    SsaOp::Phi { incoming },
-                );
+                let merge_phi =
+                    self.m
+                        .emit(open.merge_block, Self::reg_ty(r), SsaOp::Phi { incoming });
                 self.set_reg(r, merge_phi);
             }
         } else if matches!(open.info.kind, LoopKind::While { .. }) {
@@ -1279,6 +1304,273 @@ impl Builder {
         out
     }
 
+    /// An unsigned small float (5-bit exponent, `mbits` mantissa bits, no
+    /// sign: the 11- and 10-bit components of `10_11_11` / `11_11_10`) as
+    /// f32 bits: normals rebias the exponent, denormals scale the mantissa,
+    /// exponent 31 is infinity / NaN.
+    fn small_float_to_f32(&mut self, raw: ValueId, mbits: u32) -> ValueId {
+        let blk = self.cur_block;
+        let mb = self.konst(mbits);
+        let five = self.konst(5);
+        let zero = self.konst(0);
+        let mant = self.m.emit(
+            blk,
+            Ty::U32,
+            SsaOp::BfeU32 {
+                src: raw,
+                offset: zero,
+                width: mb,
+            },
+        );
+        let exp = self.m.emit(
+            blk,
+            Ty::U32,
+            SsaOp::BfeU32 {
+                src: raw,
+                offset: mb,
+                width: five,
+            },
+        );
+        // Normal: ((e + 112) << 23) | (m << (23 - mbits)).
+        let bias = self.konst(127 - 15);
+        let e32 = self.m.emit(blk, Ty::U32, SsaOp::AddU32(exp, bias));
+        let s23 = self.konst(23);
+        let e_bits = self.m.emit(blk, Ty::U32, SsaOp::ShlU32(e32, s23));
+        let ms = self.konst(23 - mbits);
+        let m_bits = self.m.emit(blk, Ty::U32, SsaOp::ShlU32(mant, ms));
+        let normal = self.m.emit(blk, Ty::U32, SsaOp::OrU32(e_bits, m_bits));
+        // Inf / NaN: all-ones exponent.
+        let inf_e = self.konst(0x7F80_0000);
+        let special = self.m.emit(blk, Ty::U32, SsaOp::OrU32(inf_e, m_bits));
+        // Denormal: m * 2^(-14 - mbits).
+        let mf = self.m.emit(blk, Ty::F32, SsaOp::CvtF32U32(mant));
+        let scale = self.konst_f(2f32.powi(-14 - mbits as i32));
+        let denf = self.m.emit(blk, Ty::F32, SsaOp::MulF32(mf, scale));
+        let denormal = self.as_u32(denf);
+        let thirty_one = self.konst(31);
+        let is_zero_e = self.m.emit(
+            blk,
+            Ty::Bool,
+            SsaOp::Cmp {
+                op: CmpOp::Eq,
+                ty: CmpType::U32,
+                a: exp,
+                b: zero,
+            },
+        );
+        let is_max_e = self.m.emit(
+            blk,
+            Ty::Bool,
+            SsaOp::Cmp {
+                op: CmpOp::Eq,
+                ty: CmpType::U32,
+                a: exp,
+                b: thirty_one,
+            },
+        );
+        let v = self.m.emit(
+            blk,
+            Ty::U32,
+            SsaOp::SelectU32 {
+                cond: is_max_e,
+                t: special,
+                f: normal,
+            },
+        );
+        self.m.emit(
+            blk,
+            Ty::U32,
+            SsaOp::SelectU32 {
+                cond: is_zero_e,
+                t: denormal,
+                f: v,
+            },
+        )
+    }
+
+    /// f32 bits → an unsigned small float (truncating the mantissa; negative
+    /// and NaN inputs give 0, overflow gives the largest finite value).
+    fn f32_to_small_float(&mut self, val: ValueId, mbits: u32) -> ValueId {
+        let blk = self.cur_block;
+        let f = self.as_f32(val);
+        let zero_f = self.konst_f(0.0);
+        let max = self.konst_f(((1u32 << (mbits + 1)) - 1) as f32 * 2f32.powi(15 - mbits as i32));
+        let c = self.m.emit(blk, Ty::F32, SsaOp::MaxF32(f, zero_f));
+        let c = self.m.emit(blk, Ty::F32, SsaOp::MinF32(c, max));
+        let bits = self.as_u32(c);
+        let s23 = self.konst(23);
+        let eight = self.konst(8);
+        let e = self.m.emit(
+            blk,
+            Ty::U32,
+            SsaOp::BfeU32 {
+                src: bits,
+                offset: s23,
+                width: eight,
+            },
+        );
+        let ms = self.konst(23 - mbits);
+        let mb = self.konst(mbits);
+        let m = self.m.emit(
+            blk,
+            Ty::U32,
+            SsaOp::BfeU32 {
+                src: bits,
+                offset: ms,
+                width: mb,
+            },
+        );
+        // Normal: exponent rebias (e - 112), below 113 flushes to zero.
+        let rebias = self.konst(112);
+        let e5 = self.m.emit(blk, Ty::U32, SsaOp::SubU32(e, rebias));
+        let packed_e = self.m.emit(blk, Ty::U32, SsaOp::ShlU32(e5, mb));
+        let normal = self.m.emit(blk, Ty::U32, SsaOp::OrU32(packed_e, m));
+        let min_e = self.konst(113);
+        let small = self.m.emit(
+            blk,
+            Ty::Bool,
+            SsaOp::Cmp {
+                op: CmpOp::Lt,
+                ty: CmpType::U32,
+                a: e,
+                b: min_e,
+            },
+        );
+        let zero = self.konst(0);
+        self.m.emit(
+            blk,
+            Ty::U32,
+            SsaOp::SelectU32 {
+                cond: small,
+                t: zero,
+                f: normal,
+            },
+        )
+    }
+
+    /// Bit offsets and mantissa widths of `10_11_11` (R11 G11 B10 from the
+    /// low bits, as `R11G11B10_FLOAT`) and `11_11_10` (R10 G11 B11).
+    fn small_float_layout(fmt: PackedFormat) -> [(u32, u32); 3] {
+        match fmt {
+            PackedFormat::F10_11_11 => [(0, 6), (11, 6), (22, 5)],
+            _ => [(0, 5), (10, 6), (21, 6)],
+        }
+    }
+
+    /// A `10_11_11` / `11_11_10` float typed load.
+    fn typed_load_small_float(
+        &mut self,
+        addr: ValueId,
+        fmt: PackedFormat,
+        count: u8,
+    ) -> Vec<ValueId> {
+        let blk = self.cur_block;
+        let word = self.m.emit(
+            blk,
+            Ty::U32,
+            SsaOp::BdaLoad {
+                addr,
+                byte_offset: 0,
+                count: 1,
+            },
+        );
+        let layout = Self::small_float_layout(fmt);
+        (0..count as usize)
+            .map(|k| match layout.get(k) {
+                Some(&(off, mbits)) => {
+                    let o = self.konst(off);
+                    let w = self.konst(mbits + 5);
+                    let blk = self.cur_block;
+                    let raw = self.m.emit(
+                        blk,
+                        Ty::U32,
+                        SsaOp::BfeU32 {
+                            src: word,
+                            offset: o,
+                            width: w,
+                        },
+                    );
+                    self.small_float_to_f32(raw, mbits)
+                }
+                // W reads 1.0.
+                None if k == 3 => self.konst(1.0f32.to_bits()),
+                None => self.konst(0),
+            })
+            .collect()
+    }
+
+    /// A `10_11_11` / `11_11_10` float typed store's dword.
+    fn typed_store_small_float(&mut self, vals: &[ValueId], fmt: PackedFormat) -> ValueId {
+        let layout = Self::small_float_layout(fmt);
+        let mut acc = self.konst(0);
+        for (k, &(off, mbits)) in layout.iter().enumerate() {
+            let v = vals.get(k).copied().unwrap_or_else(|| self.konst(0));
+            let enc = self.f32_to_small_float(v, mbits);
+            let sh = self.konst(off);
+            let blk = self.cur_block;
+            let placed = self.m.emit(blk, Ty::U32, SsaOp::ShlU32(enc, sh));
+            acc = self.m.emit(blk, Ty::U32, SsaOp::OrU32(acc, placed));
+        }
+        acc
+    }
+
+    /// A typed store narrower than a dword (8- and 16-bit formats with one
+    /// or two components): the element's bits are replaced in their
+    /// enclosing dword with two atomics — AND clears them, OR sets them —
+    /// so neighbouring elements other lanes write are never lost.
+    fn typed_store_sub_dword(&mut self, addr: ValueId, vals: &[ValueId], fmt: FormatInfo) {
+        let blk = self.cur_block;
+        let bits_total = u32::from(fmt.bits) * u32::from(fmt.comps);
+        let mut value = self.konst(0);
+        for k in 0..fmt.comps as usize {
+            let v = vals.get(k).copied().unwrap_or_else(|| self.konst(0));
+            let enc = self.encode_component(v, fmt);
+            let sh = self.konst(k as u32 * u32::from(fmt.bits));
+            let blk = self.cur_block;
+            let placed = self.m.emit(blk, Ty::U32, SsaOp::ShlU32(enc, sh));
+            value = self.m.emit(blk, Ty::U32, SsaOp::OrU32(value, placed));
+        }
+        // Dword-aligned address and the element's bit offset in it.
+        let lo = self.m.emit(blk, Ty::U32, SsaOp::UnpackLoU64(addr));
+        let hi = self.m.emit(blk, Ty::U32, SsaOp::UnpackHiU64(addr));
+        let three = self.konst(3);
+        let byte = self.m.emit(blk, Ty::U32, SsaOp::AndU32(lo, three));
+        let shift = self.m.emit(blk, Ty::U32, SsaOp::ShlU32(byte, three));
+        let not3 = self.konst(!3);
+        let lo_aligned = self.m.emit(blk, Ty::U32, SsaOp::AndU32(lo, not3));
+        let aligned = self
+            .m
+            .emit(blk, Ty::U64, SsaOp::PackU64 { lo: lo_aligned, hi });
+        let mask = self.konst(((1u64 << bits_total) - 1) as u32);
+        let mask_at = self.m.emit(blk, Ty::U32, SsaOp::ShlU32(mask, shift));
+        let all = self.konst(u32::MAX);
+        let keep = self.m.emit(blk, Ty::U32, SsaOp::XorU32(mask_at, all));
+        let value_at = self.m.emit(blk, Ty::U32, SsaOp::ShlU32(value, shift));
+        self.guarded(|b| {
+            let blk = b.cur_block;
+            b.m.emit(
+                blk,
+                Ty::U32,
+                SsaOp::BdaAtomic {
+                    op: AtomicOp::And,
+                    addr: aligned,
+                    val: keep,
+                    cmp: None,
+                },
+            );
+            b.m.emit(
+                blk,
+                Ty::U32,
+                SsaOp::BdaAtomic {
+                    op: AtomicOp::Or,
+                    addr: aligned,
+                    val: value_at,
+                    cmp: None,
+                },
+            );
+        });
+    }
+
     /// Lower a packed 32-bit `2_10_10_10` / `10_10_10_2` typed buffer load into SSA.
     fn typed_load_packed(
         &mut self,
@@ -1292,8 +1584,16 @@ impl Builder {
             PackedFormat::Uint2_10_10_10 => ([0, 10, 20, 30], [10, 10, 10, 2], false, false),
             PackedFormat::Sint2_10_10_10 => ([0, 10, 20, 30], [10, 10, 10, 2], true, false),
             PackedFormat::Unorm10_10_10_2 => ([0, 2, 12, 22], [2, 10, 10, 10], false, true),
+            PackedFormat::Snorm10_10_10_2 => ([0, 2, 12, 22], [2, 10, 10, 10], true, true),
             PackedFormat::Uint10_10_10_2 => ([0, 2, 12, 22], [2, 10, 10, 10], false, false),
-            PackedFormat::F10_11_11 | PackedFormat::F11_11_10 => return None,
+            PackedFormat::Sint10_10_10_2 => ([0, 2, 12, 22], [2, 10, 10, 10], true, false),
+            PackedFormat::Unorm5_6_5 => ([0, 5, 11, 16], [5, 6, 5, 1], false, true),
+            PackedFormat::Unorm1_5_5_5 => ([0, 5, 10, 15], [5, 5, 5, 1], false, true),
+            PackedFormat::Unorm4_4_4_4 => ([0, 4, 8, 12], [4, 4, 4, 4], false, true),
+            PackedFormat::F5_9_9_9 => ([0, 9, 18, 27], [9, 9, 9, 5], false, false),
+            PackedFormat::F10_11_11 | PackedFormat::F11_11_10 => {
+                return Some(self.typed_load_small_float(addr, fmt, count));
+            }
         };
         let blk = self.cur_block;
         let word = self.m.emit(
@@ -1362,8 +1662,19 @@ impl Builder {
                 ([0, 10, 20, 30], [10, 10, 10, 2], false)
             }
             PackedFormat::Unorm10_10_10_2 => ([0, 2, 12, 22], [2, 10, 10, 10], true),
-            PackedFormat::Uint10_10_10_2 => ([0, 2, 12, 22], [2, 10, 10, 10], false),
-            _ => return None,
+            PackedFormat::Uint10_10_10_2 | PackedFormat::Sint10_10_10_2 => {
+                ([0, 2, 12, 22], [2, 10, 10, 10], false)
+            }
+            PackedFormat::Unorm5_6_5 => ([0, 5, 11, 16], [5, 6, 5, 1], true),
+            PackedFormat::Unorm1_5_5_5 => ([0, 5, 10, 15], [5, 5, 5, 1], true),
+            PackedFormat::Unorm4_4_4_4 => ([0, 4, 8, 12], [4, 4, 4, 4], true),
+            PackedFormat::F5_9_9_9 => ([0, 9, 18, 27], [9, 9, 9, 5], false),
+            PackedFormat::F10_11_11 | PackedFormat::F11_11_10 => {
+                return Some(self.typed_store_small_float(vals, fmt));
+            }
+            PackedFormat::Snorm2_10_10_10 | PackedFormat::Snorm10_10_10_2 => {
+                return Some(self.typed_store_snorm_2_10_10_10(vals));
+            }
         };
         let blk = self.cur_block;
         let mut acc = self.konst(0);
@@ -1390,6 +1701,34 @@ impl Builder {
             acc = self.m.emit(blk, Ty::U32, SsaOp::OrU32(acc, placed));
         }
         Some(acc)
+    }
+
+    /// `2_10_10_10_SNORM`: each component clamped to [-1, 1], scaled to its
+    /// signed range, two's complement in its field.
+    fn typed_store_snorm_2_10_10_10(&mut self, vals: &[ValueId]) -> ValueId {
+        let blk = self.cur_block;
+        let mut acc = self.konst(0);
+        for (k, (shift, width)) in [(0u32, 10u32), (10, 10), (20, 10), (30, 2)]
+            .into_iter()
+            .enumerate()
+        {
+            let v = vals.get(k).copied().unwrap_or_else(|| self.konst(0));
+            let f = self.as_f32(v);
+            let lo = self.konst_f(-1.0);
+            let hi = self.konst_f(1.0);
+            let c = self.m.emit(blk, Ty::F32, SsaOp::MaxF32(f, lo));
+            let c = self.m.emit(blk, Ty::F32, SsaOp::MinF32(c, hi));
+            let scale = self.konst_f(((1u32 << (width - 1)) - 1) as f32);
+            let c = self.m.emit(blk, Ty::F32, SsaOp::MulF32(c, scale));
+            let r = self.m.emit(blk, Ty::F32, SsaOp::RoundEvenF32(c));
+            let i = self.m.emit(blk, Ty::U32, SsaOp::CvtI32F32(r));
+            let mask = self.konst((1u32 << width) - 1);
+            let m = self.m.emit(blk, Ty::U32, SsaOp::AndU32(i, mask));
+            let sh = self.konst(shift);
+            let placed = self.m.emit(blk, Ty::U32, SsaOp::ShlU32(m, sh));
+            acc = self.m.emit(blk, Ty::U32, SsaOp::OrU32(acc, placed));
+        }
+        acc
     }
 
     /// Converts a VGPR value to a component of `fmt` (low `bits` bits).
@@ -1490,15 +1829,81 @@ impl Builder {
         Some(out)
     }
 
-    fn next_slot(counter: &mut u32, pc: usize) -> Result<u32, LowerError> {
-        if *counter >= MAX_IMAGE_SLOTS {
+    /// Float sample coordinates from consecutive VGPRs at `first` for MIMG
+    /// `dim`: `(u, v, w, registers used)`. Missing components are 0.
+    fn float_coords(&mut self, first: u8, dim: u8) -> (ValueId, ValueId, ValueId, u8) {
+        let a = self.read_vgpr(first);
+        let u = self.as_f32(a);
+        match dim & 7 {
+            0 => {
+                let z = self.konst_f(0.0);
+                (u, z, z, 1)
+            }
+            1 | 6 => {
+                let b = self.read_vgpr(first + 1);
+                let v = self.as_f32(b);
+                let z = self.konst_f(0.0);
+                (u, v, z, 2)
+            }
+            4 => {
+                // 1D array: (x, layer).
+                let b = self.read_vgpr(first + 1);
+                let layer = self.as_f32(b);
+                let z = self.konst_f(0.0);
+                (u, z, layer, 2)
+            }
+            _ => {
+                let b = self.read_vgpr(first + 1);
+                let c = self.read_vgpr(first + 2);
+                let v = self.as_f32(b);
+                let w = self.as_f32(c);
+                (u, v, w, 3)
+            }
+        }
+    }
+
+    /// Integer texel coordinates (`image_load` / `image_store`), as
+    /// [`Self::float_coords`] for raw dwords.
+    fn int_coords(&mut self, first: u8, dim: u8) -> (ValueId, ValueId, ValueId, u8) {
+        let x = self.read_vgpr(first);
+        match dim & 7 {
+            0 => {
+                let z = self.konst(0);
+                (x, z, z, 1)
+            }
+            1 | 6 => {
+                let y = self.read_vgpr(first + 1);
+                let z = self.konst(0);
+                (x, y, z, 2)
+            }
+            4 => {
+                let layer = self.read_vgpr(first + 1);
+                let z = self.konst(0);
+                (x, z, layer, 2)
+            }
+            _ => {
+                let y = self.read_vgpr(first + 1);
+                let z = self.read_vgpr(first + 2);
+                (x, y, z, 3)
+            }
+        }
+    }
+
+    fn image_slot(&mut self, pc: usize, storage: bool) -> Result<u32, LowerError> {
+        let slot = self.image_slots[&pc];
+        if slot >= MAX_IMAGE_SLOTS {
             return Err(LowerError::Unsupported {
                 pc,
-                desc: "more than 16 images of one kind in a shader",
+                desc: "image descriptor slot limit exceeded",
             });
         }
-        *counter += 1;
-        Ok(*counter - 1)
+        let count = if storage {
+            &mut self.m.storage_slots
+        } else {
+            &mut self.m.texture_slots
+        };
+        *count = (*count).max(slot + 1);
+        Ok(slot)
     }
 
     /// Writes the components `dmask` selects from a `U32x4` result to
@@ -1597,6 +2002,27 @@ pub fn build_ssa_with(
     })
 }
 
+fn plan_image_slots(program: &[DecodedInst], opts: &BuildOptions) -> HashMap<usize, u32> {
+    use crate::resource::{ImageBinding, planned_image_bindings, trace_descriptors};
+    let uses = trace_descriptors(program);
+    uses.iter()
+        .zip(planned_image_bindings(
+            program,
+            &uses,
+            opts.texture_slot_base,
+            opts.storage_slot_base,
+        ))
+        .filter_map(|(u, slot)| {
+            let slot = match slot? {
+                ImageBinding::Sampled(slot)
+                | ImageBinding::Fetched(slot)
+                | ImageBinding::Storage(slot) => slot,
+            };
+            Some((u.pc, slot))
+        })
+        .collect()
+}
+
 fn build_ssa_once(
     program: &[DecodedInst],
     wave: &WaveAnalysis,
@@ -1662,6 +2088,7 @@ fn build_ssa_once(
         scc: scc_init,
         loops: loops.clone(),
         open_loops: Vec::new(),
+        image_slots: plan_image_slots(program, opts),
         extra_phis: extra.clone(),
         missing: HashMap::new(),
         spill_frame: crate::spill::SpillFrame::default(),
@@ -1866,6 +2293,7 @@ impl Builder {
         opts: &BuildOptions,
         loops: HashMap<usize, LoopInfo>,
         extra_phis: HashMap<usize, BTreeSet<LoopReg>>,
+        image_slots: HashMap<usize, u32>,
     ) -> Self {
         let stage = opts.stage;
         let mut m = SsaModule::new(workgroup_size);
@@ -1921,6 +2349,7 @@ impl Builder {
             loops,
             open_loops: Vec::new(),
             extra_phis,
+            image_slots,
             missing: HashMap::new(),
             spill_frame: crate::spill::SpillFrame::default(),
         };
@@ -2651,11 +3080,14 @@ impl Builder {
                 let addr = b.build_mubuf_addr(*srsrc, *vaddr, *soffset, *offset, *offen, *idxen);
                 let vals: Vec<ValueId> = (0..*count).map(|k| b.read_vgpr(*vdata + k)).collect();
                 let dwords = if let Some(info) = gfx10_format(u16::from(*fmt)) {
-                    b.typed_store_dwords(&vals, info)
-                        .ok_or(LowerError::Unsupported {
-                            pc: di.pc,
-                            desc: "tbuffer store of a sub-dword element format",
-                        })?
+                    match b.typed_store_dwords(&vals, info) {
+                        Some(d) => d,
+                        None => {
+                            // 8/16-bit elements: replaced inside their dword atomically.
+                            b.typed_store_sub_dword(addr, &vals, info);
+                            Vec::new()
+                        }
+                    }
                 } else if let Some(packed) = gfx10_packed_format(u16::from(*fmt))
                     && let Some(word) = b.typed_store_packed(&vals, packed)
                 {
@@ -2832,8 +3264,10 @@ impl Builder {
 
             // --- Images: one descriptor-set slot per instruction, in program
             // order (`resource::image_bindings` numbers them the same way).
-            // All RDNA2 MIMG dimensions (1D, 2D, 3D, Cube, 1DArray, 2DArray, 2DMS, 2DMSArray)
-            // are lowered cleanly. ---
+            // The MIMG `dim` picks the image class (2D, 3D, cube, 2D array)
+            // and how many address VGPRs the coordinates take:
+            //   1D: x · 2D: x y · 3D: x y z · Cube: s t face · 1D array: x layer
+            //   2D array: x y layer · 2D MSAA: x y (fsample) · MSAA array: x y layer.
             Inst::ImageSample {
                 dst,
                 addr_vgpr,
@@ -2842,7 +3276,8 @@ impl Builder {
                 mode,
                 ..
             } => {
-                let slot = Builder::next_slot(&mut b.m.texture_slots, di.pc)?;
+                let slot = b.image_slot(di.pc, false)?;
+                let class = ImageDim::from_mimg(*dim);
                 let mut cur = *addr_vgpr;
                 let bias = if matches!(mode, SampleMode::Bias) {
                     let v = b.read_vgpr(cur);
@@ -2861,19 +3296,7 @@ impl Builder {
                 } else {
                     None
                 };
-                let u_bits = b.read_vgpr(cur);
-                let u = b.as_f32(u_bits);
-                let (v, coord_regs) = match *dim {
-                    0 => (b.konst_f(0.0), 1u8), // 1D
-                    1 | 4 => {
-                        let v_bits = b.read_vgpr(cur + 1);
-                        (b.as_f32(v_bits), 2u8) // 2D / 1DArray
-                    }
-                    _ => {
-                        let v_bits = b.read_vgpr(cur + 1);
-                        (b.as_f32(v_bits), 3u8) // 3D / Cube / 2DArray / 2DMS / 2DMSArray
-                    }
-                };
+                let (u, v, w, coord_regs) = b.float_coords(cur, *dim);
                 let lod = match mode {
                     SampleMode::Lod | SampleMode::CompareLod => {
                         let l = b.read_vgpr(cur + coord_regs);
@@ -2892,8 +3315,10 @@ impl Builder {
                         Ty::F32,
                         SsaOp::ImageSampleDref {
                             slot,
+                            dim: class,
                             u,
                             v,
+                            w,
                             dref: dref_val,
                             lod,
                             implicit,
@@ -2908,10 +3333,23 @@ impl Builder {
                         0x8 => 3,
                         _ => 0,
                     };
+                    // Gathers address 2D, cube and array images (never 3D).
+                    let class = if class == ImageDim::D3 {
+                        ImageDim::D2
+                    } else {
+                        class
+                    };
                     let texel = b.m.emit(
                         blk,
                         Ty::U32x4,
-                        SsaOp::ImageGather { slot, u, v, comp },
+                        SsaOp::ImageGather {
+                            slot,
+                            dim: class,
+                            u,
+                            v,
+                            w,
+                            comp,
+                        },
                     );
                     b.write_dmask(*dst, 0xf, texel);
                 } else {
@@ -2920,8 +3358,10 @@ impl Builder {
                         Ty::U32x4,
                         SsaOp::ImageSample {
                             slot,
+                            dim: class,
                             u,
                             v,
+                            w,
                             lod,
                             bias,
                             implicit,
@@ -2934,12 +3374,21 @@ impl Builder {
                 dst,
                 addr_vgpr,
                 dmask,
+                dim,
                 ..
             } => {
-                let slot = Builder::next_slot(&mut b.m.texture_slots, di.pc)?;
+                let slot = b.image_slot(di.pc, false)?;
                 let lod = b.read_vgpr(*addr_vgpr);
                 let blk = b.cur_block;
-                let info = b.m.emit(blk, Ty::U32x4, SsaOp::ImageQuerySize { slot, lod });
+                let info = b.m.emit(
+                    blk,
+                    Ty::U32x4,
+                    SsaOp::ImageQuerySize {
+                        slot,
+                        dim: ImageDim::from_mimg(*dim).for_storage(),
+                        lod,
+                    },
+                );
                 b.write_dmask(*dst, *dmask, info);
             }
             Inst::ImageLoad {
@@ -2950,19 +3399,22 @@ impl Builder {
                 mip,
                 ..
             } => {
-                let slot = Builder::next_slot(&mut b.m.texture_slots, di.pc)?;
-                let x = b.read_vgpr(*addr_vgpr);
-                let (y, coord_regs) = if *dim == 0 {
-                    (b.konst(0), 1u8)
-                } else if *dim == 1 || *dim == 4 {
-                    (b.read_vgpr(*addr_vgpr + 1), 2u8)
-                } else {
-                    (b.read_vgpr(*addr_vgpr + 1), 3u8)
-                };
+                let slot = b.image_slot(di.pc, false)?;
+                let (x, y, z, coord_regs) = b.int_coords(*addr_vgpr, *dim);
                 let lod = mip.then(|| b.read_vgpr(*addr_vgpr + coord_regs));
                 let blk = b.cur_block;
-                let texel =
-                    b.m.emit(blk, Ty::U32x4, SsaOp::ImageFetch { slot, x, y, lod });
+                let texel = b.m.emit(
+                    blk,
+                    Ty::U32x4,
+                    SsaOp::ImageFetch {
+                        slot,
+                        dim: ImageDim::from_mimg(*dim).for_storage(),
+                        x,
+                        y,
+                        z,
+                        lod,
+                    },
+                );
                 b.write_dmask(*dst, *dmask, texel);
             }
             Inst::ImageStore {
@@ -2972,13 +3424,9 @@ impl Builder {
                 dim,
                 ..
             } => {
-                let slot = Builder::next_slot(&mut b.m.storage_slots, di.pc)?;
-                let x = b.read_vgpr(*addr_vgpr);
-                let y = if *dim == 0 {
-                    b.konst(0)
-                } else {
-                    b.read_vgpr(*addr_vgpr + 1)
-                };
+                let slot = b.image_slot(di.pc, true)?;
+                let (x, y, z, _) = b.int_coords(*addr_vgpr, *dim);
+                let class = ImageDim::from_mimg(*dim).for_storage();
                 let mut values = [ValueId(0); 4];
                 let mut reg = *vdata;
                 for (comp, value) in values.iter_mut().enumerate() {
@@ -2991,7 +3439,18 @@ impl Builder {
                 }
                 b.guarded(|b| {
                     let blk = b.cur_block;
-                    b.m.emit(blk, Ty::U32, SsaOp::ImageStore { slot, x, y, values });
+                    b.m.emit(
+                        blk,
+                        Ty::U32,
+                        SsaOp::ImageStore {
+                            slot,
+                            dim: class,
+                            x,
+                            y,
+                            z,
+                            values,
+                        },
+                    );
                 });
             }
             Inst::SSendMsg { .. } => {}
@@ -3176,7 +3635,14 @@ impl Builder {
                     let off_u = b.konst(*offset as u32);
                     let zero = b.konst(0);
                     let blk = b.cur_block;
-                    let off64 = b.m.emit(blk, Ty::U64, SsaOp::PackU64 { lo: off_u, hi: zero });
+                    let off64 = b.m.emit(
+                        blk,
+                        Ty::U64,
+                        SsaOp::PackU64 {
+                            lo: off_u,
+                            hi: zero,
+                        },
+                    );
                     b.m.emit(blk, Ty::U64, SsaOp::AddU64(base, off64))
                 } else {
                     base
@@ -3416,7 +3882,13 @@ fn build_ssa_state_machine(
     //    entry(0) -> header -> switch(state) -> state_blocks -> switch_merge -> latch -> header / exit
     let mut extra_regs: BTreeSet<LoopReg> = BTreeSet::new();
     for _pass in 0..6 {
-        let mut b = Builder::new_for_stage(workgroup_size, opts, HashMap::new(), HashMap::new());
+        let mut b = Builder::new_for_stage(
+            workgroup_size,
+            opts,
+            HashMap::new(),
+            HashMap::new(),
+            plan_image_slots(program, opts),
+        );
         b.m.require_full_quads = opts.require_full_quads && opts.stage == Stage::Pixel;
 
         let exit_sentinel = leader_pcs.len() as u32;

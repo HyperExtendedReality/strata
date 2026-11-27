@@ -5,12 +5,15 @@ pub mod cache;
 pub mod container;
 pub mod coverage;
 pub mod descriptor;
+pub mod dxil;
 pub mod format;
 pub mod geometry;
 pub mod inflate;
 pub mod opcodes;
 pub mod opt;
+pub mod rayquery;
 pub mod rdna2;
+pub mod rect;
 pub mod resource;
 pub mod sampler;
 pub mod spill;
@@ -18,6 +21,7 @@ pub mod spirv;
 pub mod ssa;
 pub mod store;
 pub mod structurizer;
+pub mod tessellation;
 #[doc(hidden)]
 pub mod test_kernels;
 pub mod wave;
@@ -77,19 +81,26 @@ mod tests {
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         std::fs::write(&tmp, &bytes).unwrap();
 
-        if let Ok(output) = Command::new("spirv-val")
+        let validation = Command::new("spirv-val")
             .arg("--target-env")
             .arg("vulkan1.3")
             .arg(&tmp)
-            .output()
-        {
-            assert!(
+            .output();
+        let _ = std::fs::remove_file(&tmp);
+        match validation {
+            Ok(output) => assert!(
                 output.status.success(),
                 "spirv-val failed for {tag}:\n{}",
                 String::from_utf8_lossy(&output.stderr)
-            );
+            ),
+            Err(e)
+                if std::env::var_os("STRATA_REQUIRE_SPIRV_VAL").is_none()
+                    && e.kind() == std::io::ErrorKind::NotFound =>
+            {
+                eprintln!("SKIPPED spirv-val: {tag}: {e}");
+            }
+            Err(e) => panic!("spirv-val could not validate {tag}: {e}"),
         }
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -262,15 +273,38 @@ mod tests {
     }
 
     #[test]
+    fn every_mimg_dim_samples_loads_and_stores_through_its_own_class() {
+        use rdna2::encode::*;
+        use resource::{ImageDim, trace_descriptors};
+        // dim: 0 1D, 1 2D, 2 3D, 3 Cube, 4 1D array, 5 2D array, 6 MSAA, 7 MSAA array.
+        for dim in 0..8u32 {
+            let mut prog = Vec::new();
+            prog.extend_from_slice(&image_sample_lz_dim(dim, 4, 0, 8, 16, 0xf));
+            prog.extend_from_slice(&image_load_dim(dim, 8, 0, 8, 0xf));
+            prog.extend_from_slice(&image_store_dim(dim, 4, 0, 8, 0xf));
+            prog.push(s_endpgm());
+            let compiled = compile_rdna2_to_spirv(&prog, [64, 1, 1])
+                .unwrap_or_else(|e| panic!("dim {dim}: {e}"));
+            assert_spirv_valid(&compiled.spirv, &format!("mimg_dim_{dim}"));
+
+            let uses = trace_descriptors(&rdna2::decode_program(&prog).unwrap());
+            let sampled = ImageDim::from_mimg(dim as u8);
+            assert_eq!(uses[0].dim, sampled, "dim {dim} sample class");
+            assert_eq!(uses[1].dim, sampled.for_storage(), "dim {dim} load class");
+            assert_eq!(uses[2].dim, sampled.for_storage(), "dim {dim} store class");
+        }
+    }
+
+    #[test]
     fn image_slots_match_between_compiler_and_descriptor_trace() {
-        use resource::{ImageBinding, image_bindings, trace_descriptors};
+        use resource::{ImageBinding, planned_image_bindings, trace_descriptors};
         let mut prog = image_fetch_8x8();
         prog.pop(); // s_endpgm
         prog.extend_from_slice(&rdna2::encode::image_store_2d(4, 10, 8, 0xf));
         prog.extend_from_slice(&rdna2::encode::image_sample_lz_2d(4, 10, 8, 16, 0xf));
         prog.push(rdna2::encode::s_endpgm());
         let decoded = rdna2::decode_program(&prog).unwrap();
-        let slots: Vec<_> = image_bindings(&trace_descriptors(&decoded))
+        let slots: Vec<_> = planned_image_bindings(&decoded, &trace_descriptors(&decoded), 0, 0)
             .into_iter()
             .flatten()
             .collect();
@@ -285,6 +319,33 @@ mod tests {
         let wave = wave::analyze_wave_liveness(&decoded);
         let m = ssa::build_ssa(&decoded, &wave, [64, 1, 1]).unwrap();
         assert_eq!((m.texture_slots, m.storage_slots), (2, 1));
+    }
+
+    #[test]
+    fn repeated_image_accesses_share_a_descriptor_slot() {
+        use rdna2::encode::{image_sample_lz_2d, s_endpgm};
+        let mut program = Vec::new();
+        for _ in 0..40 {
+            program.extend(image_sample_lz_2d(4, 10, 8, 16, 0xf));
+        }
+        program.push(s_endpgm());
+        let shader = compile_rdna2_to_spirv(&program, [64, 1, 1]).unwrap();
+        assert_eq!(spirv::required_image_slots(&shader.spirv), Some(1));
+        assert_spirv_valid(&shader.spirv, "deduplicated_image_slots");
+    }
+
+    #[test]
+    fn distinct_table_entries_can_exceed_the_old_sixteen_slot_limit() {
+        use rdna2::encode::{image_sample_lz_2d, s_endpgm, s_load_dwordx8};
+        let mut program = Vec::new();
+        for slot in 0..24 {
+            program.extend(s_load_dwordx8(8, 0, slot * 32));
+            program.extend(image_sample_lz_2d(4, 10, 8, 16, 0xf));
+        }
+        program.push(s_endpgm());
+        let shader = compile_rdna2_to_spirv(&program, [64, 1, 1]).unwrap();
+        assert_eq!(spirv::required_image_slots(&shader.spirv), Some(24));
+        assert_spirv_valid(&shader.spirv, "twenty_four_image_slots");
     }
 
     #[test]
