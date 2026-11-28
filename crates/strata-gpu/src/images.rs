@@ -236,7 +236,7 @@ impl ComputeRunner {
         props.optimal_tiling_features.contains(features)
     }
 
-    fn device_local_type(&self, bits: u32) -> Result<u32, GpuError> {
+    pub(crate) fn device_local_type(&self, bits: u32) -> Result<u32, GpuError> {
         // SAFETY: a property query.
         let mem = unsafe {
             self.instance
@@ -430,15 +430,120 @@ impl ComputeRunner {
         block: u32,
     ) -> Result<(), GpuError> {
         let regions = copy_regions(img, tight.len(), block);
+        let staging = self.image_staging(tight)?;
+        let result = self.one_shot(|dev, cmd| {
+            record_image_upload(dev, cmd, img, staging.buffer, &regions);
+        });
+        self.free_bda_buffer(staging);
+        result
+    }
+
+    fn image_staging(&self, tight: &[u8]) -> Result<crate::runner::BdaBuffer, GpuError> {
         let mut staging = self.alloc_bda_buffer(tight.len().max(4) as u64)?;
-        // SAFETY: the staging buffer holds `tight.len()` bytes.
-        unsafe {
-            staging
-                .as_mut_slice::<u8>(tight.len())
-                .copy_from_slice(tight)
+        unsafe { staging.as_mut_slice::<u8>(tight.len()) }.copy_from_slice(tight);
+        Ok(staging)
+    }
+
+    /// Upload independent, tightly packed single-slice RGBA/BGRA images.
+    /// Each worker records from its own command pool. Submission and resource
+    /// reclamation happen on the calling thread after every worker joins.
+    pub(crate) fn upload_replay_planes(
+        &self,
+        images: &[GpuImage],
+        planes: &[crate::replay::SurfaceSnapshot],
+    ) -> Result<(), GpuError> {
+        if let ([image], [plane]) = (images, planes) {
+            return self.upload_image(image, &plane.pixels);
+        }
+        let mut staging = Vec::with_capacity(planes.len());
+        let result = (|| {
+            if images.is_empty() || images.len() != planes.len() {
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED.into());
+            }
+            for plane in planes {
+                staging.push(self.image_staging(&plane.pixels)?);
+            }
+            let jobs: Vec<_> = images
+                .iter()
+                .zip(&staging)
+                .zip(planes)
+                .map(|((image, buffer), plane)| {
+                    (
+                        image,
+                        buffer.buffer,
+                        copy_regions(image, plane.pixels.len(), 1),
+                    )
+                })
+                .collect();
+            self.record_and_submit_independent(&jobs, |dev, cmd, (image, buffer, regions)| {
+                record_image_upload(dev, cmd, image, *buffer, regions);
+            })
+        })();
+        for buffer in staging {
+            self.free_bda_buffer(buffer);
+        }
+        result
+    }
+
+    /// Detiles `src` (title-memory bytes of every level and slice) on the GPU
+    /// with `detile.slang` and copies the tightly packed result into `img`,
+    /// in one submission: no CPU detiling, no tight copy through the CPU.
+    /// `jobs` place each slice; `tight_len` is the packed size
+    /// ([`Self::upload_image_levels`]'s layout).
+    pub fn upload_image_detiled_gpu(
+        &self,
+        img: &GpuImage,
+        src: &[u8],
+        jobs: &[GpuDetileJob],
+        tight_len: usize,
+        block: u32,
+    ) -> Result<(), GpuError> {
+        let words: Vec<u32> = strata_runtime_shaders::DETILE_SPV
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let pipeline = self.pipeline_for(&words, None)?;
+        let regions = copy_regions(img, tight_len, block);
+        let mut staging = self.alloc_bda_buffer(src.len().max(16) as u64)?;
+        // SAFETY: the staging buffer holds `src.len()` bytes.
+        unsafe { staging.as_mut_slice::<u8>(src.len()).copy_from_slice(src) };
+        let tight = match self.alloc_vram_bda_buffer(tight_len.max(16) as u64, &[]) {
+            Ok(b) => b,
+            Err(e) => {
+                self.free_bda_buffer(staging);
+                return Err(e);
+            }
         };
-        let buffer = staging.buffer;
+        let (src_bda, dst_bda, dst_buf) = (staging.bda, tight.bda, tight.buffer);
+        let layout = self.pipe_layout;
         let result = self.one_shot(|dev, cmd| unsafe {
+            let host = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::HOST)
+                .src_access_mask(vk::AccessFlags2::HOST_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ)];
+            dev.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&host));
+            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            for j in jobs {
+                let mut pc = [0u8; 32];
+                pc[0..8].copy_from_slice(&(src_bda + j.src_offset).to_le_bytes());
+                pc[8..16].copy_from_slice(&(dst_bda + j.dst_offset).to_le_bytes());
+                pc[16..20].copy_from_slice(&j.width.to_le_bytes());
+                pc[20..24].copy_from_slice(&j.height.to_le_bytes());
+                pc[24..28].copy_from_slice(&j.bpp.to_le_bytes());
+                pc[28..32].copy_from_slice(&j.mode.to_le_bytes());
+                dev.cmd_push_constants(cmd, layout, crate::layout::PUSH_STAGES, 0, &pc);
+                dev.cmd_dispatch(cmd, j.width.div_ceil(8), j.height.div_ceil(8), 1);
+            }
+            let to_copy = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
+            dev.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&to_copy),
+            );
             barrier_image(
                 dev,
                 cmd,
@@ -448,7 +553,7 @@ impl ComputeRunner {
             );
             dev.cmd_copy_buffer_to_image(
                 cmd,
-                buffer,
+                dst_buf,
                 img.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &regions,
@@ -462,6 +567,7 @@ impl ComputeRunner {
             );
         });
         self.free_bda_buffer(staging);
+        self.free_bda_buffer(tight);
         result
     }
 
@@ -518,11 +624,12 @@ impl ComputeRunner {
             .level_count(img.mips)
             .layer_count(img.shape.layers());
         self.one_shot(|dev, cmd| unsafe {
+            // The clear replaces every subresource, including on first use.
             barrier_image(
                 dev,
                 cmd,
                 img,
-                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::GENERAL,
             );
             if aspect == vk::ImageAspectFlags::COLOR {
@@ -604,7 +711,16 @@ impl ComputeRunner {
         &self,
         f: impl FnOnce(&ash::Device, vk::CommandBuffer),
     ) -> Result<(), GpuError> {
+        self.one_shot_waiting_on(None, f)
+    }
+
+    fn one_shot_waiting_on(
+        &self,
+        wait: Option<vk::Semaphore>,
+        f: impl FnOnce(&ash::Device, vk::CommandBuffer),
+    ) -> Result<(), GpuError> {
         // SAFETY: a command buffer from our pool, submitted and waited on.
+        let _pool = self.cmd_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let cmd = self.device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -612,15 +728,57 @@ impl ComputeRunner {
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(1),
             )?[0];
-            self.device.begin_command_buffer(
-                cmd,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )?;
-            f(&self.device, cmd);
-            self.device.end_command_buffer(cmd)?;
-            self.submit_and_wait(cmd)
+            let record = self
+                .device
+                .begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .and_then(|()| {
+                    f(&self.device, cmd);
+                    self.device.end_command_buffer(cmd)
+                });
+            if let Err(error) = record {
+                self.device.free_command_buffers(self.cmd_pool, &[cmd]);
+                return Err(error.into());
+            }
+            self.submit_command_buffer_and_wait(cmd, wait)
         }
+    }
+}
+
+fn record_image_upload(
+    dev: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: &GpuImage,
+    src: vk::Buffer,
+    regions: &[vk::BufferImageCopy],
+) {
+    unsafe {
+        barrier_image(
+            dev,
+            cmd,
+            image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        if !regions.is_empty() {
+            dev.cmd_copy_buffer_to_image(
+                cmd,
+                src,
+                image.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                regions,
+            );
+        }
+        barrier_image(
+            dev,
+            cmd,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::GENERAL,
+        );
     }
 }
 
@@ -767,4 +925,244 @@ unsafe fn barrier_range(
             &vk::DependencyInfo::default().image_memory_barriers(&b),
         )
     };
+}
+
+/// One slice of a GPU detile ([`ComputeRunner::upload_image_detiled_gpu`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuDetileJob {
+    /// Byte offset of the tiled slice in the source.
+    pub src_offset: u64,
+    /// Byte offset of the packed slice in the tight output.
+    pub dst_offset: u64,
+    /// Elements (texels, or 4×4 blocks).
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per element (1, 2, 4, 8 or 16).
+    pub bpp: u32,
+    /// `detile.slang` swizzle mode (0 linear with tight pitch, 1 8×8 Morton).
+    pub mode: u32,
+}
+
+/// The dedicated transfer (copy engine) queue of a [`ComputeRunner`].
+pub struct TransferQueue {
+    pub(crate) family: u32,
+    pub(crate) queue: std::sync::Mutex<vk::Queue>,
+    pub(crate) pool: std::sync::Mutex<vk::CommandPool>,
+}
+
+/// An image upload running on the transfer queue
+/// ([`ComputeRunner::upload_image_levels_async`]). The image must not be
+/// used until [`ComputeRunner::finish_upload`] hands it to the main queue.
+pub struct PendingUpload {
+    fence: vk::Fence,
+    released: vk::Semaphore,
+    cmd: vk::CommandBuffer,
+    staging: crate::runner::BdaBuffer,
+    image: vk::Image,
+    range: vk::ImageSubresourceRange,
+    pub(crate) started: std::time::Instant,
+    pub(crate) bytes: u64,
+}
+
+// SAFETY: Vulkan handles and a staging buffer only touched by the runner.
+unsafe impl Send for PendingUpload {}
+
+impl ComputeRunner {
+    /// Whether the device has a dedicated transfer queue for
+    /// [`Self::upload_image_levels_async`].
+    pub fn has_transfer_queue(&self) -> bool {
+        self.transfer.is_some()
+    }
+
+    /// Starts uploading `tight` (as [`Self::upload_image_levels`] lays it out)
+    /// into a newly created, unused `img` on the dedicated transfer queue and returns without
+    /// waiting. `Ok(None)`: no transfer queue (upload synchronously instead).
+    /// The copy ends with a queue-family release to the main queue.
+    pub fn upload_image_levels_async(
+        &self,
+        img: &GpuImage,
+        tight: &[u8],
+        block: u32,
+    ) -> Result<Option<PendingUpload>, GpuError> {
+        let Some(t) = &self.transfer else {
+            return Ok(None);
+        };
+        if block == 0 || tight.len() != img.tight_bytes(element_bytes(img.format), block) {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED.into());
+        }
+        let regions = copy_regions(img, tight.len(), block);
+        let staging = self.image_staging(tight)?;
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(aspect_of(img.format))
+            .level_count(vk::REMAINING_MIP_LEVELS)
+            .layer_count(vk::REMAINING_ARRAY_LAYERS);
+        // SAFETY: a command buffer from the transfer pool, submitted to the
+        // transfer queue (both externally synchronised by their mutexes).
+        unsafe {
+            let pool = t.pool.lock().unwrap_or_else(|e| e.into_inner());
+            let cmd = match self.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(*pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            ) {
+                Ok(c) => c[0],
+                Err(e) => {
+                    self.free_bda_buffer(staging);
+                    return Err(e.into());
+                }
+            };
+            let record = || -> Result<(), vk::Result> {
+                self.device.begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )?;
+                let to_dst = [vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(img.image)
+                    .subresource_range(range)];
+                self.device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&to_dst),
+                );
+                self.device.cmd_copy_buffer_to_image(
+                    cmd,
+                    staging.buffer,
+                    img.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &regions,
+                );
+                // Release to the main queue family (acquired in finish_upload).
+                let release = [vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(t.family)
+                    .dst_queue_family_index(self.queue_family)
+                    .image(img.image)
+                    .subresource_range(range)];
+                self.device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&release),
+                );
+                self.device.end_command_buffer(cmd)
+            };
+            let sync = record().and_then(|()| {
+                let fence = self
+                    .device
+                    .create_fence(&vk::FenceCreateInfo::default(), None)?;
+                match self
+                    .device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                {
+                    Ok(released) => Ok((fence, released)),
+                    Err(error) => {
+                        self.device.destroy_fence(fence, None);
+                        Err(error)
+                    }
+                }
+            });
+            let (fence, released) = match sync {
+                Ok(f) => f,
+                Err(e) => {
+                    self.device.free_command_buffers(*pool, &[cmd]);
+                    self.free_bda_buffer(staging);
+                    return Err(e.into());
+                }
+            };
+            let cmds = [cmd];
+            let signals = [released];
+            let submit = [vk::SubmitInfo::default()
+                .command_buffers(&cmds)
+                .signal_semaphores(&signals)];
+            let queue = t.queue.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = self.device.queue_submit(*queue, &submit, fence) {
+                self.device.destroy_semaphore(released, None);
+                self.device.destroy_fence(fence, None);
+                self.device.free_command_buffers(*pool, &[cmd]);
+                self.free_bda_buffer(staging);
+                return Err(e.into());
+            }
+            crate::perf::upload_bytes(tight.len() as u64);
+            let bytes = staging.size;
+            Ok(Some(PendingUpload {
+                fence,
+                released,
+                cmd,
+                staging,
+                image: img.image,
+                range,
+                started: std::time::Instant::now(),
+                bytes,
+            }))
+        }
+    }
+
+    /// Whether the transfer fence signaled. The image becomes usable after
+    /// `finish_upload` acquires it on the graphics queue.
+    pub fn upload_ready(&self, p: &PendingUpload) -> Result<bool, GpuError> {
+        // SAFETY: a fence this runner created.
+        Ok(unsafe { self.device.get_fence_status(p.fence) }?)
+    }
+
+    /// Completes an upload: waits for the copy if it is still running,
+    /// acquires the image on the main queue (layout `GENERAL`) and frees the
+    /// staging memory.
+    pub fn finish_upload(&self, p: PendingUpload) -> Result<(), GpuError> {
+        let t = self
+            .transfer
+            .as_ref()
+            .expect("upload belongs to a transfer queue");
+        // SAFETY: the fence and command buffer belong to the transfer queue;
+        // the acquire runs on the main queue after the copy completed.
+        let waited = {
+            let queue = t.queue.lock().unwrap_or_else(|e| e.into_inner());
+            unsafe { self.wait_submitted_fence(*queue, p.fence) }
+        };
+        let acquire = waited.map_err(GpuError::from).and_then(|()| {
+            self.one_shot_waiting_on(Some(p.released), |dev, cmd| unsafe {
+                let b = [vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(t.family)
+                    .dst_queue_family_index(self.queue_family)
+                    .image(p.image)
+                    .subresource_range(p.range)];
+                dev.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&b),
+                );
+            })
+        });
+        unsafe {
+            self.device.destroy_semaphore(p.released, None);
+            self.device.destroy_fence(p.fence, None);
+            let pool = t.pool.lock().unwrap_or_else(|e| e.into_inner());
+            self.device.free_command_buffers(*pool, &[p.cmd]);
+        }
+        self.free_bda_buffer(p.staging);
+        acquire
+    }
+
+    /// The default (1-texel) image standing in for a texture of `shape`
+    /// until its upload finishes.
+    pub fn placeholder_image(&self, shape: ImageShape) -> Option<&GpuImage> {
+        match shape {
+            ImageShape::D3 { .. } => self.default_3d.as_ref(),
+            ImageShape::Cube { .. } => self.default_cube.as_ref(),
+            _ => self.default_image.as_ref(),
+        }
+    }
 }

@@ -356,27 +356,42 @@ fn rewrite_operands(op: &mut SsaOp, repl: &HashMap<ValueId, ValueId>) {
         | SsaOp::RoundEvenF32(a)
         | SsaOp::BdaLoad { addr: a, .. } => f(a),
         SsaOp::ImageSample {
-            u, v, w, lod, bias, ..
+            u,
+            v,
+            w,
+            lod,
+            bias,
+            ext,
+            ..
         } => {
             f(u);
             f(v);
             f(w);
             lod.iter_mut().for_each(&f);
             bias.iter_mut().for_each(&f);
+            ext.values_mut().for_each(&f);
         }
         SsaOp::ImageSampleDref {
-            u, v, w, dref, lod, ..
+            u,
+            v,
+            w,
+            dref,
+            lod,
+            ext,
+            ..
         } => {
             f(u);
             f(v);
             f(w);
             f(dref);
             lod.iter_mut().for_each(&f);
+            ext.values_mut().for_each(&f);
         }
-        SsaOp::ImageGather { u, v, w, .. } => {
+        SsaOp::ImageGather { u, v, w, ext, .. } => {
             f(u);
             f(v);
             f(w);
+            ext.values_mut().for_each(&f);
         }
         SsaOp::ImageQuerySize { lod, .. } => {
             f(lod);
@@ -536,26 +551,41 @@ fn for_each_operand(op: &SsaOp, mut f: impl FnMut(ValueId)) {
         | SsaOp::RoundEvenF32(a)
         | SsaOp::BdaLoad { addr: a, .. } => f(*a),
         SsaOp::ImageSample {
-            u, v, w, lod, bias, ..
+            u,
+            v,
+            w,
+            lod,
+            bias,
+            ext,
+            ..
         } => {
             f(*u);
             f(*v);
             f(*w);
             lod.iter().chain(bias.iter()).for_each(|&x| f(x));
+            ext.values().for_each(&mut f);
         }
         SsaOp::ImageSampleDref {
-            u, v, w, dref, lod, ..
+            u,
+            v,
+            w,
+            dref,
+            lod,
+            ext,
+            ..
         } => {
             f(*u);
             f(*v);
             f(*w);
             f(*dref);
             lod.iter().for_each(|&x| f(x));
+            ext.values().for_each(&mut f);
         }
-        SsaOp::ImageGather { u, v, w, .. } => {
+        SsaOp::ImageGather { u, v, w, ext, .. } => {
             f(*u);
             f(*v);
             f(*w);
+            ext.values().for_each(&mut f);
         }
         SsaOp::ImageQuerySize { lod, .. } => {
             f(*lod);

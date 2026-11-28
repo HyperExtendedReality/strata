@@ -8,13 +8,24 @@
 //! `TessellationControl` and `TessellationEvaluation` SPIR-V 1.6 modules using
 //! Strata's No-API conventions.
 
-use std::collections::HashMap;
+use crate::rdna2::{Inst, Operand};
+use crate::static_stage::{Registers, full_position, unsupported};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TessDomain {
     Triangles,
     Quads,
     Isolines,
+}
+
+impl TessDomain {
+    fn factor_counts(self) -> (usize, usize) {
+        match self {
+            Self::Triangles => (3, 1),
+            Self::Quads => (4, 2),
+            Self::Isolines => (2, 0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +131,7 @@ pub fn emit_hull_spirv(desc: &HullShaderDesc) -> Vec<u32> {
     let c_2 = alloc();
     let c_3 = alloc();
     let c_4 = alloc();
+    let bool_ty = alloc();
 
     let per_vert_in_struct = alloc();
     let per_vert_in_arr = alloc();
@@ -150,6 +162,9 @@ pub fn emit_hull_spirv(desc: &HullShaderDesc) -> Vec<u32> {
 
     let entry_label = alloc();
     let inv_val = alloc();
+    let first_invocation = alloc();
+    let patch_label = alloc();
+    let done_label = alloc();
     let in_pos_ptr = alloc();
     let in_pos_val = alloc();
     let out_pos_ptr = alloc();
@@ -238,6 +253,7 @@ pub fn emit_hull_spirv(desc: &HullShaderDesc) -> Vec<u32> {
     push_inst(&mut w, 33 /* OpTypeFunction */, &[fn_ty, void_ty]);
     push_inst(&mut w, 22 /* OpTypeFloat */, &[f32_ty, 32]);
     push_inst(&mut w, 21 /* OpTypeInt */, &[u32_ty, 32, 0]);
+    push_inst(&mut w, 20 /* OpTypeBool */, &[bool_ty]);
     push_inst(&mut w, 23 /* OpTypeVector */, &[vec4_ty, f32_ty, 4]);
     push_inst(&mut w, 43 /* OpConstant */, &[u32_ty, c_cp, cp]);
     push_inst(&mut w, 43, &[u32_ty, c_0, 0]);
@@ -313,8 +329,14 @@ pub fn emit_hull_spirv(desc: &HullShaderDesc) -> Vec<u32> {
     );
     push_inst(&mut w, 62 /* OpStore */, &[out_pos_ptr, in_pos_val]);
 
+    // Tessellation levels are shared by the patch. Each has one writer.
+    push_inst(&mut w, 170, &[bool_ty, first_invocation, inv_val, c_0]);
+    push_inst(&mut w, 247, &[done_label, 0]);
+    push_inst(&mut w, 250, &[first_invocation, patch_label, done_label]);
+    push_inst(&mut w, 248, &[patch_label]);
     let idx_c = [c_0, c_1, c_2, c_3];
-    for i in 0..4 {
+    let (outer_count, inner_count) = desc.domain.factor_counts();
+    for i in 0..outer_count {
         push_inst(
             &mut w,
             65,
@@ -322,7 +344,7 @@ pub fn emit_hull_spirv(desc: &HullShaderDesc) -> Vec<u32> {
         );
         push_inst(&mut w, 62, &[outer_ptrs[i], outer_c[i]]);
     }
-    for i in 0..2 {
+    for i in 0..inner_count {
         push_inst(
             &mut w,
             65,
@@ -331,6 +353,8 @@ pub fn emit_hull_spirv(desc: &HullShaderDesc) -> Vec<u32> {
         push_inst(&mut w, 62, &[inner_ptrs[i], inner_c[i]]);
     }
 
+    push_inst(&mut w, 249, &[done_label]);
+    push_inst(&mut w, 248, &[done_label]);
     push_inst(&mut w, 253 /* OpReturn */, &[]);
     push_inst(&mut w, 56 /* OpFunctionEnd */, &[]);
     w
@@ -343,6 +367,10 @@ pub fn emit_hull_spirv(desc: &HullShaderDesc) -> Vec<u32> {
 /// - `Quads`: bilinear `mix(mix(p0, p1, u), mix(p3, p2, u), v)`
 /// - `Isolines`: linear `mix(p0, p1, u)`
 pub fn emit_domain_spirv(desc: &DomainShaderDesc) -> Vec<u32> {
+    emit_domain(desc, None)
+}
+
+fn emit_domain(desc: &DomainShaderDesc, position: Option<[f32; 4]>) -> Vec<u32> {
     let cp = desc.input_control_points.clamp(
         match desc.domain {
             TessDomain::Quads => 4,
@@ -408,6 +436,7 @@ pub fn emit_domain_spirv(desc: &DomainShaderDesc) -> Vec<u32> {
     let t8 = alloc();
     let t9 = alloc();
     let final_pos = alloc();
+    let position_ids = position.map(|_| [alloc(), alloc(), alloc(), alloc()]);
 
     let mut w = Vec::with_capacity(256);
     w.extend_from_slice(&[0x0723_0203, 0x0001_0600, 0, next_id, 0]);
@@ -487,6 +516,11 @@ pub fn emit_domain_spirv(desc: &DomainShaderDesc) -> Vec<u32> {
     push_inst(&mut w, 43, &[u32_ty, c_2, 2]);
     push_inst(&mut w, 43, &[u32_ty, c_3, 3]);
     push_inst(&mut w, 43, &[f32_ty, c_one_f, 1.0f32.to_bits()]);
+    if let Some((p, ids)) = position.zip(position_ids) {
+        for (value, id) in p.into_iter().zip(ids) {
+            push_inst(&mut w, 43, &[f32_ty, id, value.to_bits()]);
+        }
+    }
 
     push_inst(&mut w, 30, &[per_vert_in_struct, vec4_ty]);
     push_inst(&mut w, 28, &[per_vert_in_arr, per_vert_in_struct, c_cp]);
@@ -505,6 +539,18 @@ pub fn emit_domain_spirv(desc: &DomainShaderDesc) -> Vec<u32> {
     // Function body
     push_inst(&mut w, 54, &[void_ty, entry_id, 0, fn_ty]);
     push_inst(&mut w, 248, &[entry_label]);
+    if let Some(ids) = position_ids {
+        push_inst(
+            &mut w,
+            80,
+            &[vec4_ty, final_pos, ids[0], ids[1], ids[2], ids[3]],
+        );
+        push_inst(&mut w, 65, &[ptr_out_vec4, out_pos_ptr, gl_out_var, c_0]);
+        push_inst(&mut w, 62, &[out_pos_ptr, final_pos]);
+        push_inst(&mut w, 253, &[]);
+        push_inst(&mut w, 56, &[]);
+        return w;
+    }
     push_inst(&mut w, 61, &[vec3_ty, tc_val, tess_coord_var]);
     push_inst(
         &mut w,
@@ -573,64 +619,105 @@ pub fn emit_domain_spirv(desc: &DomainShaderDesc) -> Vec<u32> {
     w
 }
 
-/// Translate an RDNA2 Hull Shader (including merged LS+HS waves) into a
-/// `spirv-val`-clean SPIR-V 1.6 `TessellationControl` module.
-///
-/// Inspects constant `v_mov_b32` / `s_mov_b32` writes feeding tessellation
-/// factor stores (`buffer_store` / `ds_write`) to recover static tessellation
-/// factors when present.
+/// Translates position-passthrough hull shaders with a static patch-factor
+/// block in outer-then-inner order. Dynamic merged LS+HS programs need their
+/// stage input and output layout.
 pub fn translate_hull_rdna2(
     words: &[u32],
     base_desc: &HullShaderDesc,
 ) -> Result<Vec<u32>, crate::rdna2::DecodeError> {
-    let program = crate::rdna2::decode_program(words)?;
-    let mut vgpr_bits: HashMap<u8, u32> = HashMap::new();
-    let mut factors: Vec<u32> = Vec::new();
-    for di in &program {
-        match &di.inst {
-            crate::rdna2::Inst::VMovB32 { dst, src0 } => {
-                if let Some(bits) = match *src0 {
-                    crate::rdna2::Operand::InlineFloat(b) | crate::rdna2::Operand::Literal(b) => {
-                        Some(b)
-                    }
-                    crate::rdna2::Operand::InlineInt(i) => Some((i as f32).to_bits()),
-                    crate::rdna2::Operand::Vgpr(v) => vgpr_bits.get(&v).copied(),
-                    _ => None,
-                } {
-                    vgpr_bits.insert(*dst, bits);
+    let mut registers = Registers::new();
+    let mut factors = [None; 6];
+    let mut descriptor = None;
+    let (outer_count, inner_count) = base_desc.domain.factor_counts();
+    let factor_count = outer_count + inner_count;
+    for di in crate::rdna2::decode_program(words)? {
+        let fail = || unsupported(words, di.pc);
+        match di.inst {
+            Inst::SEndpgm => break,
+            Inst::BufferStore {
+                vdata,
+                count,
+                srsrc,
+                soffset: Operand::InlineInt(0),
+                offset,
+                offen: false,
+                idxen: false,
+                typed_format: None,
+                ..
+            } if offset.is_multiple_of(4) => {
+                if *descriptor.get_or_insert(srsrc) != srsrc {
+                    return Err(fail());
+                }
+                let base = usize::from(offset / 4);
+                let end = base + usize::from(count);
+                if end > factor_count {
+                    return Err(fail());
+                }
+                for (i, target) in factors[base..end].iter_mut().enumerate() {
+                    let index = vdata.checked_add(i as u8).ok_or_else(fail)?;
+                    let value = registers
+                        .vgpr(index)
+                        .filter(|bits| f32::from_bits(*bits).is_finite())
+                        .ok_or_else(fail)?;
+                    *target = Some(value);
                 }
             }
-            crate::rdna2::Inst::BufferStore { vdata, count, .. } => {
-                for k in 0..*count {
-                    if let Some(&b) = vgpr_bits.get(&(*vdata + k)) {
-                        let f = f32::from_bits(b);
-                        if f.is_finite() && (1.0..=64.0).contains(&f) {
-                            factors.push(b);
-                        }
-                    }
-                }
-            }
-            _ => {}
+            ref inst if registers.execute(inst) => {}
+            _ => return Err(fail()),
         }
     }
     let mut desc = *base_desc;
-    for (i, &f) in factors.iter().take(4).enumerate() {
-        desc.outer_factors[i] = f;
-    }
-    for (i, &f) in factors.iter().skip(4).take(2).enumerate() {
-        desc.inner_factors[i] = f;
+    if descriptor.is_some() {
+        if factors[..factor_count].contains(&None) {
+            return Err(unsupported(words, 0));
+        }
+        for (value, factor) in desc.outer_factors[..outer_count]
+            .iter_mut()
+            .chain(&mut desc.inner_factors[..inner_count])
+            .zip(factors)
+        {
+            *value = factor.expect("the complete factor block was checked");
+        }
     }
     Ok(emit_hull_spirv(&desc))
 }
 
-/// Translate an RDNA2 Domain Shader into a `spirv-val`-clean SPIR-V 1.6
-/// `TessellationEvaluation` module.
+/// Translates straight-line domain shaders with static position exports.
+/// An empty program uses the descriptor's control-point interpolation.
 pub fn translate_domain_rdna2(
     words: &[u32],
     desc: &DomainShaderDesc,
 ) -> Result<Vec<u32>, crate::rdna2::DecodeError> {
-    let _program = crate::rdna2::decode_program(words)?;
-    Ok(emit_domain_spirv(desc))
+    let mut registers = Registers::new();
+    let mut position = [None; 4];
+    let mut export = None;
+    let mut empty = true;
+    for di in crate::rdna2::decode_program(words)? {
+        match di.inst {
+            Inst::SEndpgm => break,
+            Inst::SNop | Inst::SWaitcnt => continue,
+            Inst::Exp {
+                target: 12,
+                en,
+                vsrc,
+                compr: false,
+                ..
+            } => {
+                registers.position(en, vsrc, &mut position);
+                export = Some(di.pc);
+            }
+            ref inst if registers.execute(inst) => {}
+            _ => return Err(unsupported(words, di.pc)),
+        }
+        empty = false;
+    }
+    if empty {
+        return Ok(emit_domain_spirv(desc));
+    }
+    let pc = export.ok_or_else(|| unsupported(words, 0))?;
+    let position = full_position(position).ok_or_else(|| unsupported(words, pc))?;
+    Ok(emit_domain(desc, Some(position)))
 }
 
 #[cfg(test)]
@@ -672,5 +759,43 @@ mod tests {
             input_control_points: 4,
         });
         assert_spirv_valid(&ds_quad, "domain_quad");
+    }
+
+    #[test]
+    fn triangle_hull_puts_the_fourth_factor_in_the_inner_level() {
+        use crate::rdna2::encode::*;
+
+        let mut words = Vec::new();
+        for (i, value) in [0.0f32, 2.0, 3.0, 4.0].into_iter().enumerate() {
+            words.extend(v_mov_b32_literal(i as u8, value.to_bits()));
+            let [op, operands] = buffer_store_dword(i as u8, 0, 0, i as u16 * 4);
+            words.extend([op & !(1 << 12), operands]);
+        }
+        words.push(s_endpgm());
+        let desc = HullShaderDesc {
+            outer_factors: [0.0f32, 2.0, 3.0, 1.0].map(f32::to_bits),
+            inner_factors: [4.0f32, 1.0].map(f32::to_bits),
+            ..Default::default()
+        };
+        assert_eq!(
+            translate_hull_rdna2(&words, &HullShaderDesc::default()).unwrap(),
+            emit_hull_spirv(&desc)
+        );
+    }
+
+    #[test]
+    fn domain_lowers_a_static_position_and_refuses_an_unbound_input() {
+        use crate::rdna2::encode::*;
+
+        let mut words = Vec::new();
+        words.extend(v_mov_b32_literal(0, 0.375f32.to_bits()));
+        words.extend(v_mov_b32_literal(1, 1.0f32.to_bits()));
+        words.extend(exp(12, 15, [0, 0, 0, 1], true, false));
+        words.push(s_endpgm());
+        let desc = DomainShaderDesc::default();
+        let shader = translate_domain_rdna2(&words, &desc).unwrap();
+        assert_eq!(shader, emit_domain(&desc, Some([0.375, 0.375, 0.375, 1.0])));
+        assert_spirv_valid(&shader, "domain_static");
+        assert!(translate_domain_rdna2(&words[2..], &desc).is_err());
     }
 }

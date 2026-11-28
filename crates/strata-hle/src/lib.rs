@@ -8,6 +8,7 @@ macro_rules! host_fn {
     }};
 }
 
+mod acp_channel;
 pub mod audio;
 pub mod bvh_builder;
 pub mod config;
@@ -27,10 +28,13 @@ pub mod implib;
 pub mod input;
 pub mod linux_loader;
 pub mod loader;
+#[cfg(windows)]
+pub mod opus_host;
 pub mod os_thunks;
 pub mod patch;
 pub mod pe;
 pub mod pipeline_cache;
+mod pipeline_warm;
 pub mod profile;
 pub mod runtime;
 pub mod services;

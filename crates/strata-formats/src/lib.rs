@@ -7,6 +7,9 @@
 
 pub mod bcpack;
 pub mod opus;
+pub mod opus_native;
 pub mod sgd5;
 pub mod texture;
+pub mod wmapro;
+mod wmapro_tables;
 pub mod xma;

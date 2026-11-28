@@ -3,9 +3,9 @@
 //!
 //! Recognises console inline `RayQuery` traversal loops in decoded RDNA2
 //! instruction streams and classifies them for lifting to Vulkan
-//! `VK_KHR_ray_query` (`OpRayQueryInitializeKHR` / `OpRayQueryProceedKHR`),
-//! falling back cleanly to software BVH intersection when a loop contains
-//! unsupported side effects.
+//! `VK_KHR_ray_query` (`OpRayQueryInitializeKHR` / `OpRayQueryProceedKHR`).
+//! This scan screens candidates. A replacement also needs proven ray inputs,
+//! memory effects, and a value for every register live past the loop.
 
 use crate::rdna2::{DecodedInst, Inst};
 
@@ -17,7 +17,7 @@ pub const OP_RAY_QUERY_INITIALIZE_KHR: u16 = 4473;
 pub const OP_RAY_QUERY_TERMINATE_KHR: u16 = 4474;
 pub const OP_RAY_QUERY_PROCEED_KHR: u16 = 4477;
 pub const OP_RAY_QUERY_GET_INTERSECTION_TYPE_KHR: u16 = 4479;
-pub const OP_RAY_QUERY_GET_INTERSECTION_T_KHR: u16 = 4480;
+pub const OP_RAY_QUERY_GET_INTERSECTION_T_KHR: u16 = 6018;
 
 /// Recognized RDNA2 BVH traversal loop candidate for hardware `RayQuery` lifting.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +30,7 @@ pub struct RayLoopCandidate {
     pub bvh_inst_index: usize,
     /// Destination VGPR base of the BVH intersection result.
     pub result_vgpr: u8,
-    /// Whether the loop passed fail-safe side-effect checks for hardware lifting.
+    /// Whether the loop passed the initial store and atomic check.
     pub liftable: bool,
 }
 

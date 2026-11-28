@@ -667,7 +667,28 @@ fn host_proc(hmod: *mut c_void, func: &str) -> *const c_void {
     }
 }
 
+pub(crate) fn load_system_media_foundation(dll_name: &str) -> Option<*mut c_void> {
+    if !(dll_name.eq_ignore_ascii_case("mfplat.dll")
+        || dll_name.eq_ignore_ascii_case("mfreadwrite.dll"))
+    {
+        return None;
+    }
+    const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+    let wide: Vec<u16> = dll_name.encode_utf16().chain([0]).collect();
+    // Media Foundation objects must use the host's COM implementation.
+    Some(unsafe {
+        LoadLibraryExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    })
+}
+
 fn load_host_dll(dll_name: &str) -> *mut c_void {
+    if let Some(module) = load_system_media_foundation(dll_name) {
+        return module;
+    }
     match CString::new(dll_name) {
         // SAFETY: NUL-terminated name.
         Ok(s) => unsafe { LoadLibraryA(s.as_ptr()) },
@@ -884,6 +905,56 @@ pub fn check_import_binding(pe: &Pe64Info) -> BindReport {
 
 #[cfg(all(test, windows, target_arch = "x86_64"))]
 mod tests {
+    #[test]
+    fn media_foundation_imports_return_real_com_objects() {
+        use super::*;
+        use core::ffi::c_void;
+
+        let Resolution::Host(startup) = resolve_without_title("MFPlat.DLL", "MFStartup") else {
+            eprintln!("Media Foundation is unavailable on this host");
+            return;
+        };
+        let Resolution::Host(shutdown) = resolve_without_title("mfplat.dll", "MFShutdown") else {
+            panic!("missing MFShutdown");
+        };
+        let Resolution::Host(create) = resolve_without_title("mfplat.dll", "MFCreateMemoryBuffer")
+        else {
+            panic!("missing MFCreateMemoryBuffer");
+        };
+        assert!(matches!(
+            resolve_without_title("mfreadwrite.dll", "MFCreateSourceReaderFromURL"),
+            Resolution::Host(_)
+        ));
+        assert_eq!(resolve_hle("mfplat.dll", "MFCreateMemoryBuffer"), None);
+
+        unsafe {
+            let startup: unsafe extern "system" fn(u32, u32) -> i32 = std::mem::transmute(startup);
+            let shutdown: unsafe extern "system" fn() -> i32 = std::mem::transmute(shutdown);
+            let create: unsafe extern "system" fn(u32, *mut *mut c_void) -> i32 =
+                std::mem::transmute(create);
+            assert_eq!(startup(0x0002_0070, 0), 0);
+            let mut buffer = std::ptr::null_mut();
+            let created = create(4096, &mut buffer);
+            let mut capacity = 0;
+            let got_capacity = if created >= 0 && !buffer.is_null() {
+                let vtable = *buffer.cast::<*const usize>();
+                let release: unsafe extern "system" fn(*mut c_void) -> u32 =
+                    std::mem::transmute(*vtable.add(2));
+                let get_max_length: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32 =
+                    std::mem::transmute(*vtable.add(7));
+                let result = get_max_length(buffer, &mut capacity);
+                release(buffer);
+                result
+            } else {
+                created
+            };
+            assert_eq!(shutdown(), 0);
+            assert_eq!(created, 0);
+            assert_eq!(got_capacity, 0);
+            assert!(capacity >= 4096);
+        }
+    }
+
     use super::*;
 
     use crate::testpe::*;

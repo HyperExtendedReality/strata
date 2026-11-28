@@ -5,9 +5,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use strata_gpu::images::GpuImage;
-use strata_gpu::replay::{CapturedOp, ExecutableFrame, FrameCapture, SurfaceSnapshot};
+use strata_gpu::replay::{
+    CapturedOp, ExecutableFrame, FrameCapture, MAX_HISTORY_EVENTS, SurfaceSnapshot,
+};
 use strata_gpu::runner::ComputeRunner;
-use strata_gpu::thin_list::{ThinCommand, ThinCommandList};
+use strata_gpu::thin_list::ThinCommandList;
 
 struct Pending {
     path: PathBuf,
@@ -37,34 +39,27 @@ pub(crate) fn record(list: &ThinCommandList) {
     if !ARMED.load(Ordering::Acquire) {
         return;
     }
-    let mut pending = CAPTURE.lock().unwrap();
-    let Some(pending) = pending.as_mut() else {
+    let mut slot = CAPTURE.lock().unwrap();
+    let Some(pending) = slot.as_mut() else {
         return;
     };
-    for command in list.commands() {
-        let op = match command {
-            ThinCommand::BindPipeline(key) => CapturedOp::BindPipeline { hash: key.0 },
-            ThinCommand::PushUserSgprs { offset_dw, values } => CapturedOp::SetRootConstants {
-                offset: u32::from(*offset_dw),
-                values: values.clone(),
-            },
-            ThinCommand::Dispatch { x, y, z, .. } => CapturedOp::Dispatch {
-                x: *x,
-                y: *y,
-                z: *z,
-            },
-            ThinCommand::DrawInstanced {
-                vertex_count,
-                instance_count,
-                ..
-            } => CapturedOp::Draw {
-                vertex_count: *vertex_count,
-                instance_count: *instance_count,
-            },
-            _ => continue,
-        };
-        pending.trace.record(op);
+    if pending
+        .trace
+        .ops
+        .len()
+        .saturating_add(list.commands().len())
+        >= MAX_HISTORY_EVENTS - 1
+    {
+        stop_at_history_limit(&mut slot);
+        return;
     }
+    pending.trace.record_list(list);
+}
+
+fn stop_at_history_limit(slot: &mut Option<Pending>) {
+    *slot = None;
+    ARMED.store(false, Ordering::Release);
+    *RESULT.lock().unwrap() = Some(Err("frame capture exceeded its history event limit".into()));
 }
 
 pub(crate) fn finish(runner: &ComputeRunner, planes: &[&GpuImage], frame: &GpuImage, index: u64) {
@@ -75,8 +70,14 @@ pub(crate) fn finish(runner: &ComputeRunner, planes: &[&GpuImage], frame: &GpuIm
     let Some(pending) = slot.as_mut() else {
         return;
     };
+    if pending.trace.ops.len() >= MAX_HISTORY_EVENTS {
+        stop_at_history_limit(&mut slot);
+        return;
+    }
+    pending
+        .trace
+        .record(CapturedOp::Present { frame_index: index });
     if index < pending.target_frame {
-        pending.trace.ops.clear();
         return;
     }
     let Pending {
@@ -85,7 +86,6 @@ pub(crate) fn finish(runner: &ComputeRunner, planes: &[&GpuImage], frame: &GpuIm
     ARMED.store(false, Ordering::Release);
     drop(slot);
     trace.frame_index = index;
-    trace.record(CapturedOp::Present { frame_index: index });
     let result = (|| {
         let planes = planes
             .iter()

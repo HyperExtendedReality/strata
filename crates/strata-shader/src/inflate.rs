@@ -13,10 +13,16 @@ pub enum InflateError {
     BadBlockType { btype: u8 },
     #[error("invalid Huffman symbol")]
     BadSymbol,
+    #[error("deflate output exceeds the requested limit")]
+    OutputLimit,
 }
 
 /// Decompress an RFC 1950 zlib stream (2-byte header + deflate payload + 4-byte Adler-32).
 pub fn inflate_zlib(data: &[u8]) -> Result<Vec<u8>, InflateError> {
+    inflate_zlib_bounded(data, usize::MAX)
+}
+
+pub fn inflate_zlib_bounded(data: &[u8], limit: usize) -> Result<Vec<u8>, InflateError> {
     if data.len() < 6 {
         return Err(InflateError::UnexpectedEof);
     }
@@ -29,13 +35,20 @@ pub fn inflate_zlib(data: &[u8]) -> Result<Vec<u8>, InflateError> {
     if start > data.len() {
         return Err(InflateError::UnexpectedEof);
     }
-    inflate_raw(&data[start..])
+    inflate_raw_bounded(&data[start..], limit)
 }
 
 /// Decompress a raw RFC 1951 DEFLATE stream (stored, fixed Huffman, and dynamic Huffman).
 pub fn inflate_raw(data: &[u8]) -> Result<Vec<u8>, InflateError> {
+    inflate_raw_bounded(data, usize::MAX)
+}
+
+fn inflate_raw_bounded(data: &[u8], limit: usize) -> Result<Vec<u8>, InflateError> {
     let mut br = BitReader::new(data);
     let mut out = Vec::new();
+    if limit != usize::MAX {
+        out.try_reserve_exact(limit).map_err(|_| InflateError::OutputLimit)?;
+    }
 
     loop {
         let bfinal = br.read_bits(1)?;
@@ -50,6 +63,9 @@ pub fn inflate_raw(data: &[u8]) -> Result<Vec<u8>, InflateError> {
                     return Err(InflateError::BadBlockType { btype: 0 });
                 }
                 let slice = br.read_bytes(len)?;
+                if len > limit - out.len() {
+                    return Err(InflateError::OutputLimit);
+                }
                 out.extend_from_slice(slice);
             }
             1 => {
@@ -62,7 +78,7 @@ pub fn inflate_raw(data: &[u8]) -> Result<Vec<u8>, InflateError> {
                 let dist_lens = [5u8; 32];
                 let lit = HuffTree::build(&lit_lens)?;
                 let dist = HuffTree::build(&dist_lens)?;
-                decode_huffman_block(&mut br, &lit, &dist, &mut out)?;
+                decode_huffman_block(&mut br, &lit, &dist, &mut out, limit)?;
             }
             2 => {
                 // Dynamic Huffman block
@@ -111,7 +127,7 @@ pub fn inflate_raw(data: &[u8]) -> Result<Vec<u8>, InflateError> {
                 }
                 let lit = HuffTree::build(&all_lens[..hlit])?;
                 let dist = HuffTree::build(&all_lens[hlit..])?;
-                decode_huffman_block(&mut br, &lit, &dist, &mut out)?;
+                decode_huffman_block(&mut br, &lit, &dist, &mut out, limit)?;
             }
             _ => return Err(InflateError::BadBlockType { btype }),
         }
@@ -128,6 +144,7 @@ fn decode_huffman_block(
     lit: &HuffTree,
     dist: &HuffTree,
     out: &mut Vec<u8>,
+    limit: usize,
 ) -> Result<(), InflateError> {
     const LEN_BASE: [usize; 29] = [
         3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
@@ -148,6 +165,9 @@ fn decode_huffman_block(
     loop {
         let sym = lit.decode(br)?;
         if sym < 256 {
+            if out.len() == limit {
+                return Err(InflateError::OutputLimit);
+            }
             out.push(sym as u8);
         } else if sym == 256 {
             break;
@@ -161,6 +181,9 @@ fn decode_huffman_block(
             let back = DIST_BASE[di] + br.read_bits(DIST_EXTRA[di])? as usize;
             if back > out.len() {
                 return Err(InflateError::BadSymbol);
+            }
+            if len > limit - out.len() {
+                return Err(InflateError::OutputLimit);
             }
             for _ in 0..len {
                 let b = out[out.len() - back];

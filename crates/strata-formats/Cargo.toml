@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+# MIT OR Apache-2.0, vendored (see third_party/bcpack-rs).
+bcpack-rs = { path = "../../third_party/bcpack-rs" }
+opus-pure = "=0.2.4"
 
 [lints]
 workspace = true

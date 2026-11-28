@@ -22,6 +22,7 @@ struct BvhOraclePush {
     uint64_t nodes_addr;    // Input Box32Node array (BDA)
     uint64_t results_addr;  // Output uint4 hit child IDs (BDA)
     uint32_t count;
+    float bma_threshold;    // 0.0 = exact watertight; >0.0 = BMA probabilistic pruning
 };
 
 // Fast FNV-1a / Murmur-style avalanche mixer for 64 KiB GPU dirty-page detection.

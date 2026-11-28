@@ -339,12 +339,7 @@ pub fn trace_descriptors(program: &[DecodedInst]) -> Vec<DescriptorUse> {
                     Some(*samp_sgpr),
                 );
                 u.dim = ImageDim::from_mimg(*dim);
-                u.compare = matches!(
-                    mode,
-                    crate::rdna2::SampleMode::Compare
-                        | crate::rdna2::SampleMode::CompareLod
-                        | crate::rdna2::SampleMode::CompareLodZero
-                );
+                u.compare = mode.is_compare();
                 uses.push(u);
             }
             Inst::ImageLoad { rsrc_sgpr, dim, .. }

@@ -132,6 +132,42 @@ pub enum PressureTier {
     Critical,
 }
 
+/// Current Windows system commit headroom, in bytes.
+pub fn available_commit_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct PerformanceInformation {
+            size: u32,
+            commit_total: usize,
+            commit_limit: usize,
+            commit_peak: usize,
+            physical_total: usize,
+            physical_available: usize,
+            system_cache: usize,
+            kernel_total: usize,
+            kernel_paged: usize,
+            kernel_nonpaged: usize,
+            page_size: usize,
+            handle_count: u32,
+            process_count: u32,
+            thread_count: u32,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn K32GetPerformanceInfo(info: *mut PerformanceInformation, size: u32) -> i32;
+        }
+        let mut info = std::mem::MaybeUninit::<PerformanceInformation>::zeroed();
+        let size = std::mem::size_of::<PerformanceInformation>() as u32;
+        if unsafe { K32GetPerformanceInfo(info.as_mut_ptr(), size) } != 0 {
+            let info = unsafe { info.assume_init() };
+            return Some((info.commit_limit.saturating_sub(info.commit_total) as u64)
+                .saturating_mul(info.page_size as u64));
+        }
+    }
+    None
+}
+
 impl PressureTier {
     pub const CRITICAL_COMMIT_BYTES: u64 = 1536 * 1024 * 1024;
     pub const MILD_COMMIT_BYTES: u64 = 4096 * 1024 * 1024;

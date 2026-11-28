@@ -1,0 +1,15 @@
+[package]
+name = "bcpack-rs"
+version = "0.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Vendored copy of bcpack-rs (library only): Xbox Series BCPack (MDU rANS) BC1/BC3/BC4/BC5/BC7 decoder"
+repository = "https://github.com/Ahmet-Dedeler/bcpack-rs"
+publish = false
+
+[lib]
+name = "bcpack"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = "1.0"

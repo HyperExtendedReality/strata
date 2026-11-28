@@ -208,6 +208,15 @@ fn vrs_combiner(op: u32) -> vk::FragmentShadingRateCombinerOpKHR {
 }
 
 impl ComputeRunner {
+    pub fn precompile_graphics(
+        &self,
+        stages: GraphicsStages<'_>,
+        formats: &[vk::Format],
+        state: &GraphicsPsoState,
+    ) -> Result<(), GpuError> {
+        self.gfx_pipeline_for_stages(stages, formats, state).map(|_| ())
+    }
+
     pub(crate) fn gfx_pipeline_for_stages(
         &self,
         stages_in: GraphicsStages<'_>,
@@ -248,8 +257,11 @@ impl ComputeRunner {
             }
         };
         let key: GfxKey = (h0, h1, fmt_key);
-        let mut table = self.gfx_pipelines.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&(_, p)) = table.get(&key) {
+        if let Some(&(_, p)) = self.gfx_pipelines.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return Ok(p);
+        }
+        let _cache = self.pipeline_cache_lock.lock().unwrap();
+        if let Some(&(_, p)) = self.gfx_pipelines.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             return Ok(p);
         }
         match stages_in {
@@ -448,7 +460,6 @@ impl ComputeRunner {
                 }
             }
             let ci = [gpci];
-            let _cache = self.pipeline_cache_lock.lock().unwrap();
             let pipeline =
                 match self
                     .device
@@ -456,6 +467,7 @@ impl ComputeRunner {
                 {
                     Ok(p) => p[0],
                     Err((_, e)) => {
+                        crate::perf::pipeline_errors(1);
                         for m in modules {
                             self.device.destroy_shader_module(m, None);
                         }
@@ -463,6 +475,7 @@ impl ComputeRunner {
                     }
                 };
             let key_words: Vec<_> = key.2.iter().map(|&word| word as u32).collect();
+            crate::perf::pipeline_creation_ns(start.elapsed().as_nanos() as u64);
             self.record_pipeline(
                 format!(
                     "gs-{:016x}-{:016x}-{:016x}",
@@ -474,7 +487,7 @@ impl ComputeRunner {
                 start.elapsed(),
                 || crate::pipeline_usage::Recipe::graphics(stages_in, formats, state),
             );
-            table.insert(key, (modules, pipeline));
+            self.gfx_pipelines.lock().unwrap_or_else(|e| e.into_inner()).insert(key, (modules, pipeline));
             Ok(pipeline)
         }
     }

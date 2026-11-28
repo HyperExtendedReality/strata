@@ -19,12 +19,12 @@ use std::ffi::c_void;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 
 use strata_formats::bcpack::{BcPackTables, decode as bcpack_decode};
-use strata_shader::inflate::inflate_zlib;
+use strata_shader::inflate::{InflateError, inflate_zlib, inflate_zlib_bounded};
 
 use crate::d3d12_abi::{FenceInner, ResourceInner};
 use crate::vfs::Vfs;
@@ -487,6 +487,10 @@ fn run_request(op: Op, tables: &BcPackTables, cancels: &Mutex<Vec<(u64, u64)>>) 
         Ok(o) => o,
         Err(e) => return e,
     };
+    land_request(destination, &out)
+}
+
+fn land_request(destination: Destination, out: &[u8]) -> i32 {
     unsafe {
         match destination {
             Destination::Memory(p, n) => {
@@ -512,6 +516,77 @@ fn run_request(op: Op, tables: &BcPackTables, cancels: &Mutex<Vec<(u64, u64)>>) 
     S_OK
 }
 
+const PARALLEL_STAGING_BYTES: usize = 32 << 20;
+static PARALLEL_DECOMPRESS: AtomicBool = AtomicBool::new(false);
+
+struct DecompressPermit;
+
+impl DecompressPermit {
+    fn acquire() -> Option<Self> {
+        PARALLEL_DECOMPRESS.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .ok().map(|_| Self)
+    }
+}
+
+impl Drop for DecompressPermit {
+    fn drop(&mut self) {
+        PARALLEL_DECOMPRESS.store(false, Ordering::Release);
+    }
+}
+
+fn staging_bytes(op: &Op) -> Option<usize> {
+    if let Op::Request {
+        source: Source::File(_, _, size), format: COMPRESSION_ZLIB,
+        uncompressed, destination: Destination::Memory(_, _), ..
+    } = op {
+        let bound = *uncompressed as usize;
+        if bound != 0 {
+            return bound.checked_add(*size as usize).filter(|&bytes| bytes <= PARALLEL_STAGING_BYTES);
+        }
+    }
+    None
+}
+
+fn parallel_requests(ops: Vec<Op>, tables: &BcPackTables, cancels: &Mutex<Vec<(u64, u64)>>) -> Vec<i32> {
+    // Workers only read and decompress. The queue's original worker writes
+    // destinations in issue order, even when the ranges overlap.
+    let decoded = std::thread::scope(|scope| {
+        let workers: Vec<_> = ops.iter().map(|op| {
+            std::thread::Builder::new().spawn_scoped(scope, move || {
+                let Op::Request { source: Source::File(file, offset, size), uncompressed, tag, .. } = op else {
+                    unreachable!("parallel jobs are filtered by staging_bytes");
+                };
+                if cancels.lock().unwrap().iter().any(|&(mask, value)| tag & mask == value) {
+                    return Some(Err(E_ABORT));
+                }
+                let bytes = match file_read(file, *offset, *size) {
+                    Ok(bytes) => bytes,
+                    Err(error) => return Some(Err(error)),
+                };
+                match inflate_zlib_bounded(&bytes, *uncompressed as usize) {
+                    Ok(bytes) => Some(Ok(bytes)),
+                    Err(InflateError::OutputLimit) => None,
+                    Err(_) => Some(Err(E_FAIL)),
+                }
+            })
+        }).collect();
+        workers.into_iter().map(|worker| worker.ok().and_then(|thread| thread.join().ok().flatten()))
+            .collect::<Vec<_>>()
+    });
+    if decoded.iter().any(Option::is_none) {
+        drop(decoded);
+        return ops.into_iter().map(|op| run_request(op, tables, cancels)).collect();
+    }
+    ops.into_iter().zip(decoded).map(|(op, output)| match output {
+        Some(Ok(bytes)) => {
+            let Op::Request { destination, .. } = op else { unreachable!() };
+            land_request(destination, &bytes)
+        }
+        Some(Err(error)) => error,
+        None => unreachable!("fallback runs the group serially"),
+    }).collect()
+}
+
 fn worker(
     rx: mpsc::Receiver<Vec<Op>>,
     cancels: Arc<Mutex<Vec<(u64, u64)>>>,
@@ -519,14 +594,33 @@ fn worker(
 ) {
     let tables = BcPackTables::uniform_default();
     while let Ok(batch) = rx.recv() {
-        let mut last = S_OK;
         let mut failed = S_OK;
-        for op in batch {
+        let mut batch = batch.into_iter().peekable();
+        while let Some(op) = batch.next() {
             match op {
                 Op::Request { .. } => {
-                    last = run_request(op, &tables, &cancels);
-                    if last != S_OK {
-                        failed = last;
+                    if let Some(mut bytes) = staging_bytes(&op)
+                        && batch.peek().and_then(staging_bytes).is_some_and(|next| bytes + next <= PARALLEL_STAGING_BYTES)
+                        && let Some(_permit) = DecompressPermit::acquire()
+                    {
+                        let mut group = vec![op];
+                        while group.len() < 4
+                            && let Some(next) = batch.peek().and_then(staging_bytes)
+                            && bytes + next <= PARALLEL_STAGING_BYTES
+                        {
+                            bytes += next;
+                            group.push(batch.next().unwrap());
+                        }
+                        for result in parallel_requests(group, &tables, &cancels) {
+                            if failed == S_OK {
+                                failed = result;
+                            }
+                        }
+                    } else {
+                        let result = run_request(op, &tables, &cancels);
+                        if failed == S_OK {
+                            failed = result;
+                        }
                     }
                 }
                 // A status reports the first failure since the previous one.
@@ -551,7 +645,6 @@ fn worker(
                 },
             }
         }
-        let _ = last;
         let (m, cv) = &*idle;
         *m.lock().unwrap() += 1;
         cv.notify_all();

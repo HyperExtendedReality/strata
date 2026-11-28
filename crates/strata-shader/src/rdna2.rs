@@ -130,6 +130,61 @@ pub enum SampleMode {
     Gather,
     /// `image_gather4_lz`: 4-texel gather at level 0.
     GatherLodZero,
+    /// `image_sample_d`: explicit derivatives before the coordinates.
+    Grad,
+    /// `image_sample_c_b`: comparison with an LOD bias.
+    CompareBias,
+    /// `image_sample_c_d`: comparison with explicit derivatives.
+    CompareGrad,
+}
+
+impl SampleMode {
+    pub fn is_compare(self) -> bool {
+        matches!(
+            self,
+            SampleMode::Compare
+                | SampleMode::CompareLod
+                | SampleMode::CompareLodZero
+                | SampleMode::CompareBias
+                | SampleMode::CompareGrad
+        )
+    }
+}
+
+/// The sample mode and `(offset, clamp)` modifiers of a GFX10 MIMG sample or
+/// gather opcode (`image_sample*` 0x20..=0x3f, `image_gather4*` 0x40..=0x5f),
+/// or `None` for opcodes Strata does not lower (compare gathers, gathers
+/// with an LOD or bias: Vulkan core has no such gathers).
+pub fn sample_variant(op: u32) -> Option<(SampleMode, bool, bool)> {
+    let offset = op & 0x10 != 0;
+    let compare = op & 0x08 != 0;
+    let kind = op & 0x07;
+    match op {
+        0x20..=0x3f => {
+            // kind: 0 -, 1 _cl, 2 _d, 3 _d_cl, 4 _l, 5 _b, 6 _b_cl, 7 _lz
+            let clamp = matches!(kind, 1 | 3 | 6);
+            let mode = match (compare, kind) {
+                (false, 0 | 1) => SampleMode::Implicit,
+                (false, 2 | 3) => SampleMode::Grad,
+                (false, 4) => SampleMode::Lod,
+                (false, 5 | 6) => SampleMode::Bias,
+                (false, _) => SampleMode::LodZero,
+                (true, 0 | 1) => SampleMode::Compare,
+                (true, 2 | 3) => SampleMode::CompareGrad,
+                (true, 4) => SampleMode::CompareLod,
+                (true, 5 | 6) => SampleMode::CompareBias,
+                (true, _) => SampleMode::CompareLodZero,
+            };
+            Some((mode, offset, clamp))
+        }
+        0x40..=0x5f if !compare => match kind {
+            0 => Some((SampleMode::Gather, offset, false)),
+            1 => Some((SampleMode::Gather, offset, true)),
+            7 => Some((SampleMode::GatherLodZero, offset, false)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Atomic memory operation kind for `buffer_atomic_*` and `global_atomic_*`.
@@ -566,6 +621,10 @@ pub enum Inst {
         dmask: u8,
         dim: u8,
         mode: SampleMode,
+        /// `_o`: a packed texel offset VGPR comes first.
+        offset: bool,
+        /// `_cl`: an LOD clamp VGPR follows the coordinates.
+        clamp: bool,
     },
     /// `image_load` / `image_load_mip` (`mip`: the level follows the coordinates).
     ImageLoad {
@@ -1015,7 +1074,8 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
                 decode_vop1(op - 0x180, dst, src0, s0, w, pc)?
             } else {
                 match op {
-                    0x141 | 0x14b => Inst::VFmaF32 {
+                    // v_mad_legacy_f32 (0x140) / v_mad_f32 (0x141) / v_fma_f32 (0x14b)
+                    0x140 | 0x141 | 0x14b => Inst::VFmaF32 {
                         dst,
                         src0,
                         src1,
@@ -1591,87 +1651,20 @@ pub fn decode_program(words: &[u32]) -> Result<Vec<DecodedInst>, DecodeError> {
                     dmask,
                     dim,
                 },
-                0x20 => Inst::ImageSample {
-                    dst,
-                    addr_vgpr,
-                    rsrc_sgpr,
-                    samp_sgpr,
-                    dmask,
-                    dim,
-                    mode: SampleMode::Implicit,
-                },
-                0x24 => Inst::ImageSample {
-                    dst,
-                    addr_vgpr,
-                    rsrc_sgpr,
-                    samp_sgpr,
-                    dmask,
-                    dim,
-                    mode: SampleMode::Lod,
-                },
-                0x25 => Inst::ImageSample {
-                    dst,
-                    addr_vgpr,
-                    rsrc_sgpr,
-                    samp_sgpr,
-                    dmask,
-                    dim,
-                    mode: SampleMode::Bias,
-                },
-                0x27 => Inst::ImageSample {
-                    dst,
-                    addr_vgpr,
-                    rsrc_sgpr,
-                    samp_sgpr,
-                    dmask,
-                    dim,
-                    mode: SampleMode::LodZero,
-                },
-                0x28 => Inst::ImageSample {
-                    dst,
-                    addr_vgpr,
-                    rsrc_sgpr,
-                    samp_sgpr,
-                    dmask,
-                    dim,
-                    mode: SampleMode::Compare,
-                },
-                0x2c => Inst::ImageSample {
-                    dst,
-                    addr_vgpr,
-                    rsrc_sgpr,
-                    samp_sgpr,
-                    dmask,
-                    dim,
-                    mode: SampleMode::CompareLod,
-                },
-                0x2f => Inst::ImageSample {
-                    dst,
-                    addr_vgpr,
-                    rsrc_sgpr,
-                    samp_sgpr,
-                    dmask,
-                    dim,
-                    mode: SampleMode::CompareLodZero,
-                },
-                0x40 => Inst::ImageSample {
-                    dst,
-                    addr_vgpr,
-                    rsrc_sgpr,
-                    samp_sgpr,
-                    dmask,
-                    dim,
-                    mode: SampleMode::Gather,
-                },
-                0x47 => Inst::ImageSample {
-                    dst,
-                    addr_vgpr,
-                    rsrc_sgpr,
-                    samp_sgpr,
-                    dmask,
-                    dim,
-                    mode: SampleMode::GatherLodZero,
-                },
+                op if sample_variant(op).is_some() => {
+                    let (mode, offset, clamp) = sample_variant(op).expect("checked");
+                    Inst::ImageSample {
+                        dst,
+                        addr_vgpr,
+                        rsrc_sgpr,
+                        samp_sgpr,
+                        dmask,
+                        dim,
+                        mode,
+                        offset,
+                        clamp,
+                    }
+                }
                 0x66 => Inst::ImageBvh64IntersectRay {
                     dst,
                     addr_vgpr,
@@ -1883,6 +1876,10 @@ fn decode_vop2(
             src0: src1,
             src1: src0,
         }, // v_subrev_nc_u32
+        // GFX10.1 (Scarlett) v_mac_f32: dst = src0 * src1 + dst. Lowered as
+        // the fused form; the result differs from the unfused one by at most
+        // the intermediate product's rounding.
+        0x1f => Inst::VFmacF32 { dst, src0, src1 },
         0x2b => Inst::VFmacF32 { dst, src0, src1 },
         _ => return Err(DecodeError::Unsupported { word, offset }),
     })
@@ -2197,6 +2194,19 @@ pub mod encode {
         mimg(0x08, 1, dmask, addr, data, rsrc, 0)
     }
 
+    /// Any MIMG sample / gather opcode with any `dim`.
+    pub fn image_sample_op(
+        op: u32,
+        dim: u32,
+        dst: u8,
+        addr: u8,
+        rsrc: u8,
+        samp: u8,
+        dmask: u8,
+    ) -> [u32; 2] {
+        mimg(op, dim, dmask, addr, dst, rsrc, samp)
+    }
+
     /// `image_sample_lz` with any MIMG `dim` (0..=7).
     pub fn image_sample_lz_dim(
         dim: u32,
@@ -2333,6 +2343,27 @@ pub mod encode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_gfx10_1_mac_and_mad_legacy() {
+        // v_mac_f32 v3, v1, v2 (VOP2 0x1f)
+        let mac = (0x1f << 25) | (3 << 17) | (2 << 9) | (256 + 1);
+        let p = decode_program(&[mac, encode::s_endpgm()]).unwrap();
+        assert!(
+            matches!(p[0].inst, Inst::VFmacF32 { dst: 3, .. }),
+            "{:?}",
+            p[0].inst
+        );
+        // v_mad_legacy_f32 v4, v1, v2, v3 (VOP3 0x140)
+        let lo = (0b110101 << 26) | (0x140 << 16) | 4;
+        let hi = (256 + 1) | ((256 + 2) << 9) | ((256 + 3) << 18);
+        let p = decode_program(&[lo, hi, encode::s_endpgm()]).unwrap();
+        assert!(
+            matches!(p[0].inst, Inst::VFmaF32 { dst: 4, .. }),
+            "{:?}",
+            p[0].inst
+        );
+    }
 
     #[test]
     fn decodes_sopc_sopk_vop3_ds_mubuf_exp_without_misclassification() {

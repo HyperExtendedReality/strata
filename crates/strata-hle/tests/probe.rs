@@ -16,6 +16,9 @@ fn probe_title_presents_two_planes_through_both_entry_points() {
 }
 
 fn run_probe(graphics: bool) {
+    // The title loader and capture state are process-wide.
+    static PROBE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = PROBE.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("strata-probe-{}-{graphics}", std::process::id()));
     let t_drive = dir.join("t-drive");
     std::fs::create_dir_all(&t_drive).unwrap();
@@ -61,6 +64,16 @@ fn run_probe(graphics: bool) {
         )
         .unwrap();
         assert_eq!(capture.trace.frame_index, before.0 + 5);
+        let presented: Vec<_> = capture
+            .trace
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                strata_gpu::replay::CapturedOp::Present { frame_index } => Some(*frame_index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(presented, (before.0 + 1..=before.0 + 5).collect::<Vec<_>>());
         assert_eq!(capture.planes.len(), 2);
         assert_eq!(&capture.output.pixels[12..16], &[32, 128, 0, 255]);
     }

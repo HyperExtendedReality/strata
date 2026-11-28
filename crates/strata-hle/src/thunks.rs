@@ -664,7 +664,7 @@ fn show(resources: &[*mut c_void], frame_index: u64) -> Result<bool, String> {
         )
         .ok_or("invalid present plane descriptor")?;
         textures
-            .texture(&p.runner, words, false, &read)
+            .color_target(&p.runner, words, &read)
             .map_err(|e| e.to_string())?;
         descriptors.push(words);
     }
@@ -676,12 +676,14 @@ fn show(resources: &[*mut c_void], frame_index: u64) -> Result<bool, String> {
     let frame = if planes.len() == 1 {
         base
     } else {
-        let width = planes.iter().map(|p| p.width).max().unwrap();
-        let height = planes.iter().map(|p| p.height).max().unwrap();
+        // Scale the scene and overlay planes independently into the final
+        // output. A scaled scene never includes the HUD or subtitles.
+        let (width, height) = (w.max(1), h.max(1));
         if p.composed
             .as_ref()
             .is_none_or(|i| (i.width, i.height, i.format) != (width, height, base.format))
         {
+            p.display.as_mut().unwrap().wait_for_frame(&p.runner).map_err(|e| e.to_string())?;
             let new = p
                 .runner
                 .create_image_2d(base.format, width, height, false, Default::default())
@@ -695,11 +697,14 @@ fn show(resources: &[*mut c_void], frame_index: u64) -> Result<bool, String> {
         target
     };
     crate::frame_capture::finish(&p.runner, &planes, frame, frame_index);
-    p.display
-        .as_mut()
-        .unwrap()
-        .present(&p.runner, frame, w, h)
-        .map_err(|e| e.to_string())
+    let display = p.display.as_mut().unwrap();
+    let shown = display.present(&p.runner, frame, w, h);
+    if planes.len() == 1 {
+        // A single plane is borrowed from the evictable texture cache.
+        // Keep the cache locked until the blit has stopped reading it.
+        display.wait_for_frame(&p.runner).map_err(|e| e.to_string())?;
+    }
+    shown.map_err(|e| e.to_string())
 }
 
 pub(crate) unsafe fn present_frame(plane_count: u32, planes: *const c_void) -> i32 {
@@ -715,12 +720,14 @@ pub(crate) unsafe fn present_frame(plane_count: u32, planes: *const c_void) -> i
                 Ok(true) => FRAMES_SHOWN.fetch_add(1, Ordering::Relaxed),
                 Ok(false) => 0,
                 Err(e) => {
+                    strata_gpu::perf::present_errors(1);
                     crate::crash::log_line(&format!("present: {e}"));
                     0
                 }
             };
         }
     }
+    crate::pipeline_cache::end_frame();
     if let Some(lock) = PRESENT_HOOK.get()
         && let Ok(mut guard) = lock.lock()
         && let Some(ref mut cb) = *guard
@@ -1588,7 +1595,7 @@ unsafe extern "system" fn xaudio2_create(
 }
 
 // ============================================================================
-// IAcpHal COM Object (for AcpHalCreate / XAPUCreate)
+// Legacy XAPUCreate object
 // ============================================================================
 
 #[repr(C)]
@@ -1651,8 +1658,7 @@ impl ComAcpHal {
     }
 }
 
-/// Real HLE `AcpHalCreate` returning a valid COM `IAcpHal*` backed by `XapuHal`.
-unsafe extern "system" fn acphal_create(out_hal: *mut *mut c_void) -> i32 {
+unsafe extern "system" fn legacy_xapu_create(out_hal: *mut *mut c_void) -> i32 {
     if out_hal.is_null() {
         return 0x8007_0057u32 as i32; // E_INVALIDARG
     }
@@ -1672,6 +1678,23 @@ unsafe extern "system" fn xgame_runtime_initialize() -> i32 {
 }
 
 unsafe extern "system" fn xgame_runtime_uninitialize() {}
+
+unsafe extern "system" fn gdk_initialize_impl(_version: u64, _build: u64) -> i32 {
+    unsafe { xgame_runtime_initialize() }
+}
+
+unsafe extern "system" fn gdk_initialize_impl_ex(version: u64, build: u64, _flags: u64) -> i32 {
+    unsafe { gdk_initialize_impl(version, build) }
+}
+
+unsafe extern "system" fn gdk_initialize_impl_ex2(
+    version: u64,
+    build: u64,
+    flags: u64,
+    _options: *const c_void,
+) -> i32 {
+    unsafe { gdk_initialize_impl_ex(version, build, flags) }
+}
 
 unsafe extern "system" fn xsystem_get_device_type() -> u32 {
     6 // XSystemDeviceType::XboxScarlettAnaconda (Xbox Series X)
@@ -2622,7 +2645,12 @@ pub fn resolve_hle(dll_name: &str, func_name: &str) -> Option<usize> {
         }),
         "xgameruntime.dll" => Some(match func_name {
             "XGameRuntimeInitialize" => xgame_runtime_initialize as *const () as usize,
-            "XGameRuntimeUninitialize" => xgame_runtime_uninitialize as *const () as usize,
+            "InitializeApiImpl" => gdk_initialize_impl as *const () as usize,
+            "InitializeApiImplEx" => gdk_initialize_impl_ex as *const () as usize,
+            "InitializeApiImplEx2" => gdk_initialize_impl_ex2 as *const () as usize,
+            "XGameRuntimeUninitialize" | "UninitializeApiImpl" => {
+                xgame_runtime_uninitialize as *const () as usize
+            }
             "XSystemGetDeviceType" => xsystem_get_device_type as *const () as usize,
             "XNetworkingQueryConnectivityHint" => {
                 xnetworking_query_connectivity_hint as *const () as usize
@@ -2720,7 +2748,8 @@ pub fn resolve_hle(dll_name: &str, func_name: &str) -> Option<usize> {
             _ => audio_stub_silent as *const () as usize,
         }),
         "xapu.dll" | "acphal.dll" => Some(match func_name {
-            "AcpHalCreate" | "XAPUCreate" => acphal_create as *const () as usize,
+            "AcpHalCreate" => crate::acp_channel::create as *const () as usize,
+            "XAPUCreate" => legacy_xapu_create as *const () as usize,
             "AcpHalAllocateShapeContexts" => acphal_allocate_shape_contexts as *const () as usize,
             "AcpHalReleaseShapeContexts" => acphal_release_shape_contexts as *const () as usize,
             _ => audio_stub_silent as *const () as usize,
@@ -2938,9 +2967,9 @@ mod tests {
                 std::mem::transmute(vt[2].0);
             assert_eq!(release(xa2_ptr), 0);
 
-            // AcpHalCreate -> IAcpHal COM object
+            // Legacy XAPUCreate object lifetime.
             let mut acp_ptr: *mut c_void = std::ptr::null_mut();
-            assert_eq!(acphal_create(&mut acp_ptr), 0);
+            assert_eq!(legacy_xapu_create(&mut acp_ptr), 0);
             assert!(!acp_ptr.is_null());
             let acp = acp_ptr as *mut ComAcpHal;
             let acp_rel: unsafe extern "system" fn(*mut c_void) -> u32 =
@@ -3098,10 +3127,6 @@ mod tests {
             let mut engine_ptr: *mut c_void = std::ptr::null_mut();
             assert_eq!(xaudio2_create(&mut engine_ptr, 0, 0), 0);
             assert!(!engine_ptr.is_null());
-
-            let mut hal_ptr: *mut c_void = std::ptr::null_mut();
-            assert_eq!(acphal_create(&mut hal_ptr), 0);
-            assert!(!hal_ptr.is_null());
 
             let mut ctx_ids = [u32::MAX; 2];
             assert_eq!(acphal_allocate_shape_contexts(2, ctx_ids.as_mut_ptr()), 0);

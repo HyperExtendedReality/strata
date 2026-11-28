@@ -1,8 +1,9 @@
 //! `BuildRaytracingAccelerationStructure`: bounding volume hierarchies built
 //! into title memory, in the node layout Strata's translated
 //! `image_bvh64_intersect_ray` reads (No-API: an acceleration structure is
-//! plain GPU memory the title's own traversal code walks; no Vulkan
-//! acceleration-structure object exists).
+//! plain GPU memory the title's own traversal code walks). The opaque
+//! triangle query helper can build Vulkan objects from a snapshot of that
+//! memory for hardware closest-hit queries.
 //!
 //! Layout (Strata's model, offsets from the structure's base):
 //!
@@ -34,6 +35,20 @@ pub const TYPE_INSTANCE: u32 = 6;
 pub const TYPE_PROCEDURAL: u32 = 7;
 pub const INVALID: u32 = u32::MAX;
 
+/// Byte offset of the build generation in the header (the root box node is at
+/// [`HEADER_BYTES`], so this is `root - 8`).
+pub const BUILD_ID_OFFSET: u64 = HEADER_BYTES - strata_shader::bma::BUILD_ID_BEFORE_ROOT;
+
+fn next_build_id() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    loop {
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
 /// Title memory access for the builder (by GPU address).
 pub struct Memory<'a> {
     pub read: Box<dyn Fn(u64, usize) -> Option<Vec<u8>> + 'a>,
@@ -64,6 +79,12 @@ impl Aabb {
     }
     fn centroid(&self) -> [f32; 3] {
         std::array::from_fn(|a| 0.5 * (self.min[a] + self.max[a]))
+    }
+    fn surface_area(&self) -> f32 {
+        let dx = (self.max[0] - self.min[0]).max(0.0);
+        let dy = (self.max[1] - self.min[1]).max(0.0);
+        let dz = (self.max[2] - self.min[2]).max(0.0);
+        2.0 * (dx * dy + dy * dz + dz * dx)
     }
 }
 
@@ -382,6 +403,36 @@ fn build_node(leaves: &[Leaf], items: &mut [usize]) -> Node {
     Node::Inner(children, bounds)
 }
 
+impl Node {
+    fn leaf_count(&self) -> usize {
+        match self {
+            Node::Leaf(_) => 1,
+            Node::Inner(c, _) => c.iter().map(Node::leaf_count).sum(),
+        }
+    }
+}
+
+/// IEEE half from `f32` (round-to-nearest; clamps to the finite range).
+fn f32_to_f16(v: f32) -> u16 {
+    let b = v.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    let man = b & 0x7f_ffff;
+    if exp <= 0 {
+        if exp < -10 {
+            return sign;
+        }
+        let m = (man | 0x80_0000) >> (1 - exp);
+        return sign | ((m + 0x1000) >> 13) as u16;
+    }
+    if exp >= 31 {
+        return sign | 0x7bff;
+    }
+    let h = ((exp as u32) << 10) | (man >> 13);
+    let round = (man >> 12) & 1;
+    sign | (h + round).min(0x7bff) as u16
+}
+
 fn count_inner(n: &Node) -> u64 {
     match n {
         Node::Leaf(_) => 0,
@@ -419,18 +470,26 @@ fn serialize(root: &Node, leaves: &[Leaf]) -> (Vec<u8>, u32) {
             ptr(HEADER_BYTES, TYPE_BOX)
         }
     };
-    while let Some((node, off)) = queue.pop_front() {
-        let Node::Inner(children, _) = node else {
+    // (node, byte offset, parent pointer, depth)
+    let mut queue: std::collections::VecDeque<(&Node, u64, u32, u16)> = queue
+        .into_iter()
+        .map(|(n, o)| (n, o, INVALID, 0u16))
+        .collect();
+    while let Some((node, off, parent, depth)) = queue.pop_front() {
+        let Node::Inner(children, parent_bounds) = node else {
             continue;
         };
+        let parent_sa = parent_bounds.surface_area().max(1e-12);
+        let self_ptr = ptr(off, TYPE_BOX);
         let o = off as usize;
+        let mut priors = [0u16; 4];
         for slot in 0..4 {
             let (p, b) = match children.get(slot) {
                 Some(Node::Leaf(i)) => (ptr(leaf_off[*i], leaves[*i].kind), leaves[*i].bounds),
                 Some(c @ Node::Inner(_, b)) => {
                     let child_off = next_box;
                     next_box += BOX_BYTES;
-                    queue.push_back((c, child_off));
+                    queue.push_back((c, child_off, self_ptr, depth.saturating_add(1)));
                     (ptr(child_off, TYPE_BOX), *b)
                 }
                 None => (
@@ -448,7 +507,19 @@ fn serialize(root: &Node, leaves: &[Leaf]) -> (Vec<u8>, u32) {
                 out[o + mn..o + mn + 4].copy_from_slice(&b.min[a].to_le_bytes());
                 out[o + mx..o + mx + 4].copy_from_slice(&b.max[a].to_le_bytes());
             }
+            if p != INVALID {
+                priors[slot] = f32_to_f16((b.surface_area() / parent_sa).clamp(0.0, 1.0));
+            }
         }
+        // Strata metadata in the Box32 trailer [112..128], which the RDNA2
+        // box test never reads (see `strata_shader::bvh::Box32Meta`).
+        let meta = strata_shader::bvh::Box32Meta {
+            parent,
+            depth,
+            leaf_count: node.leaf_count().min(u16::MAX as usize) as u16,
+            child_priors: priors,
+        };
+        out[o + 112..o + 128].copy_from_slice(&meta.to_bytes());
     }
     for (l, &off) in leaves.iter().zip(&leaf_off) {
         out[off as usize..off as usize + l.bytes.len()].copy_from_slice(&l.bytes);
@@ -502,12 +573,139 @@ pub fn build(mem: &Memory<'_>, b: &AccelBuild) -> Result<u64, String> {
     for x in bounds.min.iter().chain(&bounds.max) {
         header.extend_from_slice(&x.to_le_bytes());
     }
+    // Build generation at `HEADER_BYTES - 8` (just before the root box):
+    // BMA traversal shortcuts recorded against an older build are ignored.
+    header.extend_from_slice(&next_build_id().to_le_bytes());
     header.resize(HEADER_BYTES as usize, 0);
     bytes[..HEADER_BYTES as usize].copy_from_slice(&header);
     if !(mem.write)(b.dest, &bytes) {
         return Err(format!("destination 0x{:x} is not title memory", b.dest));
     }
     Ok(used)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SbvhTriangleHit {
+    pub node_pointer: u32,
+    pub geometry_index: u32,
+    pub primitive_index: u32,
+    pub t: f32,
+    pub barycentrics: [f32; 2],
+    /// Reference triangle instruction result bits, in destination VGPR order.
+    pub intersection_vgprs: [u32; 4],
+}
+
+/// Runs a hardware closest-hit query on a snapshot of a Strata-built opaque
+/// triangle BLAS, using an identity instance. The original SBVH leaf pointer
+/// and geometry/primitive IDs accompany the normalized Vulkan hit.
+pub fn query_sbvh_opaque(
+    runner: &strata_gpu::runner::ComputeRunner,
+    bytes: &[u8],
+    ray: &strata_shader::bvh::Ray,
+) -> Result<Option<SbvhTriangleHit>, String> {
+    let invalid = || "invalid or unsupported opaque triangle SBVH".to_string();
+    let word = |offset: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(
+            bytes.get(offset..offset + 4)?.try_into().ok()?,
+        ))
+    };
+    if word(0) != Some(MAGIC) || word(4) != Some(1) || word(24) != Some(0) {
+        return Err(invalid());
+    }
+    let box_count = word(16).ok_or_else(invalid)? as usize;
+    let root = word(20).ok_or_else(invalid)?;
+    let leaf_count = word(28).ok_or_else(invalid)? as usize;
+    let declared_size = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let header = HEADER_BYTES as usize;
+    let box_size = BOX_BYTES as usize;
+    let leaf_size = TRIANGLE_BYTES as usize;
+    let leaf_base = box_count
+        .checked_mul(box_size)
+        .and_then(|size| size.checked_add(header))
+        .ok_or_else(invalid)?;
+    let expected_size = leaf_count
+        .checked_mul(leaf_size)
+        .and_then(|size| size.checked_add(leaf_base))
+        .ok_or_else(invalid)?;
+    if declared_size != expected_size as u64 || bytes.len() < expected_size {
+        return Err(invalid());
+    }
+    if leaf_count == 0 {
+        return if root == INVALID && box_count == 0 {
+            Ok(None)
+        } else {
+            Err(invalid())
+        };
+    }
+
+    let mut stack = vec![root];
+    let mut visited = vec![false; box_count + leaf_count];
+    let mut triangles = Vec::with_capacity(leaf_count);
+    let mut leaves = Vec::with_capacity(leaf_count);
+    while let Some(node) = stack.pop() {
+        let offset = ((node & !7) as usize).checked_mul(8).ok_or_else(invalid)?;
+        let slot = match node & 7 {
+            TYPE_BOX
+                if (header..leaf_base).contains(&offset)
+                    && (offset - header).is_multiple_of(box_size) =>
+            {
+                (offset - header) / box_size
+            }
+            TYPE_TRIANGLE
+                if (leaf_base..expected_size).contains(&offset)
+                    && (offset - leaf_base).is_multiple_of(leaf_size) =>
+            {
+                box_count + (offset - leaf_base) / leaf_size
+            }
+            _ => return Err(invalid()),
+        };
+        if std::mem::replace(&mut visited[slot], true) {
+            return Err(invalid());
+        }
+        if slot < box_count {
+            stack.extend(
+                (0..4)
+                    .filter_map(|child| word(offset + child * 4))
+                    .filter(|&child| child != INVALID),
+            );
+        } else {
+            if word(offset + 44) != Some(1) {
+                return Err(invalid());
+            }
+            let triangle = std::array::from_fn(|vertex| {
+                std::array::from_fn(|axis| {
+                    f32::from_bits(word(offset + vertex * 12 + axis * 4).unwrap())
+                })
+            });
+            triangles.push(triangle);
+            leaves.push((node, word(offset + 36).unwrap(), word(offset + 40).unwrap()));
+        }
+    }
+    if visited.contains(&false) {
+        return Err(invalid());
+    }
+    let Some(hit) = runner
+        .query_opaque_triangles(&triangles, ray.origin, ray.dir, ray.t_max)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let &(node_pointer, geometry_index, primitive_index) = leaves
+        .get(hit.primitive as usize)
+        .ok_or("Vulkan returned an unknown triangle")?;
+    let [a, b, c] = triangles[hit.primitive as usize];
+    let registers = strata_shader::bvh::intersect_triangle(ray, a, b, c);
+    if !registers.iter().all(|v| v.is_finite()) || registers[1] == 0.0 {
+        return Err("hardware hit disagrees with the reference triangle test".into());
+    }
+    Ok(Some(SbvhTriangleHit {
+        node_pointer,
+        geometry_index,
+        primitive_index,
+        t: hit.t,
+        barycentrics: hit.barycentrics,
+        intersection_vgprs: registers.map(f32::to_bits),
+    }))
 }
 
 #[cfg(test)]
@@ -625,5 +823,199 @@ mod tests {
             }
         }
         assert_eq!(hit_prims, [7]);
+    }
+
+    #[test]
+    fn vulkan_ray_query_maps_hits_back_to_sbvh_leaves() {
+        let Ok(runner) = strata_gpu::runner::ComputeRunner::new() else {
+            eprintln!("Vulkan compute device unavailable");
+            return;
+        };
+        if !runner.ray_query {
+            eprintln!("Vulkan ray query unavailable");
+            return;
+        }
+        let bytes = grid_bvh(4);
+        let mut ray = Ray {
+            t_max: 20.0,
+            origin: [2.65, 1.25, 0.0],
+            dir: [0.0, 0.0, 1.0],
+            inv_dir: [f32::INFINITY, f32::INFINITY, 1.0],
+        };
+        let hit = query_sbvh_opaque(&runner, &bytes, &ray).unwrap().unwrap();
+        assert_eq!(hit.geometry_index, 0);
+        assert_eq!(hit.primitive_index, 12);
+        let offset = ((hit.node_pointer & !7) * 8) as usize;
+        let vertex = |i: usize| {
+            std::array::from_fn(|axis| {
+                let pos = offset + (i * 3 + axis) * 4;
+                f32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap())
+            })
+        };
+        let [t, den, u, v] =
+            strata_shader::bvh::intersect_triangle(&ray, vertex(0), vertex(1), vertex(2));
+        assert_eq!(hit.intersection_vgprs, [t, den, u, v].map(f32::to_bits));
+        assert!((hit.t - t / den).abs() < 1e-5);
+        assert!((hit.barycentrics[0] - u / den).abs() < 1e-5);
+        assert!((hit.barycentrics[1] - v / den).abs() < 1e-5);
+        ray.origin[0] = -1.0;
+        assert_eq!(query_sbvh_opaque(&runner, &bytes, &ray).unwrap(), None);
+        let mut corrupted = bytes.clone();
+        corrupted[offset + 44] = 0;
+        assert!(query_sbvh_opaque(&runner, &corrupted, &ray).is_err());
+    }
+
+    /// Builds a `n × n` grid of quads (two triangles each) over `[0, n)²`
+    /// at a gently varying height; returns the structure bytes.
+    fn grid_bvh(n: u32) -> Vec<u8> {
+        let mem_cells = RefCell::new(HashMap::new());
+        let mut verts = Vec::new();
+        let z = |x: f32, y: f32| 5.0 + 0.25 * ((x * 0.37).sin() + (y * 0.21).cos());
+        for qy in 0..n {
+            for qx in 0..n {
+                let (x, y) = (qx as f32, qy as f32);
+                let c = [
+                    [x, y, z(x, y)],
+                    [x + 1.0, y, z(x + 1.0, y)],
+                    [x, y + 1.0, z(x, y + 1.0)],
+                    [x + 1.0, y + 1.0, z(x + 1.0, y + 1.0)],
+                ];
+                for p in [c[0], c[1], c[2], c[2], c[1], c[3]] {
+                    for v in p {
+                        verts.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+        }
+        put(&mem_cells, 0x1000, &verts);
+        let mem = memory(&mem_cells);
+        let job = AccelBuild {
+            dest: 0x100_0000,
+            dest_size: 0,
+            top_level: false,
+            geometries: vec![AccelGeometry::Triangles {
+                transform: 0,
+                index_format: 0,
+                vertex_format: 6,
+                index_count: 0,
+                vertex_count: n * n * 6,
+                index_va: 0,
+                vertex_va: 0x1000,
+                vertex_stride: 12,
+                opaque: true,
+            }],
+            instances: (0, 0),
+        };
+        let used = build(&mem, &job).unwrap();
+        let m = mem_cells.borrow();
+        (0..used).map(|i| m[&(0x100_0000 + i)]).collect()
+    }
+
+    fn tri_leaf(bytes: &[u8], ray: &Ray, p: u32) -> Option<f32> {
+        let (off, _) = strata_shader::bma::decode_ptr(p);
+        let f = |i: usize| {
+            let o = off as usize + 4 * i;
+            f32::from_le_bytes(bytes[o..o + 4].try_into().unwrap())
+        };
+        let v = |k: usize| [f(3 * k), f(3 * k + 1), f(3 * k + 2)];
+        let [num, den, _, _] = strata_shader::bvh::intersect_triangle(ray, v(0), v(1), v(2));
+        let t = num / den;
+        (t.is_finite() && t >= 0.0 && t <= ray.t_max).then_some(t)
+    }
+
+    #[test]
+    fn box_trailer_carries_parent_depth_and_priors() {
+        let bytes = grid_bvh(8);
+        let bvh = strata_shader::bma::Box32Bvh {
+            bytes: &bytes,
+            root: HEADER_BYTES,
+        };
+        let build_id = u32::from_le_bytes(
+            bytes[BUILD_ID_OFFSET as usize..BUILD_ID_OFFSET as usize + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_ne!(build_id, 0);
+        let (root, meta) = bvh.node(HEADER_BYTES).unwrap();
+        assert_eq!(meta.parent, INVALID);
+        assert_eq!(meta.depth, 0);
+        assert_eq!(meta.leaf_count, 128);
+        let priors = meta.priors();
+        for (c, p) in root.children.iter().zip(priors) {
+            if *c != INVALID {
+                assert!(p > 0.0 && p <= 1.0, "prior {p}");
+            }
+        }
+        // Every box child points back at its parent, one level deeper.
+        for &c in &root.children {
+            let (off, kind) = strata_shader::bma::decode_ptr(c);
+            if c != INVALID && kind == TYPE_BOX {
+                let (_, m) = bvh.node(off).unwrap();
+                assert_eq!(m.parent, (HEADER_BYTES / 8) as u32 | TYPE_BOX);
+                assert_eq!(m.depth, 1);
+            }
+        }
+    }
+
+    /// The BMA pipeline (sampling, 3×3 mapping, shortcut traversal) on a
+    /// Strata-built BVH: far fewer box tests, near-identical hits.
+    #[test]
+    fn bma_shortcuts_cut_box_tests_with_matching_hits() {
+        use strata_shader::bma::{BmaConfig, Box32Bvh, render_reference};
+        let bytes = grid_bvh(32);
+        let bvh = Box32Bvh {
+            bytes: &bytes,
+            root: HEADER_BYTES,
+        };
+        let (w, h) = (128u32, 128u32);
+        let dir = [0.0f32, 0.0, -1.0];
+        let ray_at = |x: u32, y: u32| Ray {
+            t_max: 100.0,
+            origin: [(x as f32 + 0.5) / 4.0, (y as f32 + 0.5) / 4.0, 10.0],
+            dir,
+            inv_dir: dir.map(|d| if d == 0.0 { f32::INFINITY } else { 1.0 / d }),
+        };
+        let leaf = |r: &Ray, p: u32| tri_leaf(&bytes, r, p);
+        // Exact: every pixel from the root.
+        let mut exact = Vec::new();
+        let mut exact_tests = 0u64;
+        for y in 0..h {
+            for x in 0..w {
+                let r = ray_at(x, y);
+                let (hit, n) = bvh.closest_hit(HEADER_BYTES, &r, |p| leaf(&r, p), |_, _| {});
+                exact.push(hit);
+                exact_tests += u64::from(n);
+            }
+        }
+        let cfg = BmaConfig {
+            threshold: 0.9,
+            tile: 8,
+            ..BmaConfig::default()
+        };
+        let (bma, bma_tests) = render_reference(&bvh, &cfg, w, h, ray_at, leaf);
+        let same = exact
+            .iter()
+            .zip(&bma)
+            .filter(|(a, b)| a.map(|x| x.1) == b.map(|x| x.1))
+            .count();
+        let agree = same as f64 / exact.len() as f64;
+        eprintln!("BMA: {bma_tests} vs {exact_tests} box tests, {agree:.4} hits agree");
+        assert!(agree >= 0.98, "only {agree:.4} of pixels agree");
+        assert!(
+            bma_tests * 10 < exact_tests * 9,
+            "BMA {bma_tests} vs exact {exact_tests} box tests"
+        );
+        // Threshold 1.0 only shortcuts where all nine neighbours agree.
+        let strict = BmaConfig {
+            threshold: 1.0,
+            ..cfg
+        };
+        let (s, _) = render_reference(&bvh, &strict, w, h, ray_at, leaf);
+        let strict_same = exact
+            .iter()
+            .zip(&s)
+            .filter(|(a, b)| a.map(|x| x.1) == b.map(|x| x.1))
+            .count();
+        assert!(strict_same >= same);
     }
 }

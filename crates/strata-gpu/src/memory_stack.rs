@@ -68,6 +68,24 @@ impl BindlessFeedbackEvictor {
         self.resident_bytes
     }
 
+    pub fn high_water_bytes(&self) -> u64 {
+        self.high_water_bytes
+    }
+
+    pub fn set_watermarks(&mut self, high: u64, low: u64) {
+        self.high_water_bytes = high;
+        self.low_water_bytes = low.min(high);
+    }
+
+    /// Stops tracking `slot` (its resource was destroyed).
+    pub fn forget(&mut self, slot: u32) {
+        if let Some(e) = self.slots.remove(&slot)
+            && e.state == SlotState::Resident
+        {
+            self.resident_bytes = self.resident_bytes.saturating_sub(e.bytes);
+        }
+    }
+
     /// Record a descriptor write to `slot`. If the slot was evicted and the title
     /// writes the exact same `view_hash`, park it instead of re-allocating VRAM.
     pub fn on_write(&mut self, slot: u32, view_hash: u64, bytes: u64, now_sec: u64) -> SlotState {
@@ -109,23 +127,33 @@ impl BindlessFeedbackEvictor {
     /// Evict oldest eligible slots (those that lived the full `idle_window_s` unread)
     /// while `resident_bytes > high_water_bytes`, stopping once `<= low_water_bytes`.
     pub fn sweep(&mut self, now_sec: u64) -> Vec<u32> {
+        self.sweep_at_most(now_sec, usize::MAX, |_| true)
+    }
+
+    pub(crate) fn sweep_at_most(
+        &mut self,
+        now_sec: u64,
+        limit: usize,
+        eligible: impl Fn(u32) -> bool,
+    ) -> Vec<u32> {
         if self.resident_bytes <= self.high_water_bytes {
             return Vec::new();
         }
         let mut candidates: Vec<(u64, u32)> = self
             .slots
             .iter()
-            .filter(|(_, e)| {
+            .filter(|&(&slot, e)| {
                 e.state == SlotState::Resident
                     && now_sec.saturating_sub(e.created_sec) >= self.idle_window_s
                     && now_sec.saturating_sub(e.last_read_sec) >= self.idle_window_s
+                    && eligible(slot)
             })
             .map(|(&slot, e)| (e.last_read_sec, slot))
             .collect();
         candidates.sort_unstable();
 
         let mut evicted = Vec::new();
-        for (_, slot) in candidates {
+        for (_, slot) in candidates.into_iter().take(limit) {
             if self.resident_bytes <= self.low_water_bytes {
                 break;
             }

@@ -1,3 +1,4 @@
+mod run_metrics;
 mod smoke;
 
 use strata_gpu::context::probe_capabilities;
@@ -53,7 +54,7 @@ fn main() {
         }
         "run" => {
             let path = std::env::args().nth(2).unwrap_or_else(|| {
-                eprintln!("Usage: strata-cli run <path-to-exe> [--window] [--report FILE] [--capture FILE] [--capture-frame N] [--pipeline-cache FILE] [--no-prewarm|--cold-pipelines] [--unimplemented trap|zero|notimpl] [--mount D=C:/folder]... [--search-dir DIR] [--crash-log FILE]");
+                eprintln!("Usage: strata-cli run <path-to-exe> [--window] [--report FILE] [--frame-times CSV] [--capture FILE] [--capture-frame N] [--pipeline-cache FILE] [--no-prewarm|--cold-pipelines] [--unimplemented trap|zero|notimpl] [--mount D=C:/folder]... [--search-dir DIR] [--crash-log FILE]");
                 std::process::exit(1);
             });
             cmd_run(&path);
@@ -67,10 +68,13 @@ fn main() {
         }
         "translate" => {
             let path = std::env::args().nth(2).unwrap_or_else(|| {
-                eprintln!("Usage: strata-cli translate <shader-file-or-dir>");
+                eprintln!("Usage: strata-cli translate <shader-file-or-dir> [--write-baseline FILE | --check-baseline FILE]");
                 std::process::exit(1);
             });
-            cmd_translate(&path);
+            if let Err(error) = cmd_translate(&path) {
+                eprintln!("[FAIL] {error}");
+                std::process::exit(1);
+            }
         }
         "census" => {
             let path = std::env::args().nth(2).unwrap_or_else(|| {
@@ -399,32 +403,39 @@ fn cmd_config() {
 
 /// Runs every shader found under `path` through the compiler and ranks what
 /// blocks translation, with where each resource's descriptor comes from.
-fn cmd_translate(path: &str) {
+fn cmd_translate(path: &str) -> Result<(), String> {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
     use strata_shader::coverage::{Outcome, Summary, extract_programs, translate};
-    fn walk(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        if p.is_dir() {
-            if let Ok(rd) = std::fs::read_dir(p) {
-                let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
-                entries.sort();
-                for e in entries {
-                    walk(&e, out);
-                }
-            }
-        } else {
-            out.push(p.to_path_buf());
-        }
-    }
+    let args: Vec<_> = std::env::args().skip(3).collect();
+    let baseline = match args.as_slice() {
+        [] => None,
+        [flag, path] if flag == "--write-baseline" => Some((false, PathBuf::from(path))),
+        [flag, path] if flag == "--check-baseline" => Some((true, PathBuf::from(path))),
+        _ => return Err("expected --write-baseline FILE or --check-baseline FILE".into()),
+    };
+    let root = Path::new(path);
     let mut files = Vec::new();
-    walk(std::path::Path::new(path), &mut files);
+    collect_files(root, &mut files);
+    files.sort();
+    let base = if root.is_dir() { root } else { root.parent().unwrap_or(Path::new("")) };
     let mut summary = Summary::default();
+    let mut coverage = BTreeMap::<String, bool>::new();
     for file in &files {
-        let Ok(bytes) = std::fs::read(file) else {
-            continue;
+        let bytes = match std::fs::read(file) {
+            Ok(bytes) => bytes,
+            Err(error) if baseline.is_some() => return Err(format!("{}: {error}", file.display())),
+            Err(_) => continue,
         };
-        for program in extract_programs(&file.display().to_string(), &bytes) {
+        let name = file.strip_prefix(base).unwrap_or(file).to_string_lossy().replace('\\', "/");
+        for program in extract_programs(&name, &bytes) {
             let report = translate(&program);
             if let Outcome::Failed(why) = &report.outcome {
                 println!("[FAIL] {} ({} dw): {why}", report.source, report.dwords);
+            }
+            if baseline.is_some() {
+                let id = format!("{} [{:?}]", report.source, report.stage);
+                coverage.insert(id, matches!(&report.outcome, Outcome::Translated { .. }));
             }
             summary.add(&report);
         }
@@ -444,6 +455,32 @@ fn cmd_translate(path: &str) {
             println!("  {n:>6}  {class}");
         }
     }
+    if let Some((check, file)) = baseline {
+        if coverage.is_empty() {
+            return Err("coverage corpus contains no shaders".into());
+        }
+        if check {
+            let baseline = std::fs::read(&file).map_err(|error| format!("{}: {error}", file.display()))?;
+            let previous: BTreeMap<String, bool> = serde_json::from_slice(&baseline).map_err(|error| error.to_string())?;
+            if previous.is_empty() {
+                return Err("coverage baseline contains no shaders".into());
+            }
+            let regressions: Vec<_> = previous.iter().filter(|&(id, &ok)| {
+                ok && coverage.get(id) != Some(&true)
+            }).map(|(id, _)| id.as_str()).collect();
+            if !regressions.is_empty() {
+                for id in &regressions {
+                    eprintln!("[FAIL] Coverage regression: {id}");
+                }
+                return Err(format!("{} previously translated shaders regressed", regressions.len()));
+            }
+            println!("[PASS] Shader coverage baseline");
+        } else {
+            let bytes = serde_json::to_vec_pretty(&coverage).map_err(|error| error.to_string())?;
+            strata_gpu::present::write_atomic(&file, &bytes).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 /// Creates the pipeline of every cached shader ahead of play and saves the
@@ -867,6 +904,8 @@ struct GpuBox32Node {
     children: [u32; 4],
     bmin: [[f32; 3]; 4],
     bmax: [[f32; 3]; 4],
+    /// Box32 trailer (`strata_shader::bvh::Box32Meta`); zero priors here.
+    meta: [u32; 4],
 }
 
 fn test_gpu_bvh_oracle_parity(runner: &ComputeRunner) {
@@ -922,6 +961,7 @@ fn test_gpu_bvh_oracle_parity(runner: &ComputeRunner) {
                 children: node.children,
                 bmin: node.bounds_min,
                 bmax: node.bounds_max,
+                meta: [0; 4],
             };
             cpu_expected.push(bvh::intersect_box32(&ray, &node));
         }
@@ -932,6 +972,7 @@ fn test_gpu_bvh_oracle_parity(runner: &ComputeRunner) {
     pc.extend_from_slice(&nodes_buf.bda.to_le_bytes());
     pc.extend_from_slice(&res_buf.bda.to_le_bytes());
     pc.extend_from_slice(&(count as u32).to_le_bytes());
+    pc.extend_from_slice(&0.0f32.to_le_bytes()); // exact box test (no prior pruning)
 
     let bvh_words = bytes_to_u32_vec(BVH_ORACLE_SPV);
     runner
@@ -954,6 +995,301 @@ fn test_gpu_bvh_oracle_parity(runner: &ComputeRunner) {
     runner.free_bda_buffer(rays_buf);
     runner.free_bda_buffer(nodes_buf);
     runner.free_bda_buffer(res_buf);
+
+    // 8. SLANG `bma_mapping.slang` vs CPU `bma::map` (BMA Mapping stage):
+    // synthetic sampled paths over a 6x5 tile grid, two ray slots.
+    {
+        use strata_shader::bma::{self, BmaConfig, SamplePaths};
+        let cfg = BmaConfig {
+            rays: 2,
+            depth: 6,
+            threshold: 0.6,
+            ..BmaConfig::default()
+        };
+        let (tx_n, ty_n) = (6u32, 5u32);
+        let mut paths = SamplePaths::new(tx_n, ty_n, cfg.rays, cfg.depth);
+        let mut seed = 0x9e37_79b9u32;
+        for ty in 0..ty_n {
+            for tx in 0..tx_n {
+                for r in 0..cfg.rays {
+                    for d in 0..cfg.depth {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        // Shared prefix, then increasingly tile-specific nodes.
+                        let node = if d < 2 + (seed % 3) {
+                            128 * d
+                        } else {
+                            128 * (d * 64 + (tx / 2) + 8 * ty + (seed % 2))
+                        };
+                        paths.record(tx, ty, r, d, node);
+                    }
+                }
+            }
+        }
+        let expect = bma::map(&paths, &cfg);
+        let (size, paths_off) = bma::table_layout(tx_n, ty_n, cfg.rays, cfg.depth);
+        let mut table = runner.alloc_bda_buffer(size).unwrap();
+        unsafe {
+            let bytes = table.as_mut_slice::<u8>(size as usize);
+            bytes.fill(0);
+            bytes[..64].copy_from_slice(&bma::table_header(&cfg, tx_n, ty_n, 0, true));
+            for (i, v) in paths.data.iter().enumerate() {
+                let o = paths_off as usize + 4 * i;
+                bytes[o..o + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            // A non-zero sampled generation the map pass must publish.
+            bytes[40..44].copy_from_slice(&7u32.to_le_bytes());
+        }
+        let entries = tx_n * ty_n * cfg.rays;
+        let mut pc = Vec::new();
+        pc.extend_from_slice(&table.bda.to_le_bytes());
+        pc.extend_from_slice(&0u64.to_le_bytes());
+        pc.extend_from_slice(&cfg.threshold.to_le_bytes());
+        pc.extend_from_slice(&0u32.to_le_bytes()); // mode: map
+        pc.extend_from_slice(&0u32.to_le_bytes());
+        pc.extend_from_slice(&entries.to_le_bytes());
+        for k in cfg.kernel_flat() {
+            pc.extend_from_slice(&k.to_le_bytes());
+        }
+        let words = bytes_to_u32_vec(strata_runtime_shaders::BMA_MAPPING_SPV);
+        runner
+            .dispatch_spirv(&words, &pc, [entries.div_ceil(64), 1, 1])
+            .expect("bma_mapping.slang GPU dispatch failed");
+        unsafe {
+            let got = table.as_slice::<u32>(size as usize / 4);
+            assert_eq!(got[1], 7, "map build generation not published");
+            assert_eq!(&got[16..16 + entries as usize], &expect.entries[..]);
+        }
+        println!(
+            "[PASS] Slang bma_mapping.slang vs Rust CPU bma::map: {entries} tile/ray entries match ({} shortcuts)",
+            expect.mapped()
+        );
+        runner.free_bda_buffer(table);
+    }
+
+    // 8b. A BMA-instrumented RDNA2 `image_bvh64_intersect_ray` through the
+    // runner (spec-constant table address; BMA off unless STRATA_BVH_BMA):
+    // results must stay bit-exact with the CPU box test.
+    {
+        use strata_shader::{opt, rdna2, spirv, ssa, wave};
+        let mut prog = vec![encode::v_lshlrev_b32_imm(1, 6, 0)];
+        for k in 0..12u8 {
+            prog.extend_from_slice(&encode::global_load_dword(8 + k, 1, 0, 4 * u16::from(k)));
+        }
+        prog.push(encode::s_waitcnt());
+        prog.extend_from_slice(&encode::image_bvh64_intersect_ray(20, 8, 0));
+        prog.push(encode::v_lshlrev_b32_imm(2, 4, 0));
+        prog.push(encode::s_waitcnt());
+        for k in 0..4u8 {
+            prog.extend_from_slice(&encode::global_store_dword(2, 20 + k, 2, 4 * u16::from(k)));
+        }
+        prog.push(encode::s_endpgm());
+        let decoded = rdna2::decode_program(&prog).unwrap();
+        let wl = wave::analyze_wave_liveness(&decoded);
+        let mut m =
+            ssa::build_ssa_with(&decoded, &wl, [64, 1, 1], &ssa::BuildOptions::default()).unwrap();
+        m.bma = true;
+        opt::optimize(&mut m);
+        let words = spirv::emit_spirv(&m);
+        assert!(strata_gpu::bma::uses_bma_table(&words));
+
+        let lanes = 64usize;
+        let mut nodes_buf = runner.alloc_bda_buffer((lanes * 128) as u64).unwrap();
+        let mut in_buf = runner.alloc_bda_buffer((lanes * 64) as u64).unwrap();
+        let out_buf = runner.alloc_bda_buffer((lanes * 16) as u64).unwrap();
+        let mut expect = Vec::new();
+        let nodes_bda = nodes_buf.bda;
+        unsafe {
+            let nodes = nodes_buf.as_mut_slice::<u8>(lanes * 128);
+            let input = in_buf.as_mut_slice::<u32>(lanes * 16);
+            for i in 0..lanes {
+                let zf = 3.0 + i as f32 * 0.25;
+                let node = bvh::Box32Node {
+                    children: [10 + i as u32, 20, 30 + i as u32, bvh::INVALID_NODE],
+                    bounds_min: [
+                        [-1.0, -1.0, zf + 4.0],
+                        [-1.0, -1.0, zf],
+                        [4.0, 4.0, 4.0],
+                        [0.0; 3],
+                    ],
+                    bounds_max: [
+                        [1.0, 1.0, zf + 5.0],
+                        [1.0, 1.0, zf + 1.0],
+                        [5.0, 5.0, 5.0],
+                        [0.0; 3],
+                    ],
+                };
+                let o = i * 128;
+                for c in 0..4 {
+                    nodes[o + 4 * c..o + 4 * c + 4]
+                        .copy_from_slice(&node.children[c].to_le_bytes());
+                    for a in 0..3 {
+                        let mn = o + 16 + 12 * c + 4 * a;
+                        let mx = o + 64 + 12 * c + 4 * a;
+                        nodes[mn..mn + 4].copy_from_slice(&node.bounds_min[c][a].to_le_bytes());
+                        nodes[mx..mx + 4].copy_from_slice(&node.bounds_max[c][a].to_le_bytes());
+                    }
+                }
+                let ray = bvh::Ray {
+                    t_max: 100.0,
+                    origin: [0.0, 0.0, 0.0],
+                    dir: [0.0, 0.0, 1.0],
+                    inv_dir: [f32::INFINITY, f32::INFINITY, 1.0],
+                };
+                expect.push(bvh::intersect_box32(&ray, &node));
+                let addr = nodes_bda + o as u64;
+                let v = &mut input[i * 16..i * 16 + 12];
+                v[0] = addr as u32;
+                v[1] = (addr >> 32) as u32;
+                v[2] = ray.t_max.to_bits();
+                for a in 0..3 {
+                    v[3 + a] = ray.origin[a].to_bits();
+                    v[6 + a] = ray.dir[a].to_bits();
+                    v[9 + a] = ray.inv_dir[a].to_bits();
+                }
+            }
+        }
+        let mut sgprs = [0u32; 32];
+        sgprs[0] = in_buf.bda as u32;
+        sgprs[1] = (in_buf.bda >> 32) as u32;
+        sgprs[2] = out_buf.bda as u32;
+        sgprs[3] = (out_buf.bda >> 32) as u32;
+        let push: Vec<u8> = sgprs.iter().flat_map(|w| w.to_le_bytes()).collect();
+        runner
+            .dispatch_spirv(&words, &push, [1, 1, 1])
+            .expect("BMA-instrumented box test dispatch failed");
+        unsafe {
+            let got = out_buf.as_slice::<[u32; 4]>(lanes);
+            for i in 0..lanes {
+                assert_eq!(got[i], expect[i], "BMA-instrumented box test lane {i}");
+            }
+        }
+        println!(
+            "[PASS] BMA-instrumented RDNA2 image_bvh64_intersect_ray (spec-constant table, {}): 64/64 lanes bit-exact on GPU",
+            if strata_shader::bma::shader_instrumentation_enabled() {
+                "BMA on"
+            } else {
+                "BMA off"
+            }
+        );
+        runner.free_bda_buffer(nodes_buf);
+        runner.free_bda_buffer(in_buf);
+        runner.free_bda_buffer(out_buf);
+    }
+
+    // 9. GPU texture detile + upload (TextureCache's GPU path) vs the CPU
+    // detiler: a Morton RGBA8 mip chain, read back from the Vulkan image.
+    {
+        use strata_gpu::images::{ImageShape, ImageSpec};
+        use strata_gpu::texture::TextureCache;
+        use strata_shader::descriptor::{ImageDescriptor, ImageKind, Select};
+        let d = ImageDescriptor {
+            base_address: 0,
+            format: 56,
+            width: 200,
+            height: 120,
+            depth: 1,
+            kind: ImageKind::Tex2D,
+            sw_mode: 9,
+            select: [Select::X, Select::Y, Select::Z, Select::W],
+            base_level: 0,
+            last_level: 3,
+            base_array: 0,
+        };
+        let model = TextureCache::model(&d.encode(), None).unwrap();
+        let src: Vec<u8> = (0..model.footprint().unwrap())
+            .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+            .collect();
+        let cpu = model.detile_levels(&src).unwrap();
+        let (jobs, tight_len) = model.gpu_detile_jobs().unwrap();
+        let img = runner
+            .create_image(&ImageSpec {
+                format: model.format,
+                width: d.width,
+                height: d.height,
+                shape: ImageShape::D2 { layers: 1 },
+                mips: model.levels,
+                storage: false,
+                components: Default::default(),
+            })
+            .unwrap();
+        runner
+            .upload_image_detiled_gpu(&img, &src, &jobs, tight_len, model.block)
+            .expect("GPU detile upload failed");
+        let back = runner
+            .read_image_levels(&img, tight_len, model.block)
+            .unwrap();
+        assert_eq!(back, cpu, "GPU-detiled image differs from the CPU detiler");
+        runner.destroy_image(img);
+
+        // The same levels through the dedicated transfer queue: fence-gated
+        // upload, queue-family release/acquire, then read back.
+        if runner.has_transfer_queue() {
+            let img2 = runner
+                .create_image(&ImageSpec {
+                    format: model.format,
+                    width: d.width,
+                    height: d.height,
+                    shape: ImageShape::D2 { layers: 1 },
+                    mips: model.levels,
+                    storage: false,
+                    components: Default::default(),
+                })
+                .unwrap();
+            let pending = runner
+                .upload_image_levels_async(&img2, &cpu, model.block)
+                .expect("async upload")
+                .expect("transfer queue");
+            let mut polls = 0u32;
+            while !runner.upload_ready(&pending).expect("poll transfer fence") && polls < 1_000_000
+            {
+                polls += 1;
+                std::hint::spin_loop();
+            }
+            runner.finish_upload(pending).expect("finish upload");
+            let back2 = runner
+                .read_image_levels(&img2, tight_len, model.block)
+                .unwrap();
+            assert_eq!(back2, cpu, "transfer-queue upload differs");
+            runner.destroy_image(img2);
+            println!(
+                "[PASS] Async transfer-queue texture upload (fence + queue-family handoff, {polls} polls): image bytes match"
+            );
+
+            // Through TextureCache: the first bind shows the placeholder,
+            // later binds the uploaded image (show after the fence).
+            let mut cache = TextureCache::new();
+            cache.set_async_upload_min(0);
+            let words = d.encode();
+            let read = |_a: u64, n: usize| Some(src[..n].to_vec());
+            let first = cache.texture(runner, words, false, &read).unwrap();
+            let pending = cache.pending_uploads();
+            cache
+                .settle_uploads(runner)
+                .expect("settle texture uploads");
+            let later = cache.texture(runner, words, false, &read).unwrap();
+            let real = cache.image(&words).unwrap();
+            assert_eq!(later, real.view);
+            assert_eq!(pending, 1, "first bind did not start an async upload");
+            assert_ne!(first, real.view, "first bind should show the placeholder");
+            let back3 = runner
+                .read_image_levels(real, tight_len, model.block)
+                .unwrap();
+            assert_eq!(back3, cpu, "TextureCache async upload differs");
+            println!(
+                "[PASS] TextureCache async upload: placeholder first ({} placeholder binds), uploaded image after the fence",
+                cache.placeholder_binds
+            );
+            cache.destroy(runner);
+        } else {
+            println!("[SKIP] Async transfer-queue upload: no dedicated transfer queue");
+        }
+        println!(
+            "[PASS] GPU detile.slang -> vkCmdCopyBufferToImage ({} levels, {} B): image bytes match the CPU detiler",
+            model.levels, tight_len
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -1226,6 +1562,7 @@ fn cmd_run(path: &str) {
     let mut capture = None;
     let mut capture_frame = 1u64;
     let mut report = None;
+    let mut frame_times = None;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--window" {
@@ -1264,6 +1601,7 @@ fn cmd_run(path: &str) {
             "--search-dir" => opts.search_dir = Some(value.into()),
             "--crash-log" => opts.crash_reporter = Some(Some(value.into())),
             "--report" => report = Some(std::path::PathBuf::from(value)),
+            "--frame-times" => frame_times = Some(std::path::PathBuf::from(value)),
             "--pipeline-cache" => cache_seed = Some(std::path::PathBuf::from(value)),
             "--capture" => capture = Some(std::path::PathBuf::from(value)),
             "--capture-frame" => {
@@ -1294,18 +1632,17 @@ fn cmd_run(path: &str) {
         std::process::exit(1);
     }
     strata_hle::pipeline_cache::configure(cache_dir, prewarm, cache_seed);
-    let metrics = std::sync::Arc::new(std::sync::Mutex::new((None, Vec::new())));
-    let start = std::time::Instant::now();
-    if report.is_some() {
+    let metrics = run_metrics::RunMetrics::new(frame_times.as_deref()).unwrap_or_else(|error| {
+        eprintln!("[FAIL] Frame timing CSV: {error}");
+        std::process::exit(1);
+    });
+    let metrics = std::sync::Arc::new(std::sync::Mutex::new(metrics));
+    if report.is_some() || frame_times.is_some() {
+        strata_gpu::perf::enable();
         let data = metrics.clone();
-        strata_hle::thunks::set_present_hook(move |_| {
-            let mut metrics = data.lock().unwrap();
+        strata_hle::thunks::set_present_hook(move |frame| {
             let (_, shown) = strata_hle::thunks::frame_counts();
-            if shown as usize > metrics.1.len() {
-                let ms = start.elapsed().as_secs_f64() * 1000.0;
-                metrics.0.get_or_insert(ms);
-                metrics.1.push(ms);
-            }
+            data.lock().unwrap().present(frame, shown);
         });
     }
     if enable_window {
@@ -1350,10 +1687,14 @@ fn cmd_run(path: &str) {
         None
     };
     strata_hle::pipeline_cache::flush();
+    let metrics = metrics.lock().unwrap();
+    if let Some(error) = &metrics.csv_error {
+        eprintln!("[FAIL] Frame timing CSV: {error}");
+        std::process::exit(1);
+    }
     if let Some(report_path) = report {
         let (present_calls, frames_shown) = strata_hle::thunks::frame_counts();
-        let metrics = metrics.lock().unwrap();
-        let intervals: Vec<_> = metrics.1.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        let intervals = metrics.visible_intervals();
         let devices: Vec<_> = strata_hle::pipeline_cache::stats().into_iter().map(|device| {
             let s = device.pipelines;
             let uma = device.transfers;
@@ -1367,8 +1708,11 @@ fn cmd_run(path: &str) {
             "capture_error": capture_error,
             "exit_code": result.as_ref().ok(), "title_error": result.as_ref().err().map(ToString::to_string),
             "unimplemented_stub_calls": strata_hle::thunks::unimplemented_stub_call_count(),
-            "present_calls": present_calls, "frames_shown": frames_shown, "first_visible_frame_ms": metrics.0,
+            "present_calls": present_calls, "frames_shown": frames_shown, "first_visible_frame_ms": metrics.first_visible_ms(),
             "frame_ms_p50": smoke::percentile(&intervals, 0.50), "frame_ms_p95": smoke::percentile(&intervals, 0.95),
+            "frame_ms_p99": smoke::percentile(&intervals, 0.99), "frame_ms_p999": smoke::percentile(&intervals, 0.999),
+            "frames_over_50ms": intervals.iter().filter(|&&ms| ms > 50.0).count(),
+            "frames_over_100ms": intervals.iter().filter(|&&ms| ms > 100.0).count(),
             "devices": devices});
         if let Err(error) = smoke::write_report(Some(&report_path), &data) {
             eprintln!("[FAIL] Run report: {error}");

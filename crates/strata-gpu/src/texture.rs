@@ -384,6 +384,27 @@ fn fnv(bytes: &[u8]) -> u64 {
 struct Entry {
     image: GpuImage,
     hash: u64,
+    base_address: u64,
+    footprint: usize,
+    /// A logged write overlapped the texture since it was last verified.
+    dirty: bool,
+    /// Its memory is write-watched ([`crate::dirty_log::is_watched`]), so
+    /// "not dirty" means unchanged and the bind can skip re-reading.
+    watched: bool,
+    /// Eviction slot (`0`: never evicted — storage images and depth
+    /// targets hold GPU-written contents).
+    slot: u32,
+    /// The first upload still running on the transfer queue: the texture
+    /// binds a placeholder until it finishes ("show after").
+    pending: Option<crate::images::PendingUpload>,
+}
+
+/// Finishes `e`'s transfer-queue upload, if any (blocking if still running).
+fn settle(runner: &ComputeRunner, e: &mut Entry) -> Result<(), GpuError> {
+    if let Some(p) = e.pending.take() {
+        runner.finish_upload(p)?;
+    }
+    Ok(())
 }
 
 /// Reads `len` bytes of title memory at an address (`None` if unreadable).
@@ -462,6 +483,42 @@ impl SurfaceModel {
         Ok(out)
     }
 
+    /// [`Self::detile_all`]: title-memory bytes to tightly packed levels.
+    pub fn detile_levels(&self, src: &[u8]) -> Result<Vec<u8>, TextureError> {
+        self.detile_all(src)
+    }
+
+    /// The `detile.slang` jobs for every level and slice, and the packed
+    /// size, when the GPU detiler reproduces [`Self::detile_all`] exactly:
+    /// 8×8 Morton surfaces with 1, 2, 4, 8 or 16-byte elements.
+    pub fn gpu_detile_jobs(&self) -> Option<(Vec<crate::images::GpuDetileJob>, usize)> {
+        if !matches!(self.bpe, 1 | 2 | 4 | 8 | 16) {
+            return None;
+        }
+        let mut jobs = Vec::new();
+        let mut cursor = 0usize;
+        for m in self.first_level..self.first_level + self.levels {
+            let (d, tiling, foot) = self.slice_layout(m).ok()?;
+            if !matches!(tiling, Tiling::Morton) {
+                return None;
+            }
+            let mut at = self.level_offset(m).ok()?;
+            for _ in 0..self.slices(m) {
+                jobs.push(crate::images::GpuDetileJob {
+                    src_offset: at as u64,
+                    dst_offset: cursor as u64,
+                    width: d.width,
+                    height: d.height,
+                    bpp: self.bpe as u32,
+                    mode: 1,
+                });
+                cursor += (d.width * d.height) as usize * self.bpe;
+                at += foot;
+            }
+        }
+        Some((jobs, cursor))
+    }
+
     /// The inverse of [`Self::detile_all`], into `dst` (keeps bytes the
     /// model does not cover, such as linear row padding).
     fn retile_all(&self, tight: &[u8], dst: &mut [u8]) -> Result<(), TextureError> {
@@ -502,14 +559,115 @@ pub fn trailer_flags(w: &[u32; 8]) -> Option<u32> {
     (w[5] & 0xffff_0000 == TRAILER_MAGIC).then_some(w[5] & 0xffff)
 }
 
-/// Vulkan images and samplers for the descriptors titles use.
-#[derive(Default)]
+/// Vulkan images and samplers for the descriptors titles use, with integrated
+/// dirty-range tracking, persistent [`crate::texstore::TextureStore`] caching,
+/// [`crate::memory_stack::BindlessFeedbackEvictor`] VRAM eviction, and
+/// [`crate::memory_stack::MemoryTelemetry`] latency histograms.
+type TextureKey = ([u32; 5], i32);
+
 pub struct TextureCache {
     /// By the T#'s first five dwords (address, format, size, tiling, selects,
     /// levels, depth) and, for depth targets, the depth format.
     textures: HashMap<([u32; 5], i32), Entry>,
     samplers: HashMap<([u32; 4], Option<u8>), vk::Sampler>,
+    key_by_slot: HashMap<u32, ([u32; 5], i32)>,
+    next_slot: u32,
+    /// Title-memory writes since the last bind ([`crate::dirty_log`]).
+    dirty: Option<std::sync::Arc<crate::dirty_log::DirtyQueue>>,
+    epoch: std::time::Instant,
+    clock_sec: u64,
+    /// Detile on the GPU (`detile.slang`) for Morton surfaces of at least
+    /// this many bytes (`usize::MAX`: never).
+    gpu_detile_min: usize,
+    store: Option<crate::texstore::TextureStore>,
+    evictor: crate::memory_stack::BindlessFeedbackEvictor,
+    pub telemetry: crate::memory_stack::MemoryTelemetry,
     pub uploads: u64,
+    pub clean_skips: u64,
+    pub store_hits: u64,
+    pub evicted_images: u64,
+    pub gpu_detiles: u64,
+    /// First uploads started on the transfer queue.
+    pub async_uploads: u64,
+    /// Binds that showed a placeholder while an upload ran.
+    pub placeholder_binds: u64,
+    /// Sampled textures at least this large upload asynchronously
+    /// (`usize::MAX`: never).
+    async_min: usize,
+    staging_limit: u64,
+    pending_bytes: u64,
+    pending_order: std::collections::BTreeSet<(std::time::Instant, TextureKey)>,
+    configured_budget: u64,
+    pressure: bool,
+    streaming: StreamingStats,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StreamingStats {
+    pub heap_usage: u64,
+    pub heap_budget: u64,
+    pub commit_available: u64,
+    pub resident_bytes: u64,
+    pub oldest_upload_ms: u64,
+}
+
+/// Default sampled-texture VRAM budget: `STRATA_TEXTURE_BUDGET_MB`, else
+/// 4 GiB (fits 8–16 GB cards next to render targets and buffers).
+fn texture_budget_bytes() -> u64 {
+    std::env::var("STRATA_TEXTURE_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&mb| mb >= 64)
+        .map_or(4 << 30, |mb| mb << 20)
+}
+
+/// `STRATA_GPU_DETILE=0` keeps detiling on the CPU.
+fn gpu_detile_min_bytes() -> usize {
+    match std::env::var("STRATA_GPU_DETILE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("0" | "off" | "false") => usize::MAX,
+        _ => 256 << 10,
+    }
+}
+
+impl Default for TextureCache {
+    fn default() -> Self {
+        let budget = texture_budget_bytes();
+        Self {
+            textures: HashMap::new(),
+            samplers: HashMap::new(),
+            key_by_slot: HashMap::new(),
+            next_slot: 1,
+            dirty: None,
+            epoch: std::time::Instant::now(),
+            clock_sec: 0,
+            gpu_detile_min: gpu_detile_min_bytes(),
+            store: None,
+            // Textures unread for 30 s go first once the budget is exceeded,
+            // down to 75 % of it.
+            evictor: {
+                crate::memory_stack::BindlessFeedbackEvictor::new(30, budget, budget / 4 * 3)
+            },
+            telemetry: crate::memory_stack::MemoryTelemetry::default(),
+            uploads: 0,
+            clean_skips: 0,
+            store_hits: 0,
+            evicted_images: 0,
+            gpu_detiles: 0,
+            async_uploads: 0,
+            placeholder_binds: 0,
+            async_min: 1 << 20,
+            staging_limit: 64 << 20,
+            pending_bytes: 0,
+            pending_order: Default::default(),
+            configured_budget: budget,
+            pressure: false,
+            streaming: StreamingStats::default(),
+        }
+    }
 }
 
 fn key(words: &[u32; 8], depth: Option<vk::Format>) -> ([u32; 5], i32) {
@@ -523,6 +681,15 @@ fn key(words: &[u32; 8], depth: Option<vk::Format>) -> ([u32; 5], i32) {
 
 /// The Vulkan format a T#'s format code reads as, its element size and
 /// block size (`None`: Strata does not read it).
+pub fn rgba8_order(format: vk::Format, bgra: bool, srgb: bool) -> vk::Format {
+    match (format, bgra, srgb) {
+        (vk::Format::R8G8B8A8_UNORM, true, true) => vk::Format::B8G8R8A8_SRGB,
+        (vk::Format::R8G8B8A8_UNORM, true, false) => vk::Format::B8G8R8A8_UNORM,
+        (vk::Format::R8G8B8A8_UNORM, false, true) => vk::Format::R8G8B8A8_SRGB,
+        _ => format,
+    }
+}
+
 pub fn texel_format(code: u16) -> Result<(vk::Format, usize, u32), TextureError> {
     if let Some(f) = bc_format(code) {
         return Ok((f, bcn_block_bytes(f), 4));
@@ -587,6 +754,160 @@ impl TextureCache {
         Self::default()
     }
 
+    /// Trust the title-memory write log ([`crate::dirty_log`]): a cached
+    /// texture in write-watched memory that no logged write touched is bound
+    /// without re-reading and re-hashing its footprint. Textures outside
+    /// watched memory are always verified.
+    pub fn set_dirty_tracking(&mut self, enabled: bool) {
+        self.dirty = enabled.then(crate::dirty_log::subscribe);
+        for e in self.textures.values_mut() {
+            e.dirty = true;
+        }
+    }
+
+    /// Upload new sampled textures of at least `min_bytes` on the transfer
+    /// queue (`usize::MAX` disables; needs a device transfer queue).
+    pub fn set_async_upload_min(&mut self, min_bytes: usize) {
+        self.async_min = min_bytes;
+    }
+
+    /// Detile Morton surfaces of at least `min_bytes` on the GPU
+    /// (`usize::MAX` disables).
+    pub fn set_gpu_detile_min(&mut self, min_bytes: usize) {
+        self.gpu_detile_min = min_bytes;
+    }
+
+    /// Applies logged writes to the cached entries.
+    fn apply_dirty_log(&mut self) {
+        let Some(q) = &self.dirty else { return };
+        let d = q.drain();
+        if d.everything {
+            for e in self.textures.values_mut() {
+                e.dirty = true;
+            }
+        }
+        for (a, n) in d.ranges {
+            self.mark_dirty_range(a, n);
+        }
+    }
+
+    /// Attach a persistent on-disk [`crate::texstore::TextureStore`] for detiled
+    /// texture caching across runs.
+    pub fn attach_store(&mut self, store: crate::texstore::TextureStore) {
+        self.store = Some(store);
+    }
+
+    /// Configure bindless feedback VRAM eviction thresholds.
+    pub fn configure_eviction(
+        &mut self,
+        idle_window_s: u64,
+        high_water_bytes: u64,
+        low_water_bytes: u64,
+    ) {
+        self.configured_budget = high_water_bytes;
+        self.evictor = crate::memory_stack::BindlessFeedbackEvictor::new(
+            idle_window_s,
+            high_water_bytes,
+            low_water_bytes,
+        );
+    }
+
+    /// Advance the logical texture-streaming clock (in seconds).
+    pub fn set_clock_sec(&mut self, now_sec: u64) {
+        self.clock_sec = now_sec;
+    }
+
+    /// Mark any cached textures overlapping `[addr, addr + len)` as dirty so
+    /// their next bind re-reads and uploads updated mip bytes.
+    pub fn mark_dirty_range(&mut self, addr: u64, len: u64) {
+        let end = addr.saturating_add(len);
+        for entry in self.textures.values_mut() {
+            let e_end = entry.base_address.saturating_add(entry.footprint as u64);
+            if entry.base_address < end && addr < e_end {
+                entry.dirty = true;
+            }
+        }
+    }
+
+    /// Evict idle GPU textures above the VRAM high-water mark, destroying their
+    /// Vulkan `VkImage`s to reclaim VRAM immediately. Binds do this on their
+    /// own whenever an upload takes the cache over budget.
+    pub fn evict_idle(&mut self, runner: &ComputeRunner, now_sec: u64) -> usize {
+        self.clock_sec = now_sec;
+        let slots = self.evictor.sweep_at_most(now_sec, 8, |slot| {
+            self.key_by_slot.get(&slot).and_then(|key| self.textures.get(key))
+                .is_some_and(|entry| entry.pending.is_none())
+        });
+        let mut count = 0usize;
+        for slot in slots {
+            self.evictor.forget(slot);
+            if let Some(k) = self.key_by_slot.remove(&slot)
+                && let Some(entry) = self.textures.remove(&k)
+            {
+                self.telemetry.vram_textures_bytes = self
+                    .telemetry
+                    .vram_textures_bytes
+                    .saturating_sub(entry.footprint as u64);
+                let mut entry = entry;
+                let _ = settle(runner, &mut entry);
+                runner.destroy_image(entry.image);
+                self.evicted_images += 1;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Reclaims completed staging and idle textures between frames.
+    pub fn maintain_streaming(&mut self, runner: &ComputeRunner) {
+        const GIB: u64 = 1 << 30;
+        let heap = runner.texture_heap_budget();
+        let commit = crate::residency::available_commit_bytes();
+        let (usage, budget) = heap.unwrap_or_default();
+        let (heap_pressure, heap_recovery) = (budget / 10 * 9, budget / 10 * 8);
+        if self.pressure {
+            self.pressure = (budget > 0 && usage >= heap_recovery)
+                || commit.is_some_and(|bytes| bytes < 5 * GIB);
+        } else {
+            self.pressure = (budget > 0 && usage >= heap_pressure)
+                || commit.is_some_and(|bytes| bytes < 3 * GIB);
+        }
+        self.staging_limit = if self.pressure { 16 << 20 } else { 64 << 20 };
+        self.streaming = StreamingStats {
+            heap_usage: usage,
+            heap_budget: budget,
+            commit_available: commit.unwrap_or_default(),
+            resident_bytes: self.telemetry.vram_textures_bytes,
+            oldest_upload_ms: self.pending_order.first().map_or(0, |(start, _)| start.elapsed().as_millis() as u64),
+        };
+        // Transfers use one FIFO queue. An unfinished oldest transfer also
+        // means that newer uploads have yet to signal.
+        for _ in 0..8 {
+            let Some(&(_, key)) = self.pending_order.first() else { break };
+            let upload = self.textures[&key].pending.as_ref().unwrap();
+            if matches!(runner.upload_ready(upload), Ok(false)) {
+                break;
+            }
+            if let Err(error) = self.settle_entry(runner, key) {
+                crate::perf::binding_errors(1);
+                eprintln!("texture upload: {error}");
+            }
+        }
+        let resident = self.evictor.resident_bytes();
+        let goal = if self.pressure {
+            let reclaim = usage.saturating_sub(heap_recovery);
+            self.configured_budget.min(resident.saturating_sub(reclaim.max(resident / 8)))
+        } else {
+            self.configured_budget
+        };
+        self.evictor.set_watermarks(goal, goal / 4 * 3);
+        self.evict_idle(runner, self.epoch.elapsed().as_secs());
+    }
+
+    pub fn streaming_stats(&self) -> StreamingStats {
+        self.streaming
+    }
+
     /// The memory model of a T#, with `format` overriding its format (depth
     /// targets).
     pub fn model(
@@ -600,19 +921,8 @@ impl TextureCache {
         };
         // Host-built T#s say how the bytes are really stored (BGRA order,
         // sRGB encoding) in Strata's trailer.
-        let format = match (trailer_flags(words), format) {
-            (Some(f), vk::Format::R8G8B8A8_UNORM) if f & TRAILER_BGRA != 0 => {
-                if f & TRAILER_SRGB != 0 {
-                    vk::Format::B8G8R8A8_SRGB
-                } else {
-                    vk::Format::B8G8R8A8_UNORM
-                }
-            }
-            (Some(f), vk::Format::R8G8B8A8_UNORM) if f & TRAILER_SRGB != 0 => {
-                vk::Format::R8G8B8A8_SRGB
-            }
-            (_, f) => f,
-        };
+        let flags = trailer_flags(words).unwrap_or_default();
+        let format = rgba8_order(format, flags & TRAILER_BGRA != 0, flags & TRAILER_SRGB != 0);
         let first_level = u32::from(d.base_level);
         let levels = u32::from(d.last_level).saturating_sub(first_level) + 1;
         Ok(SurfaceModel {
@@ -631,6 +941,16 @@ impl TextureCache {
         Self::model(words, None)
     }
 
+    /// Resolve a color attachment at full fidelity, including its first upload.
+    pub fn color_target(
+        &mut self,
+        runner: &ComputeRunner,
+        words: [u32; 8],
+        read: ReadFn<'_>,
+    ) -> Result<&GpuImage, TextureError> {
+        self.entry(runner, words, false, None, read)
+    }
+
     /// The image for a T# (`depth`: as a depth/stencil target of that
     /// format), created or refreshed from title memory. `storage`: a
     /// shader writes it (the image gets `STORAGE` usage).
@@ -642,6 +962,39 @@ impl TextureCache {
         depth: Option<vk::Format>,
         read: ReadFn<'_>,
     ) -> Result<&GpuImage, TextureError> {
+        self.entry_with(runner, words, storage, depth, read, false)
+    }
+
+    /// [`Self::entry`]; `allow_async`: a new sampled texture may start a
+    /// transfer-queue upload (the caller shows a placeholder meanwhile).
+    fn entry_with(
+        &mut self,
+        runner: &ComputeRunner,
+        words: [u32; 8],
+        storage: bool,
+        depth: Option<vk::Format>,
+        read: ReadFn<'_>,
+        allow_async: bool,
+    ) -> Result<&GpuImage, TextureError> {
+        let k = key(&words, depth);
+        self.clock_sec = self.epoch.elapsed().as_secs();
+        self.apply_dirty_log();
+        // Whoever reaches the image now needs the upload done.
+        self.settle_entry(runner, k)?;
+
+        // Fast path: a cached entry in write-watched memory that no logged
+        // write touched is unchanged: skip reading and hashing title memory.
+        if self.dirty.is_some()
+            && let Some(e) = self.textures.get(&k)
+            && e.watched
+            && !e.dirty
+            && (e.image.storage || !storage)
+        {
+            self.clean_skips += 1;
+            self.evictor.on_gpu_read(e.slot, self.clock_sec);
+            return Ok(&self.textures[&k].image);
+        }
+
         let model = Self::model(&words, depth)?;
         let d = model.desc;
         let footprint = model.footprint()?;
@@ -650,7 +1003,6 @@ impl TextureCache {
             len: footprint,
         })?;
         let hash = fnv(&src);
-        let k = key(&words, depth);
 
         let reuse = match self.textures.get(&k) {
             Some(e) => e.image.storage || !storage,
@@ -658,15 +1010,26 @@ impl TextureCache {
         };
         if !reuse && let Some(old) = self.textures.remove(&k) {
             // Needed as storage now: made again with STORAGE usage below.
-            runner.destroy_image(old.image);
+            self.destroy_entry(runner, old);
         }
         if reuse {
-            let e = self.textures.get_mut(&k).expect("present");
-            if e.hash != hash {
-                runner.upload_image_levels(&e.image, &model.detile_all(&src)?, model.block)?;
+            let need_upload = self.textures[&k].hash != hash;
+            if need_upload {
+                let mut e = self.textures.remove(&k).expect("present");
+                let filled = self.fill(runner, &e.image, &model, &src);
+                if let Err(error) = filled {
+                    self.destroy_entry(runner, e);
+                    return Err(error);
+                }
                 e.hash = hash;
-                self.uploads += 1;
+                e.dirty = false;
+                self.textures.insert(k, e);
+            } else {
+                let e = self.textures.get_mut(&k).expect("present");
+                e.dirty = false;
             }
+            let slot = self.textures[&k].slot;
+            self.evictor.on_gpu_read(slot, self.clock_sec);
             return Ok(&self.textures[&k].image);
         }
 
@@ -713,20 +1076,132 @@ impl TextureCache {
             storage,
             components,
         })?;
-        let tight = match model.detile_all(&src) {
-            Ok(t) => t,
-            Err(e) => {
-                runner.destroy_image(image);
-                return Err(e);
+        let mut pending = None;
+        if allow_async
+            && !storage
+            && depth.is_none()
+            && src.len() >= self.async_min
+            && runner.has_transfer_queue()
+            && self.pending_bytes.saturating_add(footprint as u64) <= self.staging_limit
+        {
+            match self
+                .detile_or_store(&model, &src)
+                .map(|tight| runner.upload_image_levels_async(&image, &tight, model.block))
+            {
+                Ok(Ok(Some(p))) => {
+                    self.async_uploads += 1;
+                    self.uploads += 1;
+                    self.pending_bytes += p.bytes;
+                    self.pending_order.insert((p.started, k));
+                    pending = Some(p);
+                }
+                Ok(Ok(None)) | Ok(Err(_)) => {}
+                Err(e) => {
+                    runner.destroy_image(image);
+                    return Err(e);
+                }
             }
-        };
-        if let Err(e) = runner.upload_image_levels(&image, &tight, model.block) {
-            runner.destroy_image(image);
-            return Err(e.into());
         }
-        self.uploads += 1;
-        self.textures.insert(k, Entry { image, hash });
+        if pending.is_none()
+            && let Err(e) = self.fill(runner, &image, &model, &src)
+        {
+            runner.destroy_image(image);
+            return Err(e);
+        }
+        // Sampled textures can be evicted and re-read from title memory;
+        // storage images and depth targets hold GPU-written contents.
+        let slot = if storage || depth.is_some() {
+            0
+        } else {
+            let slot = self.next_slot;
+            self.next_slot = self.next_slot.wrapping_add(1).max(1);
+            self.key_by_slot.insert(slot, k);
+            self.evictor
+                .on_write(slot, hash, footprint as u64, self.clock_sec);
+            slot
+        };
+        self.telemetry.vram_textures_bytes += footprint as u64;
+        self.textures.insert(
+            k,
+            Entry {
+                image,
+                hash,
+                base_address: d.base_address,
+                footprint,
+                dirty: false,
+                watched: crate::dirty_log::is_watched(d.base_address, footprint as u64),
+                slot,
+                pending,
+            },
+        );
         Ok(&self.textures[&k].image)
+    }
+
+    /// Uploads `src` (title-memory bytes) into `image`: from the texture
+    /// store when it has the detiled levels, detiled on the GPU for large
+    /// Morton surfaces, else detiled on the CPU (and stored).
+    fn fill(
+        &mut self,
+        runner: &ComputeRunner,
+        image: &GpuImage,
+        model: &SurfaceModel,
+        src: &[u8],
+    ) -> Result<(), TextureError> {
+        let t0 = std::time::Instant::now();
+        if self.store.is_none()
+            && src.len() >= self.gpu_detile_min
+            && let Some((jobs, tight_len)) = model.gpu_detile_jobs()
+        {
+            if runner
+                .upload_image_detiled_gpu(image, src, &jobs, tight_len, model.block)
+                .is_ok()
+            {
+                self.gpu_detiles += 1;
+                self.uploads += 1;
+                self.telemetry
+                    .upload_latency
+                    .record_us(t0.elapsed().as_micros() as u64);
+                return Ok(());
+            }
+            // Fall back to the CPU path below.
+        }
+        let tight = self.detile_or_store(model, src)?;
+        self.telemetry
+            .detile_latency
+            .record_us(t0.elapsed().as_micros() as u64);
+        let up_t0 = std::time::Instant::now();
+        runner.upload_image_levels(image, &tight, model.block)?;
+        self.telemetry
+            .upload_latency
+            .record_us(up_t0.elapsed().as_micros() as u64);
+        self.uploads += 1;
+        Ok(())
+    }
+
+    fn detile_or_store(
+        &mut self,
+        model: &SurfaceModel,
+        src: &[u8],
+    ) -> Result<Vec<u8>, TextureError> {
+        let store_key = self.store.as_ref().map(|_| {
+            crate::texstore::hash_texture_key(
+                model.format.as_raw() as u32,
+                model.desc.width,
+                model.desc.height,
+                src,
+            )
+        });
+        if let (Some(store), Some(sk)) = (self.store.as_mut(), store_key)
+            && let Some(cached) = store.get(sk)
+        {
+            self.store_hits += 1;
+            return Ok(cached);
+        }
+        let tight = model.detile_all(src)?;
+        if let (Some(store), Some(sk)) = (self.store.as_ref(), store_key) {
+            let _ = store.put(sk, &tight);
+        }
+        Ok(tight)
     }
 
     /// The 2D image view for a T#, created or refreshed from title memory.
@@ -751,11 +1226,85 @@ impl TextureCache {
         dim: ImageDim,
         read: ReadFn<'_>,
     ) -> Result<vk::ImageView, TextureError> {
-        let img = self.entry(runner, words, storage, None, read)?;
+        let k = key(&words, None);
+        // An upload still on the transfer queue: show the placeholder.
+        if !storage
+            && let Some(e) = self.textures.get(&k)
+            && let Some(p) = &e.pending
+            && matches!(runner.upload_ready(p), Ok(false))
+            && let Some(v) = runner
+                .placeholder_image(e.image.shape)
+                .and_then(|i| i.view_for(dim))
+        {
+            self.placeholder_binds += 1;
+            return Ok(v);
+        }
+        self.entry_with(runner, words, storage, None, read, !storage)?;
+        let e = &self.textures[&k];
+        if e.pending.is_some() {
+            match runner
+                .placeholder_image(e.image.shape)
+                .and_then(|i| i.view_for(dim))
+            {
+                Some(v) => {
+                    self.placeholder_binds += 1;
+                    return Ok(v);
+                }
+                None => self.settle_entry(runner, k)?,
+            }
+        }
+        let img = &self.textures[&k].image;
         img.view_for(dim).ok_or(TextureError::View {
             shape: img.shape,
             dim,
         })
+    }
+
+    /// Finishes every transfer-queue upload still running (before reading
+    /// images back or tearing down).
+    pub fn settle_uploads(&mut self, runner: &ComputeRunner) -> Result<(), GpuError> {
+        let keys: Vec<_> = self
+            .textures
+            .iter()
+            .filter_map(|(key, entry)| entry.pending.is_some().then_some(*key))
+            .collect();
+        let mut first_error = None;
+        for key in keys {
+            if let Err(error) = self.settle_entry(runner, key) {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn settle_entry(&mut self, runner: &ComputeRunner, k: ([u32; 5], i32)) -> Result<(), GpuError> {
+        if let Some(upload) = self.textures.get(&k).and_then(|e| e.pending.as_ref()) {
+            self.pending_order.remove(&(upload.started, k));
+            self.pending_bytes -= upload.bytes;
+        }
+        if let Some(entry) = self.textures.get_mut(&k)
+            && let Err(error) = settle(runner, entry)
+        {
+            let entry = self.textures.remove(&k).expect("entry is present");
+            self.destroy_entry(runner, entry);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn destroy_entry(&mut self, runner: &ComputeRunner, entry: Entry) {
+        self.key_by_slot.remove(&entry.slot);
+        self.evictor.forget(entry.slot);
+        self.telemetry.vram_textures_bytes = self
+            .telemetry
+            .vram_textures_bytes
+            .saturating_sub(entry.footprint as u64);
+        runner.destroy_image(entry.image);
+    }
+
+    /// Uploads still running on the transfer queue.
+    pub fn pending_uploads(&self) -> usize {
+        self.pending_order.len()
     }
 
     /// A depth/stencil target of `format` over the memory a T# names.
@@ -771,7 +1320,10 @@ impl TextureCache {
 
     /// The image made for a T# (after [`Self::texture`]).
     pub fn image(&self, words: &[u32; 8]) -> Option<&GpuImage> {
-        self.textures.get(&key(words, None)).map(|e| &e.image)
+        self.textures
+            .get(&key(words, None))
+            .filter(|e| e.pending.is_none())
+            .map(|e| &e.image)
     }
 
     /// The depth target made for a T# (after [`Self::depth_target`]).
@@ -816,7 +1368,9 @@ impl TextureCache {
         let model = Self::model(&words, depth)?;
         let d = model.desc;
         let footprint = model.footprint()?;
-        let Some(e) = self.textures.get_mut(&key(&words, depth)) else {
+        let k = key(&words, depth);
+        self.settle_entry(runner, k)?;
+        let Some(e) = self.textures.get_mut(&k) else {
             return Ok(());
         };
         // Depth/stencil images read back their depth aspect only; packed
@@ -890,12 +1444,15 @@ impl TextureCache {
     }
 
     pub fn destroy(&mut self, runner: &ComputeRunner) {
-        for (_, e) in self.textures.drain() {
+        for (_, mut e) in self.textures.drain() {
+            let _ = settle(runner, &mut e);
             runner.destroy_image(e.image);
         }
         for (_, s) in self.samplers.drain() {
             runner.destroy_sampler(s);
         }
+        self.pending_bytes = 0;
+        self.pending_order.clear();
     }
 }
 
@@ -950,6 +1507,49 @@ mod tests {
             source_layout(&desc(8, 8, 24), 4),
             Err(TextureError::SwizzleMode(24))
         ));
+    }
+
+    #[test]
+    fn gpu_detile_jobs_reproduce_the_cpu_detiler() {
+        // Morton 2D array: 2 layers, levels 0..=2, RGBA8.
+        let mut d = desc(40, 24, 9);
+        d.kind = ImageKind::Tex2DArray;
+        d.depth = 2;
+        d.last_level = 2;
+        let m = TextureCache::model(&d.encode(), None).unwrap();
+        let src: Vec<u8> = (0..m.footprint().unwrap())
+            .map(|i| (i * 13 + 1) as u8)
+            .collect();
+        let cpu = m.detile_levels(&src).unwrap();
+        let (jobs, tight_len) = m.gpu_detile_jobs().unwrap();
+        assert_eq!(jobs.len(), 6);
+        assert_eq!(tight_len, cpu.len());
+        // What detile.slang mode 1 computes, per job.
+        let mut gpu = vec![0u8; tight_len];
+        for j in &jobs {
+            let bpp = j.bpp as usize;
+            for y in 0..j.height as usize {
+                for x in 0..j.width as usize {
+                    let t = j.src_offset as usize + morton_offset(x, y, j.width as usize, bpp);
+                    let o = j.dst_offset as usize + (y * j.width as usize + x) * bpp;
+                    gpu[o..o + bpp].copy_from_slice(&src[t..t + bpp]);
+                }
+            }
+        }
+        assert_eq!(gpu, cpu);
+        // Linear and bank-XOR surfaces stay on the CPU path.
+        assert!(
+            TextureCache::model(&desc(16, 16, 0).encode(), None)
+                .unwrap()
+                .gpu_detile_jobs()
+                .is_none()
+        );
+        assert!(
+            TextureCache::model(&desc(16, 16, 25).encode(), None)
+                .unwrap()
+                .gpu_detile_jobs()
+                .is_none()
+        );
     }
 
     #[test]

@@ -152,6 +152,8 @@ pub struct SourceVoice {
     b_valid: bool,
     primed: bool,
     xma: Option<XmaDecoder>,
+    /// Opus is stateful across packets: one decoder per voice.
+    opus: Option<OpusDecoder>,
 }
 
 impl SourceVoice {
@@ -160,7 +162,22 @@ impl SourceVoice {
             WaveFormat::Xma2 {
                 channels,
                 sample_rate,
-            } => XmaDecoder::new((channels as u8).clamp(1, 2), sample_rate).ok(),
+                // Up to 8 channels (the voice mixer's frame width); more than 2 are
+                // interleaved XMA streams.
+            } => XmaDecoder::new((channels as u8).clamp(1, 8), sample_rate).ok(),
+            _ => None,
+        };
+        let opus = match format {
+            WaveFormat::Opus {
+                channels,
+                sample_rate,
+            } => {
+                #[cfg(windows)]
+                let decoder = crate::opus_host::decoder(channels, sample_rate);
+                #[cfg(not(windows))]
+                let decoder = OpusDecoder::new(channels, sample_rate);
+                Some(decoder)
+            }
             _ => None,
         };
         Self {
@@ -180,6 +197,7 @@ impl SourceVoice {
             b_valid: false,
             primed: false,
             xma,
+            opus,
         }
     }
 
@@ -201,13 +219,10 @@ impl SourceVoice {
                 Some(dec) => dec.decode_packets(&buf.data).unwrap_or_default(),
                 None => Vec::new(),
             },
-            WaveFormat::Opus {
-                channels,
-                sample_rate,
-            } => {
-                let mut dec = OpusDecoder::new(channels, sample_rate);
-                dec.decode_stream(&buf.data)
-            }
+            WaveFormat::Opus { .. } => match &mut self.opus {
+                Some(dec) => dec.decode_stream(&buf.data),
+                None => Vec::new(),
+            },
         };
         let frames = pcm.len() / ch;
         let begin = (buf.play_begin as usize).min(frames);

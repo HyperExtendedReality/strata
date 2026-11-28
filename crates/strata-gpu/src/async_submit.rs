@@ -15,6 +15,7 @@ pub struct TranslatedBatch {
     pub draw_count: usize,
     pub dispatch_count: usize,
     pub ops: Vec<ThinCommand>,
+    pub hoisted_clamps: Vec<(u64, u32, u32)>,
 }
 
 /// Multi-threaded worker pool that flattens and prepares thin command lists
@@ -63,11 +64,12 @@ impl ThinTranslationPool {
                 }));
             }
             for h in handles {
-                if let Ok(part) = h.join() {
-                    for b in part {
-                        let idx = b.ticket as usize;
-                        results[idx] = Some(b);
-                    }
+                for b in h
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                {
+                    let idx = b.ticket as usize;
+                    results[idx] = Some(b);
                 }
             }
         });
@@ -77,7 +79,7 @@ impl ThinTranslationPool {
 }
 
 fn translate_one(ticket: u64, list: ThinCommandList) -> TranslatedBatch {
-    let ops = list.commands().to_vec();
+    let (ops, hoisted_clamps) = list.into_recording();
     let mut draw_count = 0usize;
     let mut dispatch_count = 0usize;
     for op in &ops {
@@ -99,6 +101,7 @@ fn translate_one(ticket: u64, list: ThinCommandList) -> TranslatedBatch {
         draw_count,
         dispatch_count,
         ops,
+        hoisted_clamps,
     }
 }
 
@@ -311,7 +314,7 @@ mod tests {
         l0.dispatch(4, 1, 1, [64, 1, 1], false);
         let mut l1 = ThinCommandList::new();
         l1.draw_instanced(3, 1, 0, 0);
-        l1.draw_instanced(6, 1, 0, 0);
+        l1.draw_indirect(4096, 6, 1);
 
         let pool = ThinTranslationPool::new(4);
         let batches = pool.translate_parallel(vec![l0, l1]);
@@ -320,6 +323,7 @@ mod tests {
         assert_eq!(batches[0].dispatch_count, 1);
         assert_eq!(batches[1].ticket, 1);
         assert_eq!(batches[1].draw_count, 2);
+        assert_eq!(batches[1].hoisted_clamps, [(4096, 6, 1)]);
     }
 
     #[test]

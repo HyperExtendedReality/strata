@@ -227,17 +227,17 @@ fn encode_spirv_string(s: &str) -> Vec<u32> {
 }
 
 /// Emit a valid SPIR-V 1.6 NGG / Mesh Shader module (`VK_EXT_mesh_shader` /
-/// `SPV_EXT_mesh_shader`) that emits `vertices` clip-space positions and
-/// `triangles` primitive index triples via `OpSetMeshOutputsEXT`.
+/// `SPV_EXT_mesh_shader`) that emits clip-space positions and primitive
+/// indices. Point and line primitives use the first one or two indices.
 pub fn emit_mesh_spirv(
     desc: &MeshShaderDesc,
     vertices: &[[f32; 4]],
-    triangles: &[[u32; 3]],
+    primitives: &[[u32; 3]],
 ) -> Vec<u32> {
     let max_verts = desc.max_vertices.max(vertices.len() as u32).max(1);
-    let max_prims = desc.max_primitives.max(triangles.len() as u32).max(1);
+    let max_prims = desc.max_primitives.max(primitives.len() as u32).max(1);
     let vert_count = (vertices.len() as u32).min(max_verts);
-    let prim_count = (triangles.len() as u32).min(max_prims);
+    let prim_count = (primitives.len() as u32).min(max_prims);
 
     let mut w = Vec::new();
     let mut next_id = 1u32;
@@ -259,7 +259,19 @@ pub fn emit_mesh_spirv(
     let u32_ty = alloc();
     let f32_ty = alloc();
     let vec4_ty = alloc();
-    let uvec3_ty = alloc();
+    let bool_ty = alloc();
+    let (indices_per_primitive, index_builtin, prim_mode) = match desc.output_topology {
+        GsOutputPrimitive::Points => (1, 5294, 27),
+        GsOutputPrimitive::LineStrip => (2, 5295, 5269),
+        GsOutputPrimitive::TriangleStrip => (3, 5296, 5298),
+    };
+    let index_ty = if indices_per_primitive == 1 {
+        u32_ty
+    } else {
+        alloc()
+    };
+    let ptr_in_u32 = alloc();
+    let invocation_var = alloc();
     let c_max_verts = alloc();
     let c_max_prims = alloc();
     let c_vert_count = alloc();
@@ -272,10 +284,10 @@ pub fn emit_mesh_spirv(
     let ptr_out_vec4 = alloc();
     let vtx_out_var = alloc();
 
-    // Primitive triangle indices: uvec3 gl_PrimitiveTriangleIndicesEXT[max_prims]
+    // Primitive indices, with one scalar or vector element per primitive.
     let prim_arr_ty = alloc();
     let ptr_out_prim_arr = alloc();
-    let ptr_out_uvec3 = alloc();
+    let ptr_out_index = alloc();
     let prim_out_var = alloc();
 
     let entry_label = alloc();
@@ -296,6 +308,21 @@ pub fn emit_mesh_spirv(
         &[u32_ty, c_zero, 0],
     );
     u32_consts.insert(0, c_zero);
+    // Set the output counts uniformly. Only invocation zero writes the static
+    // positions and indices, so each output element has a single writer.
+    let invocation = alloc();
+    let first_lane = alloc();
+    let write_label = alloc();
+    let done_label = alloc();
+    push_inst(&mut body_insts, 61, &[u32_ty, invocation, invocation_var]);
+    push_inst(
+        &mut body_insts,
+        170,
+        &[bool_ty, first_lane, invocation, c_zero],
+    );
+    push_inst(&mut body_insts, 247, &[done_label, 0]);
+    push_inst(&mut body_insts, 250, &[first_lane, write_label, done_label]);
+    push_inst(&mut body_insts, 248, &[write_label]);
 
     let get_u32 = |val: u32,
                    u32_consts: &mut std::collections::HashMap<u32, u32>,
@@ -339,25 +366,36 @@ pub fn emit_mesh_spirv(
         push_inst(&mut body_insts, 62 /* OpStore */, &[ptr_id, vec_id]);
     }
 
-    for (idx, tri) in triangles.iter().take(prim_count as usize).enumerate() {
-        let i0 = get_u32(tri[0], &mut u32_consts, &mut const_insts, &mut alloc);
-        let i1 = get_u32(tri[1], &mut u32_consts, &mut const_insts, &mut alloc);
-        let i2 = get_u32(tri[2], &mut u32_consts, &mut const_insts, &mut alloc);
-        let tri_id = alloc();
-        push_inst(
-            &mut body_insts,
-            80, /* OpCompositeConstruct */
-            &[uvec3_ty, tri_id, i0, i1, i2],
-        );
+    for (idx, primitive) in primitives.iter().take(prim_count as usize).enumerate() {
+        let first = get_u32(primitive[0], &mut u32_consts, &mut const_insts, &mut alloc);
+        let index_vector = if indices_per_primitive == 1 {
+            first
+        } else {
+            let id = alloc();
+            let mut operands = vec![index_ty, id, first];
+            operands.extend(
+                primitive[1..indices_per_primitive]
+                    .iter()
+                    .map(|&index| get_u32(index, &mut u32_consts, &mut const_insts, &mut alloc)),
+            );
+            push_inst(&mut body_insts, 80, &operands);
+            id
+        };
         let idx_id = get_u32(idx as u32, &mut u32_consts, &mut const_insts, &mut alloc);
         let ptr_id = alloc();
         push_inst(
             &mut body_insts,
             65, /* OpAccessChain */
-            &[ptr_out_uvec3, ptr_id, prim_out_var, idx_id],
+            &[ptr_out_index, ptr_id, prim_out_var, idx_id],
         );
-        push_inst(&mut body_insts, 62 /* OpStore */, &[ptr_id, tri_id]);
+        push_inst(
+            &mut body_insts,
+            62, /* OpStore */
+            &[ptr_id, index_vector],
+        );
     }
+    push_inst(&mut body_insts, 249, &[done_label]);
+    push_inst(&mut body_insts, 248, &[done_label]);
 
     // Header
     w.push(0x0723_0203); // Magic
@@ -387,6 +425,7 @@ pub fn emit_mesh_spirv(
             0,
             vtx_out_var,
             prim_out_var,
+            invocation_var,
         ],
     );
 
@@ -408,11 +447,6 @@ pub fn emit_mesh_spirv(
         16,
         &[entry_id, 5270 /* OutputPrimitivesEXT */, max_prims],
     );
-    let prim_mode = match desc.output_topology {
-        GsOutputPrimitive::Points => 27,          // OutputPoints
-        GsOutputPrimitive::LineStrip => 5269,     // OutputLinesEXT
-        GsOutputPrimitive::TriangleStrip => 5298, // OutputTrianglesEXT
-    };
     push_inst(&mut w, 16, &[entry_id, prim_mode]);
 
     // Decorations
@@ -427,14 +461,11 @@ pub fn emit_mesh_spirv(
             0,  /* Position */
         ],
     );
+    push_inst(&mut w, 71, &[prim_out_var, 11 /* BuiltIn */, index_builtin]);
     push_inst(
         &mut w,
         71,
-        &[
-            prim_out_var,
-            11,   /* BuiltIn */
-            5296, /* PrimitiveTriangleIndicesEXT */
-        ],
+        &[invocation_var, 11, 29 /* LocalInvocationIndex */],
     );
 
     // Types & Constants
@@ -443,7 +474,14 @@ pub fn emit_mesh_spirv(
     push_inst(&mut w, 21, &[u32_ty, 32, 0]);
     push_inst(&mut w, 22, &[f32_ty, 32]);
     push_inst(&mut w, 23, &[vec4_ty, f32_ty, 4]);
-    push_inst(&mut w, 23, &[uvec3_ty, u32_ty, 3]);
+    push_inst(&mut w, 20, &[bool_ty]);
+    if indices_per_primitive > 1 {
+        push_inst(
+            &mut w,
+            23,
+            &[index_ty, u32_ty, indices_per_primitive as u32],
+        );
+    }
     push_inst(&mut w, 43, &[u32_ty, c_max_verts, max_verts]);
     push_inst(&mut w, 43, &[u32_ty, c_max_prims, max_prims]);
     push_inst(&mut w, 43, &[u32_ty, c_vert_count, vert_count]);
@@ -463,11 +501,13 @@ pub fn emit_mesh_spirv(
     push_inst(
         &mut w,
         28, /* OpTypeArray */
-        &[prim_arr_ty, uvec3_ty, c_max_prims],
+        &[prim_arr_ty, index_ty, c_max_prims],
     );
     push_inst(&mut w, 32, &[ptr_out_prim_arr, 3 /* Output */, prim_arr_ty]);
-    push_inst(&mut w, 32, &[ptr_out_uvec3, 3 /* Output */, uvec3_ty]);
+    push_inst(&mut w, 32, &[ptr_out_index, 3 /* Output */, index_ty]);
+    push_inst(&mut w, 32, &[ptr_in_u32, 1 /* Input */, u32_ty]);
     w.extend_from_slice(&const_insts);
+    push_inst(&mut w, 59, &[ptr_in_u32, invocation_var, 1 /* Input */]);
     push_inst(&mut w, 59, &[ptr_out_vtx_arr, vtx_out_var, 3 /* Output */]);
     push_inst(
         &mut w,
@@ -484,61 +524,53 @@ pub fn emit_mesh_spirv(
     w
 }
 
-/// Translate an RDNA2 Geometry Shader (`s_sendmsg(GS/GS_CUT/GS_DONE)` + `exp`)
-/// into a `spirv-val`-clean SPIR-V 1.6 Geometry Shader module.
+/// Translates straight-line, position-only geometry shaders with static VGPRs.
 pub fn translate_geometry_rdna2(
     words: &[u32],
     desc: &GeometryShaderDesc,
 ) -> Result<Vec<u32>, crate::rdna2::DecodeError> {
-    let program = crate::rdna2::decode_program(words)?;
-    let mut vgpr_f32: [f32; 256] = [0.0; 256];
-    let mut last_pos = [0.0f32, 0.0, 0.0, 1.0];
+    use crate::rdna2::Inst;
+    use crate::static_stage::{Registers, full_position, unsupported};
+
+    let mut registers = Registers::new();
+    let mut position = [None; 4];
+    let mut emitted = 0;
     let mut actions = Vec::new();
-    for di in &program {
-        match &di.inst {
-            crate::rdna2::Inst::VMovB32 { dst, src0 } => {
-                vgpr_f32[*dst as usize] = match *src0 {
-                    crate::rdna2::Operand::InlineFloat(bits)
-                    | crate::rdna2::Operand::Literal(bits) => f32::from_bits(bits),
-                    crate::rdna2::Operand::InlineInt(i) => i as f32,
-                    crate::rdna2::Operand::Vgpr(v) => vgpr_f32[v as usize],
-                    _ => 0.0,
-                };
-            }
-            crate::rdna2::Inst::Exp {
+    for di in crate::rdna2::decode_program(words)? {
+        let fail = || unsupported(words, di.pc);
+        match di.inst {
+            Inst::SEndpgm => break,
+            Inst::Exp {
                 target: 12,
                 en,
                 vsrc,
+                compr: false,
                 ..
             } => {
-                for k in 0..4 {
-                    if (en & (1 << k)) != 0 {
-                        last_pos[k] = vgpr_f32[vsrc[k] as usize];
+                registers.position(en, vsrc, &mut position);
+            }
+            Inst::SSendMsg { msg } if matches!(msg & 0xf, 2 | 3) && msg >> 7 == 0 => {
+                let op = (msg >> 4) & 7;
+                if op > 3 || (op == 0 && msg & 0xf != 3) {
+                    return Err(fail());
+                }
+                if op & 2 != 0 {
+                    emitted += 1;
+                    if emitted > desc.max_vertices {
+                        return Err(fail());
                     }
+                    actions.push(GsAction::EmitVertex {
+                        pos: full_position(position).ok_or_else(fail)?,
+                    });
+                    position = [None; 4];
+                }
+                if op & 1 != 0 {
+                    actions.push(GsAction::EndPrimitive);
                 }
             }
-            crate::rdna2::Inst::SSendMsg { msg } => {
-                // RDNA2 GS message: bits [3:0] == 2 (GS), bits [5:4] = op (1=CUT, 2=EMIT, 3=EMIT_CUT)
-                let msg_id = msg & 0xf;
-                let op = (msg >> 4) & 0x3;
-                if msg_id == 2 {
-                    match op {
-                        1 => actions.push(GsAction::EndPrimitive),
-                        2 => actions.push(GsAction::EmitVertex { pos: last_pos }),
-                        3 => {
-                            actions.push(GsAction::EmitVertex { pos: last_pos });
-                            actions.push(GsAction::EndPrimitive);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
+            ref inst if registers.execute(inst) => {}
+            _ => return Err(fail()),
         }
-    }
-    if actions.is_empty() {
-        actions.push(GsAction::EmitVertex { pos: last_pos });
-        actions.push(GsAction::EndPrimitive);
     }
     Ok(emit_geometry_spirv(desc, &actions))
 }
@@ -653,56 +685,57 @@ pub fn translate_task_rdna2(
     Ok(emit_task_spirv(desc))
 }
 
-/// Translate an RDNA2 NGG / Mesh Shader into a `spirv-val`-clean SPIR-V 1.6
-/// `VK_EXT_mesh_shader` module.
+/// Translates straight-line NGG position exports and sequential primitives.
 pub fn translate_mesh_rdna2(
     words: &[u32],
     desc: &MeshShaderDesc,
 ) -> Result<Vec<u32>, crate::rdna2::DecodeError> {
-    let program = crate::rdna2::decode_program(words)?;
-    let mut vgpr_f32: [f32; 256] = [0.0; 256];
-    let mut vertices: Vec<[f32; 4]> = Vec::new();
-    for di in &program {
-        match &di.inst {
-            crate::rdna2::Inst::VMovB32 { dst, src0 } => {
-                vgpr_f32[*dst as usize] = match *src0 {
-                    crate::rdna2::Operand::InlineFloat(bits)
-                    | crate::rdna2::Operand::Literal(bits) => f32::from_bits(bits),
-                    crate::rdna2::Operand::InlineInt(i) => i as f32,
-                    crate::rdna2::Operand::Vgpr(v) => vgpr_f32[v as usize],
-                    _ => 0.0,
-                };
-            }
-            crate::rdna2::Inst::Exp {
+    use crate::rdna2::Inst;
+    use crate::static_stage::{Registers, full_position, unsupported};
+
+    let mut registers = Registers::new();
+    let mut vertices = Vec::new();
+    for di in crate::rdna2::decode_program(words)? {
+        match di.inst {
+            Inst::SEndpgm => break,
+            Inst::Exp {
                 target: 12,
                 en,
                 vsrc,
+                compr: false,
                 ..
             } => {
-                let mut pos = [0.0f32, 0.0, 0.0, 1.0];
-                for k in 0..4 {
-                    if (en & (1 << k)) != 0 {
-                        pos[k] = vgpr_f32[vsrc[k] as usize];
-                    }
-                }
-                vertices.push(pos);
+                let mut position = [None; 4];
+                registers.position(en, vsrc, &mut position);
+                vertices.push(full_position(position).ok_or_else(|| unsupported(words, di.pc))?);
             }
-            _ => {}
+            ref inst if registers.execute(inst) => {}
+            _ => return Err(unsupported(words, di.pc)),
         }
     }
-    if vertices.len() < 3 {
-        vertices = vec![
-            [0.0, 0.5, 0.0, 1.0],
-            [-0.5, -0.5, 0.0, 1.0],
-            [0.5, -0.5, 0.0, 1.0],
-        ];
+    let indices_per_primitive = match desc.output_topology {
+        GsOutputPrimitive::Points => 1,
+        GsOutputPrimitive::LineStrip => 2,
+        GsOutputPrimitive::TriangleStrip => 3,
+    };
+    if vertices.len() > desc.max_vertices as usize
+        || !vertices.len().is_multiple_of(indices_per_primitive)
+        || vertices.len() / indices_per_primitive > desc.max_primitives as usize
+    {
+        return Err(unsupported(words, 0));
     }
-    let mut indices = Vec::new();
-    let mut i = 0u32;
-    while (i + 2) < vertices.len() as u32 {
-        indices.push([i, i + 1, i + 2]);
-        i += 3;
-    }
+    let indices = (0..vertices.len() as u32)
+        .step_by(indices_per_primitive)
+        .map(|first| {
+            std::array::from_fn(|i| {
+                if i < indices_per_primitive {
+                    first + i as u32
+                } else {
+                    0
+                }
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(emit_mesh_spirv(desc, &vertices, &indices))
 }
 
@@ -753,35 +786,72 @@ mod tests {
 
     #[test]
     fn ngg_mesh_shader_spirv_validates_with_spirv_val() {
-        let desc = MeshShaderDesc {
+        let mut desc = MeshShaderDesc {
             workgroup_size: [32, 1, 1],
             max_vertices: 3,
             max_primitives: 1,
             output_topology: GsOutputPrimitive::TriangleStrip,
         };
-        let spv = emit_mesh_spirv(
-            &desc,
-            &[
-                [0.0, 0.5, 0.0, 1.0],
-                [-0.5, -0.5, 0.0, 1.0],
-                [0.5, -0.5, 0.0, 1.0],
-            ],
-            &[[0, 1, 2]],
-        );
         let tmp = std::env::temp_dir().join("strata_test_mesh.spv");
-        let bytes: Vec<u8> = spv.iter().flat_map(|w| w.to_le_bytes()).collect();
-        std::fs::write(&tmp, &bytes).unwrap();
-        if let Ok(out) = Command::new("spirv-val")
-            .args(["--target-env", "vulkan1.3"])
-            .arg(&tmp)
-            .output()
-        {
-            assert!(
-                out.status.success(),
-                "spirv-val failed for mesh shader: {}",
-                String::from_utf8_lossy(&out.stderr)
+        for topology in [
+            GsOutputPrimitive::Points,
+            GsOutputPrimitive::LineStrip,
+            GsOutputPrimitive::TriangleStrip,
+        ] {
+            desc.output_topology = topology;
+            let spv = emit_mesh_spirv(
+                &desc,
+                &[
+                    [0.0, 0.5, 0.0, 1.0],
+                    [-0.5, -0.5, 0.0, 1.0],
+                    [0.5, -0.5, 0.0, 1.0],
+                ],
+                &[[0, 1, 2]],
             );
+            let bytes: Vec<u8> = spv.iter().flat_map(|w| w.to_le_bytes()).collect();
+            std::fs::write(&tmp, &bytes).unwrap();
+            if let Ok(out) = Command::new("spirv-val")
+                .args(["--target-env", "vulkan1.3"])
+                .arg(&tmp)
+                .output()
+            {
+                assert!(
+                    out.status.success(),
+                    "spirv-val failed for {topology:?} mesh shader: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
         }
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn translates_geometry_done_emit_cut_and_static_vector_math() {
+        use crate::rdna2::encode::*;
+
+        let desc = GeometryShaderDesc {
+            input: GsInputPrimitive::Triangles,
+            output: GsOutputPrimitive::Points,
+            max_vertices: 1,
+            invocations: 1,
+        };
+        let mut words = Vec::new();
+        words.extend(v_mov_b32_literal(0, 0.125f32.to_bits()));
+        words.extend(v_mov_b32_literal(1, 0.25f32.to_bits()));
+        words.push(v_add_f32(2, 0, 1));
+        words.extend(exp(12, 15, [2, 0, 0, 1], true, false));
+        words.extend([0xBF90_0033, s_endpgm()]);
+        assert_eq!(
+            translate_geometry_rdna2(&words, &desc).unwrap(),
+            emit_geometry_spirv(
+                &desc,
+                &[
+                    GsAction::EmitVertex {
+                        pos: [0.375, 0.125, 0.125, 0.25]
+                    },
+                    GsAction::EndPrimitive,
+                ]
+            )
+        );
     }
 }

@@ -4,6 +4,9 @@ pub const DIRTY_HASH_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dirt
 pub const MIRROR_DIFF_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mirror_diff.spv"));
 pub const DETILE_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/detile.spv"));
 pub const BVH_ORACLE_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bvh_oracle.spv"));
+pub const RAY_PROBE_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ray_probe.spv"));
+/// BMA Mapping stage (3x3 tile convolution over sampled BVH paths).
+pub const BMA_MAPPING_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bma_mapping.spv"));
 pub const CLAMP_INDIRECT_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/clamp_indirect.spv"));
 pub const TEX_CONVERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tex_convert.spv"));
@@ -60,6 +63,8 @@ mod tests {
         assert_valid_spv_header("mirror_diff", MIRROR_DIFF_SPV);
         assert_valid_spv_header("detile", DETILE_SPV);
         assert_valid_spv_header("bvh_oracle", BVH_ORACLE_SPV);
+        assert_valid_spv_header("ray_probe", RAY_PROBE_SPV);
+        assert_valid_spv_header("bma_mapping", BMA_MAPPING_SPV);
         assert_valid_spv_header("clamp_indirect", CLAMP_INDIRECT_SPV);
         assert_valid_spv_header("tex_convert", TEX_CONVERT_SPV);
         assert_valid_spv_header("mip_gen", MIP_GEN_SPV);

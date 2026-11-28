@@ -9,6 +9,8 @@ members = [
     "crates/strata-cli",
     "xtask",
 ]
+# Vendored third-party code keeps its own license and lints.
+exclude = ["third_party/bcpack-rs"]
 
 [workspace.package]
 version = "0.1.0"

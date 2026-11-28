@@ -3,7 +3,6 @@
 //!   `XPackage` / `XAsync` / `XTaskQueue` / `XGame` / PLM lifecycle / Speech APIs
 //! - Offline/sandboxed `ws2_32.dll`, `winhttp.dll`, `wininet.dll`
 //! - `rpcrt4.dll` UUID generation & formatting
-//! - `mfplat.dll` / `mfreadwrite.dll` Media Foundation session hooks
 
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -13,15 +12,12 @@ use crate::services::{AppState, LifecycleManager};
 
 const S_OK: i32 = 0;
 const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
-const E_NOINTERFACE: i32 = 0x8000_4002u32 as i32;
-const E_FAIL: i32 = 0x8000_4005u32 as i32;
 const WSAEHOSTUNREACH: i32 = 10065;
 const WSAENOTCONN: i32 = 10057;
 
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(0x5700_0001);
 static LAST_WSA_ERROR: AtomicI32 = AtomicI32::new(0);
 static UUID_COUNTER: AtomicU64 = AtomicU64::new(1);
-static MF_REF_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn alloc_handle() -> *mut c_void {
     NEXT_HANDLE.fetch_add(1, Ordering::Relaxed) as *mut c_void
@@ -33,94 +29,155 @@ fn lifecycle() -> &'static Mutex<LifecycleManager> {
 }
 
 // ============================================================================
-// xgameruntime.dll!QueryApiImpl + Generic Offline GDK Provider VTable
+// xgameruntime.dll!QueryApiImpl
 // ============================================================================
 
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct Slot(*const ());
-unsafe impl Sync for Slot {}
+const NOT_SUPPORTED: i32 = 0x8007_0032_u32 as i32;
+const E_NOINTERFACE: i32 = 0x8000_4002_u32 as i32;
 
-#[repr(C)]
-struct GenericApiProvider {
-    vtable: *const [Slot; 32],
-    ref_count: AtomicU32,
-    provider_hash: u64,
+const fn guid(a: u32, b: u16, c: u16, [d, e, f, g, h, i, j, k]: [u8; 8]) -> [u8; 16] {
+    let [a0, a1, a2, a3] = a.to_le_bytes();
+    let [b0, b1] = b.to_le_bytes();
+    let [c0, c1] = c.to_le_bytes();
+    [a0, a1, a2, a3, b0, b1, c0, c1, d, e, f, g, h, i, j, k]
 }
 
-unsafe extern "system" fn prov_qi(
-    this: *mut c_void,
-    _riid: *const c_void,
+// The two XSystem interface versions and slots recorded in Victory-Fast.
+const XSYSTEM: [u8; 16] = guid(
+    0xe349_bd1a,
+    0xfc20,
+    0x4e40,
+    [0xb9, 0x9c, 0x41, 0x78, 0xcc, 0x6b, 0x40, 0x9f],
+);
+const XSYSTEM_2022: [u8; 16] = guid(
+    0x6fd7_1f09,
+    0x7513,
+    0x49f0,
+    [0x89, 0xbc, 0xbf, 0xaf, 0x5d, 0xf6, 0xf8, 0x52],
+);
+const XSYSTEM_2026: [u8; 16] = guid(
+    0x1861_cf2e,
+    0xe18b,
+    0x4834,
+    [0xa9, 0xf5, 0xb4, 0xa4, 0xe6, 0xef, 0xb4, 0xcf],
+);
+const IUNKNOWN: [u8; 16] = guid(0, 0, 0, [0xc0, 0, 0, 0, 0, 0, 0, 0x46]);
+
+#[repr(C)]
+struct SystemProvider {
+    vtable: &'static SystemVtable,
+    ref_count: AtomicU32,
+    interface: [u8; 16],
+}
+
+type GetId = unsafe extern "system" fn(&SystemProvider, usize, *mut u8, *mut usize) -> i32;
+
+#[repr(C)]
+struct SystemVtable {
+    query_interface:
+        unsafe extern "system" fn(&SystemProvider, *const [u8; 16], *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(&SystemProvider) -> u32,
+    release: unsafe extern "system" fn(*mut SystemProvider) -> u32,
+    console_id: GetId,
+    sandbox_id: GetId,
+    device_id: GetId,
+}
+
+unsafe extern "system" fn system_qi(
+    this: &SystemProvider,
+    iid: *const [u8; 16],
     out: *mut *mut c_void,
 ) -> i32 {
     if out.is_null() {
         return E_INVALIDARG;
     }
+    unsafe { out.write(std::ptr::null_mut()) };
+    let Some(iid) = (unsafe { iid.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    if *iid != this.interface && *iid != IUNKNOWN {
+        return E_NOINTERFACE;
+    }
     unsafe {
-        let p = &*(this as *const GenericApiProvider);
-        p.ref_count.fetch_add(1, Ordering::Relaxed);
-        *out = this;
+        system_add_ref(this);
+        out.write(std::ptr::from_ref(this).cast_mut().cast());
     }
     S_OK
 }
 
-unsafe extern "system" fn prov_add_ref(this: *mut c_void) -> u32 {
-    unsafe {
-        (*(this as *const GenericApiProvider))
-            .ref_count
-            .fetch_add(1, Ordering::Relaxed)
-            + 1
+unsafe extern "system" fn system_add_ref(this: &SystemProvider) -> u32 {
+    this.ref_count.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn system_release(this: *mut SystemProvider) -> u32 {
+    let remaining = unsafe { (*this).ref_count.fetch_sub(1, Ordering::AcqRel) } - 1;
+    if remaining == 0 {
+        unsafe { drop(Box::from_raw(this)) };
     }
+    remaining
 }
 
-unsafe extern "system" fn prov_release(this: *mut c_void) -> u32 {
-    unsafe {
-        let p = this as *mut GenericApiProvider;
-        let prev = (*p).ref_count.fetch_sub(1, Ordering::AcqRel);
-        if prev <= 1 {
-            drop(Box::from_raw(p));
-            0
-        } else {
-            prev - 1
-        }
-    }
+unsafe extern "system" fn system_console_id(
+    _: &SystemProvider,
+    size: usize,
+    buf: *mut u8,
+    used: *mut usize,
+) -> i32 {
+    unsafe { crate::gdk_services::xsystem_get_console_id(size, buf, used) }
 }
 
-unsafe extern "system" fn prov_ok(_this: *mut c_void) -> i32 {
-    S_OK
+unsafe extern "system" fn system_sandbox_id(
+    _: &SystemProvider,
+    size: usize,
+    buf: *mut u8,
+    used: *mut usize,
+) -> i32 {
+    unsafe { crate::gdk_services::xsystem_get_sandbox_id(size, buf, used) }
 }
 
-static GENERIC_PROVIDER_VTABLE: [Slot; 32] = {
-    let mut vt = [Slot(prov_ok as *const ()); 32];
-    vt[0] = Slot(prov_qi as *const ());
-    vt[1] = Slot(prov_add_ref as *const ());
-    vt[2] = Slot(prov_release as *const ());
-    vt
+unsafe extern "system" fn system_device_id(
+    _: &SystemProvider,
+    size: usize,
+    buf: *mut u8,
+    used: *mut usize,
+) -> i32 {
+    unsafe { crate::gdk_services::xsystem_get_app_specific_device_id(size, buf, used) }
+}
+
+static SYSTEM_VTABLE: SystemVtable = SystemVtable {
+    query_interface: system_qi,
+    add_ref: system_add_ref,
+    release: system_release,
+    console_id: system_console_id,
+    sandbox_id: system_sandbox_id,
+    device_id: system_device_id,
 };
 
-/// `xgameruntime.dll!QueryApiImpl(provider_guid, interface_guid, out_interface)`
 pub unsafe extern "system" fn query_api_impl(
     provider: *const [u8; 16],
     interface: *const [u8; 16],
     out: *mut *mut c_void,
 ) -> i32 {
-    if out.is_null() || provider.is_null() || interface.is_null() {
+    if out.is_null() {
         return E_INVALIDARG;
     }
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for b in unsafe { (*provider).iter().chain((*interface).iter()) } {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    unsafe { out.write(std::ptr::null_mut()) };
+    let (Some(provider), Some(interface)) =
+        (unsafe { provider.as_ref() }, unsafe { interface.as_ref() })
+    else {
+        return E_INVALIDARG;
+    };
+    if *provider != XSYSTEM || ![XSYSTEM_2022, XSYSTEM_2026].contains(interface) {
+        return NOT_SUPPORTED;
     }
-    let obj = Box::into_raw(Box::new(GenericApiProvider {
-        vtable: &GENERIC_PROVIDER_VTABLE,
+    let object = Box::new(SystemProvider {
+        vtable: &SYSTEM_VTABLE,
         ref_count: AtomicU32::new(1),
-        provider_hash: h,
-    }));
-    unsafe { *out = obj.cast() };
+        interface: *interface,
+    });
+    unsafe { out.write(Box::into_raw(object).cast()) };
     S_OK
 }
-
 // ============================================================================
 // Extended GDK Flat Exports (XUser, XGameSave, XStore, XPackage, XAsync, PLM)
 // ============================================================================
@@ -635,60 +692,6 @@ unsafe extern "system" fn uuid_from_string_a(s: *const c_char, out: *mut Uuid) -
 }
 
 // ============================================================================
-// mfplat.dll & mfreadwrite.dll (Media Foundation hooks via services::MediaSession)
-// ============================================================================
-
-unsafe extern "system" fn mf_startup(_version: u32, _flags: u32) -> i32 {
-    MF_REF_COUNT.fetch_add(1, Ordering::Relaxed);
-    S_OK
-}
-
-unsafe extern "system" fn mf_shutdown() -> i32 {
-    let _ = MF_REF_COUNT.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-        Some(v.saturating_sub(1))
-    });
-    S_OK
-}
-
-unsafe extern "system" fn mf_ok_zero() -> i32 {
-    S_OK
-}
-
-unsafe extern "system" fn mf_create_object(out: *mut *mut c_void) -> i32 {
-    if out.is_null() {
-        return E_INVALIDARG;
-    }
-    let obj = Box::into_raw(Box::new(GenericApiProvider {
-        vtable: &GENERIC_PROVIDER_VTABLE,
-        ref_count: AtomicU32::new(1),
-        provider_hash: 0x4D46_504C_4154,
-    }));
-    unsafe { *out = obj.cast() };
-    S_OK
-}
-
-unsafe extern "system" fn mf_create_attributes(out: *mut *mut c_void, _initial: u32) -> i32 {
-    unsafe { mf_create_object(out) }
-}
-
-unsafe extern "system" fn mf_create_memory_buffer(_max_len: u32, out: *mut *mut c_void) -> i32 {
-    unsafe { mf_create_object(out) }
-}
-
-unsafe extern "system" fn mf_create_source_reader(
-    _src: *const c_void,
-    _attrs: *mut c_void,
-    out: *mut *mut c_void,
-) -> i32 {
-    if out.is_null() {
-        return E_INVALIDARG;
-    }
-    let _ = E_NOINTERFACE;
-    let _ = E_FAIL;
-    unsafe { mf_create_object(out) }
-}
-
-// ============================================================================
 // Dispatcher called from thunks::resolve_hle
 // ============================================================================
 
@@ -781,18 +784,6 @@ pub fn resolve_os_hle(dll_lower: &str, func_name: &str) -> Option<usize> {
             "UuidCompare" => uuid_compare as *const () as usize,
             _ => return None,
         }),
-        "mfplat.dll" | "mfreadwrite.dll" => Some(match func_name {
-            "MFStartup" => mf_startup as *const () as usize,
-            "MFShutdown" => mf_shutdown as *const () as usize,
-            "MFLockPlatform" | "MFUnlockPlatform" => mf_ok_zero as *const () as usize,
-            "MFCreateAttributes" => mf_create_attributes as *const () as usize,
-            "MFCreateMediaType" | "MFCreateSample" => mf_create_object as *const () as usize,
-            "MFCreateMemoryBuffer" => mf_create_memory_buffer as *const () as usize,
-            "MFCreateSourceReaderFromURL" | "MFCreateSourceReaderFromByteStream" => {
-                mf_create_source_reader as *const () as usize
-            }
-            _ => return None,
-        }),
         _ => None,
     }
 }
@@ -802,16 +793,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn query_api_impl_returns_releasable_com_provider() {
-        let p = [1u8; 16];
-        let i = [2u8; 16];
-        let mut out = std::ptr::null_mut();
-        assert_eq!(unsafe { query_api_impl(&p, &i, &mut out) }, S_OK);
-        assert!(!out.is_null());
-        unsafe {
-            assert_eq!(prov_add_ref(out), 2);
-            assert_eq!(prov_release(out), 1);
-            assert_eq!(prov_release(out), 0);
+    fn query_api_impl_resolves_both_observed_xsystem_interfaces() {
+        let initialize =
+            crate::thunks::resolve_hle("xgameruntime.dll", "InitializeApiImplEx2").unwrap();
+        let initialize: unsafe extern "system" fn(u64, u64, u64, *const c_void) -> i32 =
+            unsafe { std::mem::transmute(initialize) };
+        assert_eq!(unsafe { initialize(1, 0, 0, std::ptr::null()) }, S_OK);
+        for iid in [XSYSTEM_2022, XSYSTEM_2026] {
+            let mut out = std::ptr::null_mut();
+            unsafe {
+                assert_eq!(query_api_impl(&XSYSTEM, &iid, &mut out), S_OK);
+                let object = &*out.cast::<SystemProvider>();
+                let vt = object.vtable;
+                let mut buf = [0u8; 7];
+                let mut used = 0;
+                assert_eq!(
+                    (vt.sandbox_id)(object, buf.len(), buf.as_mut_ptr(), &mut used),
+                    S_OK
+                );
+                assert_eq!(&buf, b"RETAIL\0");
+                assert_eq!(used, buf.len());
+                let mut unk = std::ptr::null_mut();
+                assert_eq!((vt.query_interface)(object, &IUNKNOWN, &mut unk), S_OK);
+                assert_eq!(out, unk);
+                assert_eq!((vt.release)(unk.cast()), 1);
+                assert_eq!((vt.release)(out.cast()), 0);
+                assert_eq!(query_api_impl(&XSYSTEM, &[0; 16], &mut out), NOT_SUPPORTED);
+                assert!(out.is_null());
+            }
         }
     }
 
@@ -840,19 +849,12 @@ mod tests {
     }
 
     #[test]
-    fn offline_wsa_and_mfplat_thunks_succeed() {
+    fn offline_wsa_thunks_reject_connections() {
         let mut wsa = [0u8; 408];
         assert_eq!(unsafe { wsa_startup(0x0202, wsa.as_mut_ptr()) }, 0);
         let sock = unsafe { wsa_socket(2, 1, 6) };
         assert_eq!(unsafe { wsa_connect(sock, std::ptr::null(), 0) }, -1);
         assert_eq!(unsafe { wsa_get_last_error() }, WSAEHOSTUNREACH);
         assert_eq!(unsafe { wsa_closesocket(sock) }, 0);
-
-        assert_eq!(unsafe { mf_startup(0x0002_0070, 0) }, S_OK);
-        let mut attrs = std::ptr::null_mut();
-        assert_eq!(unsafe { mf_create_attributes(&mut attrs, 4) }, S_OK);
-        assert!(!attrs.is_null());
-        assert_eq!(unsafe { prov_release(attrs) }, 0);
-        assert_eq!(unsafe { mf_shutdown() }, S_OK);
     }
 }

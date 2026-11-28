@@ -18,7 +18,7 @@ const LENGTH_BITS: u32 = 15;
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum XmaError {
-    #[error("XMA: unsupported channel count {0} (must be 1 or 2)")]
+    #[error("XMA: unsupported channel count {0} (must be 1 to 16)")]
     UnsupportedChannels(u8),
     #[error("XMA: invalid or truncated packet data")]
     InvalidPacket,
@@ -378,6 +378,53 @@ impl XmaFrameDecoder for Xma2FrameDecoder {
     }
 }
 
+/// The WMA Pro frame decoder ([`crate::wmapro`], ported from FFmpeg's XMA
+/// decoder): the default for [`XmaDecoder::new`].
+#[derive(Debug)]
+pub struct WmaProFrames {
+    dec: Option<crate::wmapro::WmaProDecoder>,
+    sample_rate: u32,
+    pub frames_failed: u64,
+}
+
+impl WmaProFrames {
+    pub fn new(sample_rate: u32) -> Self {
+        Self {
+            dec: None,
+            sample_rate,
+            frames_failed: 0,
+        }
+    }
+}
+
+impl XmaFrameDecoder for WmaProFrames {
+    fn decode(
+        &mut self,
+        frame: &XmaFrame,
+        channels: usize,
+        out: &mut Vec<f32>,
+    ) -> Result<(), XmaError> {
+        if self.dec.as_ref().is_none_or(|d| d.channels() != channels) {
+            self.dec = crate::wmapro::WmaProDecoder::new(channels, self.sample_rate);
+        }
+        let Some(d) = self.dec.as_mut() else {
+            return Err(XmaError::UnsupportedChannels(channels as u8));
+        };
+        // A frame that fails to decode plays as silence (and resets the
+        // overlap), like FFmpeg's packet-loss handling.
+        if d.decode_frame(&frame.data, frame.bit_len, out).is_err() {
+            self.frames_failed += 1;
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        if let Some(d) = self.dec.as_mut() {
+            d.reset();
+        }
+    }
+}
+
 /// Optional silent frame decoder (useful for deterministic timing tests).
 #[derive(Debug, Default)]
 pub struct SilentFrames {
@@ -406,6 +453,67 @@ pub struct XmaDecoder {
     channels: usize,
     sample_rate: u32,
     frames: Box<dyn XmaFrameDecoder>,
+    /// More than 2 channels: one 1/2-channel decoder per interleaved stream.
+    multi: Option<MultiStream>,
+}
+
+/// Most channels an XMA source carries (8 streams of 2).
+pub const MAX_CHANNELS: usize = 16;
+
+/// Channels per XMA stream for `channels` in total: 2 + 2 + ... + (1 or 2),
+/// the layout XMA2WAVEFORMATEX sources use.
+pub fn stream_layout(channels: usize) -> Vec<usize> {
+    let mut v = vec![2; channels / 2];
+    if channels % 2 == 1 {
+        v.push(1);
+    }
+    v
+}
+
+/// Which stream owns each packet, from the packets' skip counts (FFmpeg's
+/// `xma_decode_packet` rule): a stream keeps the next packet while its last
+/// packet's skip count is 0; otherwise the stream with the smallest pending
+/// skip takes it, and every stream's pending skip drops by one per packet.
+#[derive(Debug, Clone)]
+pub struct PacketScheduler {
+    skip: Vec<u32>,
+    current: usize,
+}
+
+impl PacketScheduler {
+    pub fn new(streams: usize) -> Self {
+        Self {
+            skip: vec![0; streams.max(1)],
+            current: 0,
+        }
+    }
+
+    /// The owner of the next packet, given that packet's header.
+    pub fn assign(&mut self, header: &PacketHeader) -> usize {
+        let owner = self.current;
+        self.skip[owner] = header.skip_packets;
+        if self.skip[owner] != 0 {
+            let mut best = 0;
+            for (i, &k) in self.skip.iter().enumerate() {
+                if k < self.skip[best] {
+                    best = i;
+                }
+            }
+            self.current = best;
+        }
+        for k in &mut self.skip {
+            *k = k.saturating_sub(1);
+        }
+        owner
+    }
+}
+
+#[derive(Debug)]
+struct MultiStream {
+    streams: Vec<XmaDecoder>,
+    scheduler: PacketScheduler,
+    /// Decoded samples not yet interleaved, per stream.
+    pending: Vec<std::collections::VecDeque<f32>>,
 }
 
 impl Clone for XmaDecoder {
@@ -416,8 +524,31 @@ impl Clone for XmaDecoder {
 }
 
 impl XmaDecoder {
+    /// A decoder for `channels` (1 to 16; more than 2 are interleaved
+    /// streams laid out by [`stream_layout`]).
     pub fn new(channels: u8, sample_rate: u32) -> Result<Self, XmaError> {
-        Self::with_frame_decoder(channels, sample_rate, Box::<Xma2FrameDecoder>::default())
+        if (3..=MAX_CHANNELS as u8).contains(&channels) {
+            let streams = stream_layout(channels as usize)
+                .into_iter()
+                .map(|c| Self::new(c as u8, sample_rate))
+                .collect::<Result<Vec<_>, _>>()?;
+            let n = streams.len();
+            return Ok(Self {
+                channels: channels as usize,
+                sample_rate,
+                frames: Box::<SilentFrames>::default(),
+                multi: Some(MultiStream {
+                    streams,
+                    scheduler: PacketScheduler::new(n),
+                    pending: vec![std::collections::VecDeque::new(); n],
+                }),
+            });
+        }
+        Self::with_frame_decoder(
+            channels,
+            sample_rate,
+            Box::new(WmaProFrames::new(sample_rate)),
+        )
     }
 
     /// A decoder whose frames `frames` decodes.
@@ -433,6 +564,7 @@ impl XmaDecoder {
             channels: channels as usize,
             sample_rate,
             frames,
+            multi: None,
         })
     }
 
@@ -445,7 +577,52 @@ impl XmaDecoder {
     }
 
     pub fn reset(&mut self) {
+        if let Some(m) = &mut self.multi {
+            for s in &mut m.streams {
+                s.reset();
+            }
+            m.scheduler = PacketScheduler::new(m.streams.len());
+            m.pending.iter_mut().for_each(|p| p.clear());
+        }
         self.frames.reset();
+    }
+
+    /// Multi-stream sources: packets go to their owning stream, each stream
+    /// decodes its own packet sequence, and the channels are interleaved in
+    /// stream order (stream 0's channels first).
+    fn decode_multi(&mut self, data: &[u8]) -> Result<Vec<f32>, XmaError> {
+        let total = self.channels;
+        let m = self.multi.as_mut().expect("multi-stream");
+        let mut per_stream: Vec<Vec<u8>> = vec![Vec::new(); m.streams.len()];
+        for pkt in 0..data.len() / PACKET_BYTES {
+            let hdr = parse_packet_header(data, pkt).ok_or(XmaError::InvalidPacket)?;
+            let owner = m.scheduler.assign(&hdr);
+            per_stream[owner]
+                .extend_from_slice(&data[pkt * PACKET_BYTES..(pkt + 1) * PACKET_BYTES]);
+        }
+        for (i, packets) in per_stream.iter().enumerate() {
+            if packets.len() >= PACKET_BYTES {
+                let pcm = m.streams[i].decode_packets(packets)?;
+                m.pending[i].extend(pcm);
+            }
+        }
+        // Interleave the whole sample frames every stream has.
+        let frames = m
+            .streams
+            .iter()
+            .zip(&m.pending)
+            .map(|(s, p)| p.len() / s.channels())
+            .min()
+            .unwrap_or(0);
+        let mut out = Vec::with_capacity(frames * total);
+        for _ in 0..frames {
+            for (s, p) in m.streams.iter().zip(&mut m.pending) {
+                for _ in 0..s.channels() {
+                    out.push(p.pop_front().unwrap_or(0.0));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Decode one extracted [`XmaFrame`] into `FRAME_SAMPLES * channels` interleaved `f32` samples.
@@ -464,6 +641,9 @@ impl XmaDecoder {
     pub fn decode_packets(&mut self, data: &[u8]) -> Result<Vec<f32>, XmaError> {
         if data.len() < PACKET_BYTES {
             return Err(XmaError::InvalidPacket);
+        }
+        if self.multi.is_some() {
+            return self.decode_multi(data);
         }
         let mut pkt = 0usize;
         let mut start_bit = None;
@@ -493,6 +673,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn multi_stream_layout_and_packet_ownership() {
+        assert_eq!(stream_layout(6), [2, 2, 2]);
+        assert_eq!(stream_layout(5), [2, 2, 1]);
+        let h = |skip| PacketHeader {
+            frame_count: 1,
+            first_frame_bit_offset: 0,
+            metadata: 0,
+            skip_packets: skip,
+        };
+        // Three streams that each skip the other two's packets: round robin.
+        let mut s = PacketScheduler::new(3);
+        let owners: Vec<usize> = (0..6).map(|_| s.assign(&h(2))).collect();
+        assert_eq!(owners, [0, 1, 2, 0, 1, 2]);
+        // A stream with skip 0 keeps consecutive packets.
+        let mut s = PacketScheduler::new(2);
+        assert_eq!(
+            [s.assign(&h(0)), s.assign(&h(1)), s.assign(&h(1))],
+            [0, 0, 1]
+        );
+
+        // A 6-channel decoder interleaves three 2-channel streams.
+        let mut d = XmaDecoder::new(6, 48_000).unwrap();
+        assert_eq!(d.channels(), 6);
+        let mut data = vec![0u8; 3 * PACKET_BYTES];
+        for p in 0..3 {
+            let hdr: u32 = (1 << 26) | 2; // one frame, skip 2 packets
+            data[p * PACKET_BYTES..p * PACKET_BYTES + 4].copy_from_slice(&hdr.to_be_bytes());
+            let len_bits: u16 = 256 << 1;
+            data[p * PACKET_BYTES + 4..p * PACKET_BYTES + 6]
+                .copy_from_slice(&len_bits.to_be_bytes());
+        }
+        let pcm = d.decode_packets(&data).unwrap();
+        assert_eq!(pcm.len(), FRAME_SAMPLES * 6);
+    }
+
+    #[test]
     fn parses_packet_header_and_decodes_synthetic_frame() {
         let mut pkt = vec![0u8; PACKET_BYTES];
         // 1 frame, first_frame_bit_offset = 0, metadata = 0, skip = 0
@@ -512,7 +728,8 @@ mod tests {
         assert_eq!(pcm.len(), FRAME_SAMPLES * 2);
         assert!(pcm.iter().all(|s| *s == 0.0));
 
-        // Non-zero coded XMA2 payload produces real non-zero IMDCT PCM audio.
+        // An arbitrary payload is not a valid WMA Pro frame: the decoder
+        // keeps the timing (one frame of samples) and plays silence.
         let mut coded = vec![0u8; PACKET_BYTES];
         coded[0..4].copy_from_slice(&hdr.to_be_bytes());
         coded[4..6].copy_from_slice(&len_bits.to_be_bytes());
@@ -521,7 +738,6 @@ mod tests {
         }
         let pcm_coded = dec.decode_packets(&coded).unwrap();
         assert_eq!(pcm_coded.len(), FRAME_SAMPLES * 2);
-        assert!(pcm_coded.iter().any(|&s| s.abs() > 1e-4));
         assert!(pcm_coded.iter().all(|&s| s.is_finite() && s.abs() <= 1.0));
     }
 }

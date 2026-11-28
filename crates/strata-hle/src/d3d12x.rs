@@ -613,10 +613,12 @@ impl D3D12CommandQueueX {
         gpu_runner: Arc<ComputeRunner>,
         uma: Arc<Mutex<UmaManager>>,
     ) -> *mut Self {
-        let q = Self::new_boxed_with_runner(Some(gpu_runner));
-        // SAFETY: freshly boxed, not shared yet.
-        unsafe { (*q).uma = Some(uma) };
-        q
+        Self::new_boxed_shared(
+            Some(gpu_runner),
+            Some(uma),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(TextureCache::new())),
+        )
     }
 
     /// An engine sharing a device's pipelines and textures (every queue of
@@ -627,6 +629,14 @@ impl D3D12CommandQueueX {
         pipelines: PipelineTable,
         textures: SharedTextures,
     ) -> *mut Self {
+        // With console memory attached, writes to shadowed (write-watched)
+        // mirrors are logged: clean textures there bind without a re-hash.
+        // `STRATA_TEXTURE_DIRTY_TRACKING=0` always re-hashes.
+        if uma.is_some()
+            && std::env::var("STRATA_TEXTURE_DIRTY_TRACKING").map_or(true, |v| v.trim() != "0")
+        {
+            textures.lock().unwrap().set_dirty_tracking(true);
+        }
         Box::into_raw(Box::new(Self {
             header: ComHeader {
                 vtable: &CMD_QUEUE_VTABLE,
@@ -666,6 +676,11 @@ impl D3D12CommandQueueX {
     pub fn open_texture_store(&self, dir: &std::path::Path) -> std::io::Result<()> {
         let store = TextureStore::open(dir)?;
         *self.texture_store.lock().unwrap() = Some(store);
+        // Texture binds check the store on a miss and fill it after detiling.
+        self.textures
+            .lock()
+            .unwrap()
+            .attach_store(TextureStore::open(dir)?);
         Ok(())
     }
 
@@ -674,12 +689,8 @@ impl D3D12CommandQueueX {
         self.timeline.lock().unwrap().to_chrome_trace_json()
     }
 
-    /// Executes a batch of closed command lists, translating multi-list batches
-    /// in parallel via [`ThinTranslationPool`] and draining queued uploads first.
-    pub fn execute_command_lists(&self, lists: Vec<ThinCommandList>) {
-        if lists.is_empty() {
-            return;
-        }
+    pub(crate) fn prepare_submission(&self) {
+        let prepare = strata_gpu::perf::start();
         // Drain any queued host-to-UMA uploads before running commands.
         {
             let mem = TitleMemory {
@@ -689,21 +700,41 @@ impl D3D12CommandQueueX {
             let mut uq = self.upload_queue.lock().unwrap();
             let prev_bytes = uq.total_bytes_uploaded;
             uq.flush(|dst_va, data| {
-                let _ = mem.write(dst_va, data);
+                if mem.write(dst_va, data) {
+                    strata_gpu::perf::upload_bytes(data.len() as u64);
+                } else {
+                    strata_gpu::perf::binding_errors(1);
+                    crate::crash::log_line("queued upload: destination is unavailable");
+                }
             });
             if uq.total_bytes_uploaded > prev_bytes {
                 let mut tl = self.timeline.lock().unwrap();
                 let dur = tl.now_us().saturating_sub(t0);
                 tl.record_span("UploadQueue::flush", SpanTrack::UploadCopy, t0, dur);
             }
-            let _ready_tex = self.texture_ahead.drain_ready(64);
         }
+        if let Some(prepare) = prepare {
+            strata_gpu::perf::preparation_ns(prepare.elapsed().as_nanos() as u64);
+        }
+    }
+
+    /// Executes a batch of closed command lists, translating multi-list batches
+    /// in parallel via [`ThinTranslationPool`] and draining queued uploads first.
+    pub fn execute_command_lists(&self, lists: Vec<ThinCommandList>) {
+        if lists.is_empty() {
+            return;
+        }
+        self.prepare_submission();
         if lists.len() == 1 {
             self.execute_thin(&lists[0]);
             return;
         }
+        let prepare = strata_gpu::perf::start();
         let t0 = self.timeline.lock().unwrap().now_us();
         let batches = self.translation_pool.translate_parallel(lists);
+        if let Some(prepare) = prepare {
+            strata_gpu::perf::preparation_ns(prepare.elapsed().as_nanos() as u64);
+        }
         {
             let mut tl = self.timeline.lock().unwrap();
             let dur = tl.now_us().saturating_sub(t0);
@@ -716,6 +747,7 @@ impl D3D12CommandQueueX {
         }
         for batch in batches {
             let mut flattened = ThinCommandList::new();
+            flattened.hoisted_clamps = batch.hoisted_clamps;
             for op in batch.ops {
                 flattened.push(op);
             }
@@ -995,6 +1027,7 @@ pub fn translate_mesh(
 }
 
 /// A registered pipeline: its SPIR-V and the images it binds.
+#[derive(Clone)]
 pub struct PipelineEntry {
     /// The compute shader, or the pixel shader of a graphics pipeline.
     pub spirv: Vec<u32>,
@@ -1047,6 +1080,8 @@ impl TitleMemory<'_> {
         // SAFETY: title memory the title itself writes; committed (checked).
         let dst = unsafe { std::slice::from_raw_parts_mut(host as *mut u8, bytes.len()) };
         let _ = strata_gpu::readback::land_changed_dwords(bytes, dst);
+        // Caches of title memory (textures) must see host-side writes.
+        strata_gpu::dirty_log::note(addr, bytes.len() as u64);
         true
     }
 
@@ -1289,6 +1324,7 @@ impl D3D12CommandQueueX {
         let skip = (v == 0) == skip_if_zero;
         if skip {
             self.predicated_skips.fetch_add(1, Ordering::Relaxed);
+            strata_gpu::perf::predicated_commands(1);
         }
         skip
     }
@@ -1388,7 +1424,7 @@ impl D3D12CommandQueueX {
             }
         };
         for w in &colors {
-            if let Err(e) = textures.texture(runner, *w, false, &read) {
+            if let Err(e) = textures.color_target(runner, *w, &read) {
                 crate::crash::log_line(&format!("draw skipped: render target: {e}"));
                 return false;
             }
@@ -1449,7 +1485,9 @@ impl D3D12CommandQueueX {
             }
             _ => None,
         };
-        let want_query = st.active_occlusion_query.is_some() || st.active_stats_query.is_some();
+        st.query_acc.capture_time = strata_gpu::perf::enabled();
+        st.query_acc.gpu_ms = None;
+        let want_query = st.active_occlusion_query.is_some() || st.active_stats_query.is_some() || st.query_acc.capture_time;
         if want_query {
             st.query_acc.capture_occlusion = st.active_occlusion_query.is_some();
             st.query_acc.capture_pipeline_stats = st.active_stats_query.is_some();
@@ -1482,6 +1520,9 @@ impl D3D12CommandQueueX {
                 )
                 .is_ok()
         };
+        if let Some(ms) = st.query_acc.gpu_ms {
+            strata_gpu::perf::graphics_gpu_ns((ms * 1_000_000.0) as u64);
+        }
         for t in colors.iter().chain(&writes) {
             if let Err(e) = textures.write_back(runner, *t, &write, &read) {
                 crate::crash::log_line(&format!("render target write-back: {e}"));
@@ -1536,7 +1577,7 @@ impl D3D12CommandQueueX {
             }
         };
         for w in &colors {
-            if let Err(e) = textures.texture(runner, *w, false, &read) {
+            if let Err(e) = textures.color_target(runner, *w, &read) {
                 crate::crash::log_line(&format!("mesh draw skipped: render target: {e}"));
                 return false;
             }
@@ -1568,7 +1609,9 @@ impl D3D12CommandQueueX {
         }
         state.shading_rate = st.shading_rate;
         state.shading_rate_combiners = st.shading_rate_combiners;
-        let want_query = st.active_occlusion_query.is_some() || st.active_stats_query.is_some();
+        st.query_acc.capture_time = strata_gpu::perf::enabled();
+        st.query_acc.gpu_ms = None;
+        let want_query = st.active_occlusion_query.is_some() || st.active_stats_query.is_some() || st.query_acc.capture_time;
         if want_query {
             st.query_acc.capture_occlusion = st.active_occlusion_query.is_some();
             st.query_acc.capture_pipeline_stats = st.active_stats_query.is_some();
@@ -1595,6 +1638,9 @@ impl D3D12CommandQueueX {
                 )
                 .is_ok()
         };
+        if let Some(ms) = st.query_acc.gpu_ms {
+            strata_gpu::perf::graphics_gpu_ns((ms * 1_000_000.0) as u64);
+        }
         for t in colors.iter().chain(&writes) {
             if let Err(e) = textures.write_back(runner, *t, &write, &read) {
                 crate::crash::log_line(&format!("mesh render target write-back: {e}"));
@@ -1882,8 +1928,16 @@ impl D3D12CommandQueueX {
                     self.dispatch_mesh(runner, &mem, active_pso, &shadow, &mut st, [*x, *y, *z]);
                 }
                 ThinCommand::BuildAccel(build) => {
-                    if let Err(e) = crate::d3d12_rt::build(&mem_reader(&mem, runner), build) {
-                        crate::crash::log_line(&format!("acceleration structure build: {e}"));
+                    match crate::d3d12_rt::build(&mem_reader(&mem, runner), build) {
+                        // The latest top-level structure is the one BMA
+                        // samples and shortcuts (`STRATA_BVH_BMA`).
+                        Ok(_) if build.top_level => {
+                            runner.bma_set_root(build.dest + crate::d3d12_rt::HEADER_BYTES);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            crate::crash::log_line(&format!("acceleration structure build: {e}"));
+                        }
                     }
                 }
                 ThinCommand::CopyAccel { dst, src } => {
@@ -2446,6 +2500,7 @@ unsafe extern "system" fn queue_execute_command_lists(
     }
     let queue = unsafe { &*(this as *const D3D12CommandQueueX) };
     let slice = unsafe { std::slice::from_raw_parts(lists, num_lists as usize) };
+    queue.prepare_submission();
     for &ptr in slice {
         if ptr.is_null() {
             continue;

@@ -38,12 +38,12 @@ pub fn split_dispatch(groups: [u32; 3], limit: [u32; 3]) -> Vec<([u32; 3], [u32;
     out
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PipelineKey(pub u64);
 
 /// A linear surface in title memory: element rows `row_pitch` apart,
 /// slices `slice_pitch` apart (elements are texels, or 4×4 blocks).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Surface {
     pub va: u64,
     pub row_pitch: u64,
@@ -54,7 +54,7 @@ pub struct Surface {
 
 /// `CopyTextureRegion`: `extent` elements from `src` at `src_origin` to
 /// `dst` at `dst_origin` (x, y in elements, z in slices).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TextureCopy {
     pub dst: Surface,
     pub dst_origin: [u32; 3],
@@ -65,7 +65,7 @@ pub struct TextureCopy {
 
 /// One argument of an `ExecuteIndirect` command signature, in the order
 /// the argument buffer holds them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum IndirectArg {
     /// `D3D12_DRAW_ARGUMENTS` (4 dwords).
     Draw,
@@ -103,7 +103,7 @@ impl IndirectArg {
 }
 
 /// An `ExecuteIndirect` command signature.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IndirectLayout {
     pub stride: u32,
     pub args: Vec<IndirectArg>,
@@ -111,7 +111,7 @@ pub struct IndirectLayout {
 
 /// One bottom-level geometry of a `BuildRaytracingAccelerationStructure`,
 /// read from title memory when the build executes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AccelGeometry {
     Triangles {
         /// 3x4 row-major float transform address (0: identity).
@@ -137,7 +137,7 @@ pub enum AccelGeometry {
 }
 
 /// `BuildRaytracingAccelerationStructure`: what to build, and where.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AccelBuild {
     pub dest: u64,
     pub dest_size: u64,
@@ -149,14 +149,14 @@ pub struct AccelBuild {
 }
 
 /// Which depth/stencil aspects a clear writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ClearAspects {
     pub color: bool,
     pub depth: bool,
     pub stencil: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RenderTargetDesc {
     pub console_va: u64,
     pub format_is_integer: bool,
@@ -173,7 +173,7 @@ impl RenderTargetDesc {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ThinCommand {
     BindPipeline(PipelineKey),
     SetRenderTargets(Vec<RenderTargetDesc>),
@@ -572,6 +572,10 @@ impl ThinCommandList {
 
     pub fn commands(&self) -> &[ThinCommand] {
         &self.commands
+    }
+
+    pub(crate) fn into_recording(self) -> (Vec<ThinCommand>, Vec<(u64, u32, u32)>) {
+        (self.commands, self.hoisted_clamps)
     }
 }
 

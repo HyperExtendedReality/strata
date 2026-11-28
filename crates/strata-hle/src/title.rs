@@ -601,6 +601,11 @@ fn load_library_for_title(raw: &str, flags: u32) -> Option<Handle> {
     if flags & LOAD_AS_DATA != 0 {
         return None;
     }
+    if flags == 0
+        && let Some(module) = crate::loader::load_system_media_foundation(raw)
+    {
+        return Some(module);
+    }
     let name = module_file_name(raw);
     if classify_dll(&name) == DllClass::StrataHle {
         return crate::hooks::hook_load_library(&name).map(|h| h as Handle);

@@ -33,10 +33,16 @@ pub fn command() -> Result<(), String> {
     let mut window = false;
     let mut require_gpu = false;
     let mut cache = None;
+    let mut frames = 8;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--window" => window = true,
             "--require-gpu" => require_gpu = true,
+            "--frames" => {
+                frames = args.next().and_then(|value| value.parse().ok())
+                    .filter(|&count| (1..=1_000_000).contains(&count))
+                    .ok_or("--frames requires a value between 1 and 1000000")?;
+            }
             "--report" | "--capture" | "--pipeline-cache-dir" => {
                 let path = PathBuf::from(args.next().ok_or_else(|| format!("{arg} needs a path"))?);
                 match arg.as_str() {
@@ -66,7 +72,7 @@ pub fn command() -> Result<(), String> {
     if let Some(cache) = cache {
         runner.enable_pipeline_cache(&cache, true);
     }
-    let report = synthetic(&runner, start, window, capture.as_deref());
+    let report = synthetic(&runner, start, window, capture.as_deref(), frames);
     match report {
         Ok(report) => {
             runner.flush_pipeline_cache().map_err(|e| e.to_string())?;
@@ -87,6 +93,7 @@ fn synthetic(
     start: Instant,
     visible: bool,
     capture: Option<&Path>,
+    frame_count: usize,
 ) -> Result<Value, String> {
     let gpu = |e: strata_gpu::context::GpuError| e.to_string();
     let format = vk::Format::R8G8B8A8_UNORM;
@@ -124,7 +131,7 @@ fn synthetic(
     let mut frame_times = Vec::new();
     let mut visible_first = None;
     let mut first_output = None;
-    for _ in 0..8 {
+    for _ in 0..frame_count {
         let frame_start = Instant::now();
         compose_planes(runner, &planes, &output).map_err(gpu)?;
         if first_output.is_none() {
@@ -186,6 +193,12 @@ fn synthetic(
     if !test_wave_boundary(runner)? {
         skipped.push("native compute Wave64 shuffle unavailable");
     }
+    let ray_query = if runner.ray_query {
+        Some(ray_query_parity(runner)?)
+    } else {
+        skipped.push("Vulkan ray query is unavailable");
+        None
+    };
     let shown = visible_window.map_or(0, |window| window.finish(runner));
     if visible && shown == 0 {
         return Err("the compositor produced frames but the window showed none".into());
@@ -206,12 +219,50 @@ fn synthetic(
         "frames_composed": frame_times.len(), "present_calls": if visible { frame_times.len() } else { 0 },
         "frames_shown": shown, "first_output_ms": first_output, "first_visible_frame_ms": visible_first,
         "frame_ms_p50": percentile(&frame_times, 0.50), "frame_ms_p95": percentile(&frame_times, 0.95),
+        "frame_ms_p99": percentile(&frame_times, 0.99), "frame_ms_p999": percentile(&frame_times, 0.999),
+        "ray_query_parity": ray_query,
         "replay_different_pixels": replay.diff.differing_pixels, "replay_compose_and_readback_ms": replay.compose_and_readback_ms,
         "replay_planes": replay.plane_timings.iter().map(|pass| json!({"wall_ms": pass.wall_ms, "gpu_ms": pass.gpu_ms})).collect::<Vec<_>>(),
         "driver_cache_loaded": pipeline_stats.driver_cache_loaded, "prewarmed": pipeline_stats.prewarmed,
         "warmup_ms": pipeline_stats.warmup_ms, "pipeline_stall_ms": pipeline_stats.creation_ms,
         "skipped": skipped,
     }))
+}
+
+fn ray_query_parity(runner: &ComputeRunner) -> Result<Value, String> {
+    use strata_shader::bvh::{Ray, intersect_triangle};
+
+    let triangle = |z| [[0.0, 0.0, z], [1.0, 0.0, z], [0.0, 1.0, z]];
+    let triangles = [triangle(4.0), triangle(2.0)];
+    let rays = [([0.25, 0.125, 0.0], 10.0), ([2.0, 1.0, 0.0], 10.0), ([0.25, 0.125, 0.0], 1.0)];
+    let mut timings = Vec::new();
+    for (origin, t_max) in rays {
+        let ray = Ray { origin, t_max, dir: [0.0, 0.0, 1.0], inv_dir: [f32::INFINITY, f32::INFINITY, 1.0] };
+        let start = Instant::now();
+        let expected = triangles.iter().enumerate().filter_map(|(index, &[a, b, c])| {
+            let [num, den, u, v] = intersect_triangle(&ray, a, b, c);
+            num.is_finite().then_some((index as u32, num / den, [u / den, v / den]))
+        }).min_by(|a, b| a.1.total_cmp(&b.1));
+        let software_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        let (actual, timing) = runner.query_opaque_triangles_timed(&triangles, origin, ray.dir, t_max)
+            .map_err(|error| error.to_string())?;
+        let matches = match (expected, actual) {
+            (None, None) => true,
+            (Some((primitive, t, uv)), Some(hit)) => primitive == hit.primitive
+                && (t - hit.t).abs() < 1e-5
+                && uv.into_iter().zip(hit.barycentrics).all(|(a, b)| (a - b).abs() < 1e-5),
+            _ => false,
+        };
+        if !matches {
+            return Err(format!("ray query parity for {origin:?}, tMax={t_max}: CPU {expected:?}, GPU {actual:?}"));
+        }
+        timings.push(json!({
+            "hit": actual.is_some(), "software_ms": software_ms,
+            "as_build_wall_ms": timing.build.as_secs_f64() * 1_000.0,
+            "trace_wall_ms": timing.trace.as_secs_f64() * 1_000.0,
+        }));
+    }
+    Ok(json!(timings))
 }
 
 fn test_wave64_ballot(runner: &ComputeRunner) -> Result<(), String> {

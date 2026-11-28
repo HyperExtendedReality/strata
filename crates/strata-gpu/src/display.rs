@@ -65,6 +65,14 @@ fn compose(
         )
     });
     runner.one_shot(|dev, cmd| unsafe {
+        // The opaque base plane overwrites this surface on every composition.
+        barrier_image(
+            dev,
+            cmd,
+            target,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::GENERAL,
+        );
         for plane in planes {
             barrier_image(
                 dev,
@@ -150,8 +158,10 @@ pub struct Display {
     pub extent: vk::Extent2D,
     pub mode: DisplayMode,
     acquired: vk::Semaphore,
-    blitted: vk::Semaphore,
+    /// Each swapchain image has its own presentation wait semaphore.
+    blitted: Vec<vk::Semaphore>,
     fence: vk::Fence,
+    frame_pending: bool,
     cmd: vk::CommandBuffer,
     pub frames: u64,
 }
@@ -197,17 +207,22 @@ impl Display {
             }
             let sem = vk::SemaphoreCreateInfo::default();
             let acquired = runner.device.create_semaphore(&sem, None)?;
-            let blitted = runner.device.create_semaphore(&sem, None)?;
             let fence = runner.device.create_fence(
                 &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
                 None,
             )?;
-            let cmd = runner.device.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(runner.cmd_pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )?[0];
+            let cmd = {
+                let _pool = runner
+                    .cmd_pool_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                runner.device.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(runner.cmd_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )?[0]
+            };
             let mut d = Self {
                 handle,
                 surface_loader,
@@ -220,12 +235,16 @@ impl Display {
                 extent: vk::Extent2D { width, height },
                 mode: DisplayMode::Sdr,
                 acquired,
-                blitted,
+                blitted: Vec::new(),
                 fence,
+                frame_pending: false,
                 cmd,
                 frames: 0,
             };
-            d.recreate(runner, width, height, DisplayMode::Sdr)?;
+            if let Err(error) = d.recreate(runner, width, height, DisplayMode::Sdr) {
+                d.destroy(runner);
+                return Err(error);
+            }
             Ok(d)
         }
     }
@@ -286,9 +305,9 @@ impl Display {
         height: u32,
         mode: DisplayMode,
     ) -> Result<(), GpuError> {
-        // SAFETY: nothing uses the old swapchain (the last present's fence was waited on).
+        // SAFETY: wait for queue work before retiring the old swapchain's resources.
         unsafe {
-            let _ = runner.device.device_wait_idle();
+            runner.wait_idle()?;
             let caps = self
                 .surface_loader
                 .get_physical_device_surface_capabilities(runner.pdev, self.surface)?;
@@ -333,11 +352,25 @@ impl Display {
                 .present_mode(vk::PresentModeKHR::FIFO)
                 .clipped(true)
                 .old_swapchain(old);
-            self.swapchain = self.swapchain_loader.create_swapchain(&ci, None)?;
+            let created = self.swapchain_loader.create_swapchain(&ci, None);
+            self.swapchain = vk::SwapchainKHR::null();
+            self.images.clear();
+            for semaphore in self.blitted.drain(..) {
+                runner.device.destroy_semaphore(semaphore, None);
+            }
             if old != vk::SwapchainKHR::null() {
                 self.swapchain_loader.destroy_swapchain(old, None);
             }
-            self.images = self.swapchain_loader.get_swapchain_images(self.swapchain)?;
+            self.swapchain = created?;
+            let images = self.swapchain_loader.get_swapchain_images(self.swapchain)?;
+            for _ in &images {
+                self.blitted.push(
+                    runner
+                        .device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?,
+                );
+            }
+            self.images = images;
             self.format = sf.format;
             self.color_space = sf.color_space;
             self.extent = extent;
@@ -370,11 +403,15 @@ impl Display {
         if width == 0 || height == 0 {
             return Ok(false);
         }
-        if width != self.extent.width
+        if self.images.is_empty()
+            || width != self.extent.width
             || height != self.extent.height
             || (mode != self.mode && runner.hdr_colorspaces)
         {
             self.recreate(runner, width, height, mode)?;
+        }
+        if self.images.is_empty() {
+            return Ok(false);
         }
         for attempt in 0..2 {
             match unsafe { self.present_once(runner, frame) } {
@@ -398,15 +435,18 @@ impl Display {
     ) -> Result<(), GpuError> {
         let dev = &runner.device;
         unsafe {
-            dev.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.wait_for_frame(runner)?;
             let (index, _) = self.swapchain_loader.acquire_next_image(
                 self.swapchain,
                 u64::MAX,
                 self.acquired,
                 vk::Fence::null(),
             )?;
-            dev.reset_fences(&[self.fence])?;
             let target = self.images[index as usize];
+            let _pool = runner
+                .cmd_pool_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             dev.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())?;
             dev.begin_command_buffer(
                 self.cmd,
@@ -502,7 +542,9 @@ impl Display {
             let waits = [self.acquired];
             let stages = [vk::PipelineStageFlags::TRANSFER];
             let cmds = [self.cmd];
-            let signals = [self.blitted];
+            let signals = [self.blitted[index as usize]];
+            let _queue = runner.queue_lock.lock().unwrap_or_else(|e| e.into_inner());
+            dev.reset_fences(&[self.fence])?;
             dev.queue_submit(
                 runner.queue,
                 &[vk::SubmitInfo::default()
@@ -512,6 +554,7 @@ impl Display {
                     .signal_semaphores(&signals)],
                 self.fence,
             )?;
+            self.frame_pending = true;
             let swapchains = [self.swapchain];
             let indices = [index];
             self.swapchain_loader.queue_present(
@@ -525,17 +568,36 @@ impl Display {
         Ok(())
     }
 
+    /// Waits until the source image can be reused or destroyed.
+    pub fn wait_for_frame(&mut self, runner: &ComputeRunner) -> Result<(), GpuError> {
+        if self.frame_pending {
+            let _queue = runner.queue_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let result = unsafe { runner.wait_submitted_fence(runner.queue, self.fence) };
+            self.frame_pending = false;
+            result?;
+        }
+        Ok(())
+    }
+
     /// Releases the swapchain and surface.
     pub fn destroy(self, runner: &ComputeRunner) {
         // SAFETY: waits for the device before destroying.
         unsafe {
-            let _ = runner.device.device_wait_idle();
+            let _ = runner.wait_idle();
             runner.device.destroy_semaphore(self.acquired, None);
-            runner.device.destroy_semaphore(self.blitted, None);
+            for semaphore in self.blitted {
+                runner.device.destroy_semaphore(semaphore, None);
+            }
             runner.device.destroy_fence(self.fence, None);
-            runner
-                .device
-                .free_command_buffers(runner.cmd_pool, &[self.cmd]);
+            {
+                let _pool = runner
+                    .cmd_pool_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                runner
+                    .device
+                    .free_command_buffers(runner.cmd_pool, &[self.cmd]);
+            }
             self.swapchain_loader
                 .destroy_swapchain(self.swapchain, None);
             self.surface_loader.destroy_surface(self.surface, None);

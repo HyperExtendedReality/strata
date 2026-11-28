@@ -149,6 +149,41 @@ impl Terminator {
     }
 }
 
+/// Optional sample modifiers (`image_sample_d/_o/_cl/_c_b`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SampleExt {
+    /// Explicit derivatives `(d/dx, d/dy)` of `(u, v, w)` (`_d`); unused
+    /// components are 0.0.
+    pub grad: Option<([ValueId; 3], [ValueId; 3])>,
+    /// Packed signed 6-bit texel offsets: x `[5:0]`, y `[13:8]`, z `[21:16]`.
+    pub offset: Option<ValueId>,
+    /// Minimum LOD (`_cl`).
+    pub min_lod: Option<ValueId>,
+    /// LOD bias of a comparison sample (`image_sample_c_b`).
+    pub bias: Option<ValueId>,
+}
+
+impl SampleExt {
+    /// Every value the modifiers read.
+    pub fn values(&self) -> impl Iterator<Item = ValueId> + '_ {
+        self.grad
+            .iter()
+            .flat_map(|(a, b)| a.iter().chain(b.iter()).copied())
+            .chain(self.offset)
+            .chain(self.min_lod)
+            .chain(self.bias)
+    }
+
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut ValueId> + '_ {
+        self.grad
+            .iter_mut()
+            .flat_map(|(a, b)| a.iter_mut().chain(b.iter_mut()))
+            .chain(self.offset.iter_mut())
+            .chain(self.min_lod.iter_mut())
+            .chain(self.bias.iter_mut())
+    }
+}
+
 /// Pure, memory-accessing, or wave-level SSA operation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SsaOp {
@@ -323,6 +358,7 @@ pub enum SsaOp {
         lod: Option<ValueId>,
         bias: Option<ValueId>,
         implicit: bool,
+        ext: SampleExt,
     },
     /// Depth/shadow comparison sample (`image_sample_c*`); returns `Ty::F32` comparison result.
     ImageSampleDref {
@@ -334,6 +370,7 @@ pub enum SsaOp {
         dref: ValueId,
         lod: Option<ValueId>,
         implicit: bool,
+        ext: SampleExt,
     },
     /// 4-texel gather (`image_gather4*`); returns `Ty::U32x4`.
     ImageGather {
@@ -343,6 +380,7 @@ pub enum SsaOp {
         v: ValueId,
         w: ValueId,
         comp: u32,
+        ext: SampleExt,
     },
     /// Texture dimensions query (`image_get_resinfo`); returns `Ty::U32x4`.
     ImageQuerySize {
@@ -434,6 +472,9 @@ pub struct SsaModule {
     pub require_full_quads: bool,
     /// Number of 32-bit dwords in the per-invocation `Function` spill frame (`0` if unused).
     pub spill_dwords: u32,
+    /// Instrument box tests for BMA traversal shortcuts ([`crate::bma`]);
+    /// also on whenever `STRATA_BVH_BMA` is set.
+    pub bma: bool,
 }
 
 /// Values graphics stages receive.
@@ -509,6 +550,7 @@ impl SsaModule {
             inputs: BTreeMap::new(),
             require_full_quads: false,
             spill_dwords: 0,
+            bma: false,
         }
     }
 
@@ -3274,28 +3316,59 @@ impl Builder {
                 dmask,
                 dim,
                 mode,
+                offset,
+                clamp,
                 ..
             } => {
                 let slot = b.image_slot(di.pc, false)?;
                 let class = ImageDim::from_mimg(*dim);
                 let mut cur = *addr_vgpr;
-                let bias = if matches!(mode, SampleMode::Bias) {
+                // GFX10 address order: offset, bias, z-compare, derivatives,
+                // coordinates, then LOD or clamp.
+                let mut ext = SampleExt::default();
+                if *offset {
+                    ext.offset = Some(b.read_vgpr(cur));
+                    cur += 1;
+                }
+                let any_bias = matches!(mode, SampleMode::Bias | SampleMode::CompareBias);
+                let bias_val = if any_bias {
                     let v = b.read_vgpr(cur);
                     cur += 1;
                     Some(b.as_f32(v))
                 } else {
                     None
                 };
-                let dref = if matches!(
-                    mode,
-                    SampleMode::Compare | SampleMode::CompareLod | SampleMode::CompareLodZero
-                ) {
+                let bias = bias_val.filter(|_| matches!(mode, SampleMode::Bias));
+                ext.bias = bias_val.filter(|_| matches!(mode, SampleMode::CompareBias));
+                let dref = if mode.is_compare() {
                     let v = b.read_vgpr(cur);
                     cur += 1;
                     Some(b.as_f32(v))
                 } else {
                     None
                 };
+                if matches!(mode, SampleMode::Grad | SampleMode::CompareGrad) {
+                    // Per direction: 1D 1, 2D / arrays / cube (face s, t) 2,
+                    // 3D 3 (LLVM's AMDGPU gradient argument counts).
+                    let n = match *dim & 7 {
+                        0 | 4 => 1usize,
+                        2 => 3,
+                        _ => 2,
+                    };
+                    let zero = b.konst_f(0.0);
+                    let mut dx = [zero; 3];
+                    let mut dy = [zero; 3];
+                    for (k, d) in dx.iter_mut().enumerate().take(n) {
+                        let r = b.read_vgpr(cur + k as u8);
+                        *d = b.as_f32(r);
+                    }
+                    for (k, d) in dy.iter_mut().enumerate().take(n) {
+                        let r = b.read_vgpr(cur + (n + k) as u8);
+                        *d = b.as_f32(r);
+                    }
+                    cur += (2 * n) as u8;
+                    ext.grad = Some((dx, dy));
+                }
                 let (u, v, w, coord_regs) = b.float_coords(cur, *dim);
                 let lod = match mode {
                     SampleMode::Lod | SampleMode::CompareLod => {
@@ -3304,9 +3377,17 @@ impl Builder {
                     }
                     _ => None,
                 };
+                if *clamp {
+                    let c = b.read_vgpr(cur + coord_regs);
+                    ext.min_lod = Some(b.as_f32(c));
+                }
                 let implicit = matches!(
                     mode,
-                    SampleMode::Implicit | SampleMode::Bias | SampleMode::Compare
+                    SampleMode::Implicit
+                        | SampleMode::Bias
+                        | SampleMode::Compare
+                        | SampleMode::CompareBias
+                        | SampleMode::Gather
                 ) && b.m.stage == Stage::Pixel;
                 let blk = b.cur_block;
                 if let Some(dref_val) = dref {
@@ -3322,6 +3403,7 @@ impl Builder {
                             dref: dref_val,
                             lod,
                             implicit,
+                            ext,
                         },
                     );
                     let res_u = b.as_u32(res_f);
@@ -3349,6 +3431,7 @@ impl Builder {
                             v,
                             w,
                             comp,
+                            ext,
                         },
                     );
                     b.write_dmask(*dst, 0xf, texel);
@@ -3365,6 +3448,7 @@ impl Builder {
                             lod,
                             bias,
                             implicit,
+                            ext,
                         },
                     );
                     b.write_dmask(*dst, *dmask, texel);

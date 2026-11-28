@@ -256,6 +256,8 @@ impl UmaManager {
             return Err(e);
         }
         pages.dirty_ranges(true);
+        // CPU writes to these pages are seen by the write-watch scan.
+        crate::dirty_log::watch(console_va, size);
         let baseline = if self.mirror_diff && size >= 1024 * 1024 {
             runner
                 .alloc_vram_bda_buffer(size, &[])
@@ -317,14 +319,13 @@ impl UmaManager {
             if ranges.is_empty() {
                 continue;
             }
+            for &(off, len) in &ranges {
+                crate::dirty_log::note(alloc.console_va + off as u64, len as u64);
+            }
             let start = Instant::now();
             let moved = if let Some(baseline) = &shadow.baseline {
-                ranges.iter().try_fold(0, |bytes, &(off, len)| {
-                    diff_mirror(
-                        runner, alloc, shadow, baseline, off as u64, len as u64, true,
-                    )
-                    .map(|n| bytes + n)
-                })
+                diff_mirror(runner, alloc, shadow, baseline,
+                    ranges.iter().map(|&(off, len)| (off as u64, len as u64)), true)
             } else {
                 let regions: Vec<_> = ranges
                     .iter()
@@ -341,6 +342,7 @@ impl UmaManager {
             }
             let moved = moved?;
             self.upload_bytes.fetch_add(moved, Ordering::Relaxed);
+            crate::perf::upload_bytes(moved);
             stats.ranges += ranges.len();
             stats.bytes += moved;
         }
@@ -373,7 +375,7 @@ impl UmaManager {
         }
         let start = Instant::now();
         let moved = if let Some(baseline) = &shadow.baseline {
-            diff_mirror(runner, alloc, shadow, baseline, off, len, false)?
+            diff_mirror(runner, alloc, shadow, baseline, [(off, len)], false)?
         } else {
             runner.copy_buffer_regions(
                 alloc.buffer.buffer,
@@ -385,9 +387,13 @@ impl UmaManager {
         };
         self.sync_wait_ns
             .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if moved > 0 {
+            crate::dirty_log::note(console_va, len);
+        }
         self.readback_requested_bytes
             .fetch_add(len, Ordering::Relaxed);
         self.readback_bytes.fetch_add(moved, Ordering::Relaxed);
+        crate::perf::readback_bytes(moved);
         Ok(moved)
     }
 
@@ -582,6 +588,9 @@ impl UmaManager {
         if let Some(k) = key
             && let Some(alloc) = self.allocations.remove(&k)
         {
+            if alloc.shadow.is_some() {
+                crate::dirty_log::unwatch(alloc.console_va);
+            }
             alloc.free(runner);
             return true;
         }
@@ -591,6 +600,9 @@ impl UmaManager {
     /// Free all tracked Vulkan buffers and host virtual memory blocks cleanly.
     pub fn destroy_all(&mut self, runner: &ComputeRunner) {
         for (_, alloc) in self.allocations.drain() {
+            if alloc.shadow.is_some() {
+                crate::dirty_log::unwatch(alloc.console_va);
+            }
             alloc.free(runner);
         }
     }
@@ -601,8 +613,7 @@ fn diff_mirror(
     allocation: &UmaAllocation,
     shadow: &Shadow,
     baseline: &BdaBuffer,
-    offset: u64,
-    len: u64,
+    ranges: impl IntoIterator<Item = (u64, u64)>,
     upload: bool,
 ) -> Result<u64, GpuError> {
     static SHADER: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
@@ -612,25 +623,41 @@ fn diff_mirror(
             .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
             .collect()
     });
-    let mut counter = runner.alloc_bda_buffer(4)?;
+    const MAX_DISPATCHES: usize = 64;
+    const MAX_BYTES: u64 = 64 << 20;
+    let mut counter = runner.alloc_bda_buffer((MAX_DISPATCHES * 4) as u64)?;
+    let counter_address = counter.bda;
     let result = (|| {
-        let mut done = 0;
         let mut changed = 0;
-        while done < len {
-            unsafe {
-                counter.as_mut_slice::<u32>(1)[0] = 0;
+        let mut batch = Vec::<([u8; 48], u32)>::with_capacity(MAX_DISPATCHES);
+        let mut run = |batch: &mut Vec<([u8; 48], u32)>| -> Result<(), GpuError> {
+            if batch.is_empty() {
+                return Ok(());
             }
+            unsafe {
+                counter.as_mut_slice::<u32>(batch.len()).fill(0);
+            }
+            runner.dispatch_bda_batch(shader, batch.iter().map(|(push, words)| {
+                (push.as_slice(), [words.div_ceil(64), 1, 1])
+            }))?;
+            changed += unsafe { counter.as_slice::<u32>(batch.len()) }.iter().map(|&n| u64::from(n)).sum::<u64>();
+            batch.clear();
+            Ok(())
+        };
+        for (offset, len) in ranges {
+            let mut done = 0;
+            while done < len {
             let start = offset + done;
             let begin = start & !3;
             let first = (start - begin) as u32;
-            let count = (len - done).min(64 * 1024 * 1024 - u64::from(first)) as u32;
+            let count = (len - done).min(MAX_BYTES - u64::from(first)) as u32;
             let words = (count + first).div_ceil(4);
             let mut push = [0u8; 48];
             for (dst, value) in push[..32].chunks_exact_mut(8).zip([
                 allocation.buffer.bda + begin,
                 shadow.host.bda + begin,
                 baseline.bda + begin,
-                counter.bda,
+                counter_address + (batch.len() * 4) as u64,
             ]) {
                 dst.copy_from_slice(&value.to_le_bytes());
             }
@@ -641,10 +668,14 @@ fn diff_mirror(
             {
                 dst.copy_from_slice(&value.to_le_bytes());
             }
-            runner.dispatch_spirv(shader, &push, [words.div_ceil(64), 1, 1])?;
-            changed += u64::from(unsafe { counter.as_slice::<u32>(1)[0] });
+            batch.push((push, words));
+            if batch.len() == MAX_DISPATCHES {
+                run(&mut batch)?;
+            }
             done += u64::from(count);
+            }
         }
+        run(&mut batch)?;
         Ok(changed)
     })();
     runner.free_bda_buffer(counter);

@@ -1,5 +1,6 @@
 //! Strata RDNA2 → SPIR-V 1.6 (PhysicalStorageBuffer / No-API) shader compiler.
 
+pub mod bma;
 pub mod bvh;
 pub mod cache;
 pub mod container;
@@ -19,6 +20,7 @@ pub mod sampler;
 pub mod spill;
 pub mod spirv;
 pub mod ssa;
+mod static_stage;
 pub mod store;
 pub mod structurizer;
 pub mod tessellation;
@@ -123,6 +125,43 @@ mod tests {
         assert_eq!(compiled.opt_stats.coalesced_loads, 1);
         assert!(compiled.opt_stats.after < compiled.opt_stats.before);
         assert_spirv_valid(&compiled.spirv, "coalesced");
+    }
+
+    /// BMA instrumentation of a box test: spec-constant table address,
+    /// Function-scope ray counter, branch-free shortcut — valid SPIR-V.
+    #[test]
+    fn bma_instrumented_box_test_validates() {
+        use rdna2::encode::*;
+        let mut prog = Vec::new();
+        prog.extend_from_slice(&image_bvh64_intersect_ray(20, 0, 0));
+        prog.push(s_waitcnt());
+        prog.extend_from_slice(&global_store_dword(30, 20, 2, 0));
+        prog.push(s_endpgm());
+        let emit = |bma: bool| {
+            let decoded = rdna2::decode_program(&prog).unwrap();
+            let wave = wave::analyze_wave_liveness(&decoded);
+            let mut m =
+                ssa::build_ssa_with(&decoded, &wave, [8, 8, 1], &ssa::BuildOptions::default())
+                    .unwrap();
+            m.bma = bma;
+            opt::optimize(&mut m);
+            spirv::emit_spirv(&m)
+        };
+        let plain = emit(false);
+        let bma = emit(true);
+        let has_spec = |w: &[u32]| {
+            // OpDecorate <target> SpecId <id>
+            w.windows(4).any(|x| {
+                x[0] == (4 << 16) | 71 && x[2] == 1 && x[3] == crate::bma::SPEC_ID_TABLE_LO
+            })
+        };
+        if !bma::shader_instrumentation_enabled() {
+            assert!(!has_spec(&plain));
+        }
+        assert!(has_spec(&bma));
+        assert!(bma.len() > plain.len());
+        assert_spirv_valid(&plain, "bvh_plain");
+        assert_spirv_valid(&bma, "bvh_bma");
     }
 
     #[test]
@@ -270,6 +309,58 @@ mod tests {
                 compile_rdna2_to_spirv(&prog, [64, 1, 1]).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_spirv_valid(&compiled.spirv, name);
         }
+    }
+
+    /// Every lowered sample / gather variant (`_d`, `_o`, `_cl`, `_c_b`,
+    /// `_c_d`, ...) over 2D, 3D, cube and 2D-array images, in compute and
+    /// pixel shaders, produces valid SPIR-V.
+    #[test]
+    fn sample_variants_validate_spirv() {
+        use rdna2::encode::*;
+        let mut count = 0;
+        for op in 0x20..=0x5fu32 {
+            if rdna2::sample_variant(op).is_none() {
+                continue;
+            }
+            for dim in [1u32, 2, 3, 5] {
+                // Depth comparison on 3D images does not exist.
+                let compare = rdna2::sample_variant(op).is_some_and(|v| v.0.is_compare());
+                if compare && dim == 2 {
+                    continue;
+                }
+                for stage in [ssa::Stage::Compute, ssa::Stage::Pixel] {
+                    let mut prog = Vec::new();
+                    prog.extend_from_slice(&image_sample_op(op, dim, 20, 0, 8, 16, 0xf));
+                    prog.push(s_waitcnt());
+                    // Keep the result live.
+                    prog.extend_from_slice(&global_store_dword(30, 20, 2, 0));
+                    prog.push(s_endpgm());
+                    let decoded = rdna2::decode_program(&prog).unwrap();
+                    let wl = wave::analyze_wave_liveness(&decoded);
+                    let opts = ssa::BuildOptions {
+                        stage,
+                        ..Default::default()
+                    };
+                    let mut m = ssa::build_ssa_with(&decoded, &wl, [64, 1, 1], &opts)
+                        .unwrap_or_else(|e| panic!("op {op:#x} dim {dim}: {e}"));
+                    opt::optimize(&mut m);
+                    assert!(
+                        m.blocks.iter().flat_map(|b| &b.insts).any(|i| !i.dead
+                            && matches!(
+                                i.op,
+                                ssa::SsaOp::ImageSample { .. }
+                                    | ssa::SsaOp::ImageSampleDref { .. }
+                                    | ssa::SsaOp::ImageGather { .. }
+                            )),
+                        "op {op:#x}: sample optimized away"
+                    );
+                    let words = spirv::emit_spirv(&m);
+                    assert_spirv_valid(&words, &format!("sample_{op:x}_{dim}_{stage:?}"));
+                    count += 1;
+                }
+            }
+        }
+        assert!(count >= 250, "{count}");
     }
 
     #[test]

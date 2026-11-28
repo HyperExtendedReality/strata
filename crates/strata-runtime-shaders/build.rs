@@ -9,6 +9,8 @@ const SHADERS: &[(&str, &str, &str, &str)] = &[
     ("mirror_diff.slang", "mirror_diff.spv", "main", "compute"),
     ("detile.slang", "detile.spv", "main", "compute"),
     ("bvh_oracle.slang", "bvh_oracle.spv", "main", "compute"),
+    ("ray_probe.slang", "ray_probe.spv", "main", "compute"),
+    ("bma_mapping.slang", "bma_mapping.spv", "main", "compute"),
     (
         "clamp_indirect.slang",
         "clamp_indirect.spv",

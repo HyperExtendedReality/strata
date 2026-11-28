@@ -1,9 +1,13 @@
 //! Deterministic GPU frame Capture & Replay with binary wire serialization
 //! and pixel-level divergence diffing.
 
+use crate::thin_list::{ThinCommand, ThinCommandList};
+
 const CAPTURE_MAGIC: &[u8; 4] = b"SCAP";
+const HISTORY_MAGIC: &[u8; 4] = b"SCA2";
 const EXECUTABLE_MAGIC: &[u8; 4] = b"SCR2";
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_HISTORY_EVENTS: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapturedOp {
@@ -26,6 +30,10 @@ pub enum CapturedOp {
     Present {
         frame_index: u64,
     },
+    BeginList {
+        indirect_clamps: Vec<(u64, u32, u32)>,
+    },
+    Command(Box<ThinCommand>),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -39,9 +47,28 @@ impl FrameCapture {
         self.ops.push(op);
     }
 
+    pub fn record_list(&mut self, list: &ThinCommandList) {
+        self.record(CapturedOp::BeginList {
+            indirect_clamps: list.hoisted_clamps.clone(),
+        });
+        self.ops.extend(
+            list.commands()
+                .iter()
+                .map(|op| CapturedOp::Command(Box::new(op.clone()))),
+        );
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(CAPTURE_MAGIC);
+        let has_history = self
+            .ops
+            .iter()
+            .any(|op| matches!(op, CapturedOp::BeginList { .. } | CapturedOp::Command(_)));
+        out.extend_from_slice(if has_history {
+            HISTORY_MAGIC
+        } else {
+            CAPTURE_MAGIC
+        });
         out.extend_from_slice(&self.frame_index.to_le_bytes());
         out.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
         for op in &self.ops {
@@ -76,18 +103,38 @@ impl FrameCapture {
                     out.push(5);
                     out.extend_from_slice(&frame_index.to_le_bytes());
                 }
+                CapturedOp::BeginList { indirect_clamps } => {
+                    out.push(6);
+                    out.extend_from_slice(&(indirect_clamps.len() as u32).to_le_bytes());
+                    for (address, vertices, instances) in indirect_clamps {
+                        out.extend_from_slice(&address.to_le_bytes());
+                        out.extend_from_slice(&vertices.to_le_bytes());
+                        out.extend_from_slice(&instances.to_le_bytes());
+                    }
+                }
+                CapturedOp::Command(command) => {
+                    out.push(7);
+                    let data = serde_json::to_vec(command).expect("integer command data");
+                    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&data);
+                }
             }
         }
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 16 || &bytes[0..4] != CAPTURE_MAGIC {
+        if bytes.len() < 16 || bytes.len() > MAX_FRAME_BYTES {
+            return None;
+        }
+        let has_history = &bytes[..4] == HISTORY_MAGIC;
+        if !has_history && &bytes[..4] != CAPTURE_MAGIC {
             return None;
         }
         let frame_index = u64::from_le_bytes(bytes[4..12].try_into().ok()?);
         let count = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
-        if count > (bytes.len() - 16) / 9 {
+        let min_op_bytes = if has_history { 5 } else { 9 };
+        if count > MAX_HISTORY_EVENTS || count > (bytes.len() - 16) / min_op_bytes {
             return None;
         }
         let mut cur = 16usize;
@@ -133,6 +180,28 @@ impl FrameCapture {
                 5 => CapturedOp::Present {
                     frame_index: read_u64(&mut cur)?,
                 },
+                6 if has_history => {
+                    let count = read_u32(&mut cur)? as usize;
+                    if count > (bytes.len() - cur) / 16 {
+                        return None;
+                    }
+                    let mut indirect_clamps = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        indirect_clamps.push((
+                            read_u64(&mut cur)?,
+                            read_u32(&mut cur)?,
+                            read_u32(&mut cur)?,
+                        ));
+                    }
+                    CapturedOp::BeginList { indirect_clamps }
+                }
+                7 if has_history => {
+                    let len = read_u32(&mut cur)? as usize;
+                    let end = cur.checked_add(len)?;
+                    let command = serde_json::from_slice(bytes.get(cur..end)?).ok()?;
+                    cur = end;
+                    CapturedOp::Command(command)
+                }
                 _ => return None,
             };
             ops.push(op);
@@ -211,6 +280,9 @@ pub struct ExecutableFrame {
 
 impl ExecutableFrame {
     pub fn encode(&self) -> Result<Vec<u8>, GpuError> {
+        if self.trace.ops.len() > MAX_HISTORY_EVENTS {
+            return Err(GpuError::Io("too many frame history events".into()));
+        }
         let trace = self.trace.encode();
         let bytes = self
             .planes
@@ -282,12 +354,20 @@ impl ExecutableFrame {
 
     /// Run the captured presentation pass and compare its results to the original.
     pub fn replay(&self, runner: &ComputeRunner) -> Result<ReplayResult, GpuError> {
+        if !(1..=16).contains(&self.planes.len())
+            || self.planes.iter().chain([&self.output]).any(|surface| {
+                SurfaceSnapshot::byte_len(surface.width, surface.height, surface.format)
+                    != Some(surface.pixels.len())
+            })
+        {
+            return Err(GpuError::Io("invalid frame surfaces".into()));
+        }
         let mut images = Vec::with_capacity(self.planes.len());
         let result = (|| {
             for plane in &self.planes {
                 images.push(plane.allocate(runner)?);
-                runner.upload_image(images.last().unwrap(), &plane.pixels)?;
             }
+            runner.upload_replay_planes(&images, &self.planes)?;
             let start = std::time::Instant::now();
             let mut plane_timings = Vec::new();
             let pixels = if let [image] = images.as_slice()
@@ -482,33 +562,48 @@ pub fn bisect_captures(a: &FrameCapture, b: &FrameCapture) -> BisectReport {
 /// Exports a [`FrameCapture`]'s draws and dispatches as Chrome Trace Event JSON
 /// using [`crate::timeline::TimelineProfiler`].
 pub fn export_chrome_trace(cap: &FrameCapture) -> String {
+    use crate::timeline::SpanTrack;
+
     let mut prof = crate::timeline::TimelineProfiler::new();
     let mut ts = 0u64;
     for (i, op) in cap.ops.iter().enumerate() {
-        match op {
+        let (label, track) = match op {
             CapturedOp::Draw {
                 vertex_count,
                 instance_count,
-            } => {
-                prof.record_span(
-                    format!("Draw#{i} ({vertex_count}v x {instance_count})"),
-                    crate::timeline::SpanTrack::GpuGraphics,
-                    ts,
-                    10,
-                );
-                ts += 10;
-            }
+            } => (
+                format!("Draw#{i} ({vertex_count}v x {instance_count})"),
+                SpanTrack::GpuGraphics,
+            ),
             CapturedOp::Dispatch { x, y, z } => {
-                prof.record_span(
-                    format!("Dispatch#{i} ({x}x{y}x{z})"),
-                    crate::timeline::SpanTrack::GpuCompute,
-                    ts,
-                    10,
-                );
-                ts += 10;
+                (format!("Dispatch#{i} ({x}x{y}x{z})"), SpanTrack::GpuCompute)
             }
-            _ => {}
-        }
+            CapturedOp::BeginList { .. } => (format!("CommandList#{i}"), SpanTrack::Cpu),
+            CapturedOp::Present { frame_index } => {
+                (format!("Present {frame_index}"), SpanTrack::Cpu)
+            }
+            CapturedOp::Command(command) => {
+                let (name, track) = match command.as_ref() {
+                    ThinCommand::DrawInstanced { .. } => ("Draw", SpanTrack::GpuGraphics),
+                    ThinCommand::DrawIndexedInstanced { .. } => {
+                        ("DrawIndexed", SpanTrack::GpuGraphics)
+                    }
+                    ThinCommand::DrawIndirect { .. } => ("DrawIndirect", SpanTrack::GpuGraphics),
+                    ThinCommand::DispatchMesh { .. } => ("DispatchMesh", SpanTrack::GpuGraphics),
+                    ThinCommand::Dispatch { .. } => ("Dispatch", SpanTrack::GpuCompute),
+                    ThinCommand::DispatchIndirect { .. } => {
+                        ("DispatchIndirect", SpanTrack::GpuCompute)
+                    }
+                    ThinCommand::DispatchRays { .. } => ("DispatchRays", SpanTrack::GpuCompute),
+                    ThinCommand::ExecuteIndirect { .. } => ("ExecuteIndirect", SpanTrack::Cpu),
+                    _ => continue,
+                };
+                (format!("{name}#{i}"), track)
+            }
+            _ => continue,
+        };
+        prof.record_span(label, track, ts, 10);
+        ts += 10;
     }
     prof.to_chrome_trace_json()
 }
@@ -516,6 +611,31 @@ pub fn export_chrome_trace(cap: &FrameCapture) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserves_command_list_boundaries_and_indirect_state() {
+        use crate::thin_list::{IndirectArg, IndirectLayout};
+
+        let mut list = ThinCommandList::new();
+        list.draw_indirect(4096, 300, 1);
+        list.push(ThinCommand::ExecuteIndirect {
+            layout: std::sync::Arc::new(IndirectLayout {
+                stride: 12,
+                args: vec![IndirectArg::Dispatch],
+            }),
+            max_count: 3,
+            args_va: 8192,
+            count_va: 12288,
+        });
+        let mut capture = FrameCapture::default();
+        capture.record_list(&list);
+        capture.record(CapturedOp::Present { frame_index: 0 });
+        capture.record_list(&ThinCommandList::new());
+        let encoded = capture.encode();
+        assert!(encoded.starts_with(HISTORY_MAGIC));
+        assert_eq!(FrameCapture::decode(&encoded), Some(capture));
+        assert!(FrameCapture::decode(&encoded[..encoded.len() - 1]).is_none());
+    }
 
     #[test]
     fn frame_capture_encodes_diffs_bisects_and_exports_trace() {

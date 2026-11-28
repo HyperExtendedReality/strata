@@ -404,8 +404,56 @@ fn decode_lanes(
     Ok(())
 }
 
+/// Decode one Xbox Series MDU BCPack chunk (BC1, BC3, BC4, BC5 or BC7)
+/// into `dst` (`dst.len() / block bytes` blocks) with the vendored
+/// `bcpack-rs` decoder (exact silicon-rans model tables, built-in rebuild
+/// tables). `None` for formats it does not rebuild (BC2, BC6H).
+pub fn decode_mdu(bc: u8, src: &[u8], dst: &mut [u8]) -> Option<Result<(), BcPackError>> {
+    use bcpack::format::Mode;
+    let (mode, block_bytes) = match bc {
+        1 => (Mode::Bc1, 8),
+        3 => (Mode::Bc3, 16),
+        4 => (Mode::Bc4, 8),
+        5 => (Mode::Bc5, 16),
+        7 => (Mode::Bc7, 16),
+        _ => return None,
+    };
+    if dst.is_empty() || !dst.len().is_multiple_of(block_bytes) {
+        return Some(Err(BcPackError::InvalidDestination));
+    }
+    let blocks = dst.len() / block_bytes;
+    let window = bcpack::bc1::Window::default_table();
+    let quads = bcpack::bc1::QuadTable::default_table();
+    Some(
+        match bcpack::decode_chunk(mode, src, blocks, &window, &quads) {
+            Ok(c) if c.blocks.len() == dst.len() => {
+                dst.copy_from_slice(&c.blocks);
+                Ok(())
+            }
+            Ok(_) => Err(BcPackError::InvalidDestination),
+            Err(_) => Err(BcPackError::TruncatedStream),
+        },
+    )
+}
+
 /// Decode a BCPack stream (`bc` in `{1, 2, 3, 4, 5, 6, 7}`) into `dst`.
+///
+/// BC1/BC3/BC4/BC5/BC7 go through [`decode_mdu`]; BC2 and BC6H (whose block
+/// rebuild has no public reference yet) use Strata's table-driven decoder
+/// with the caller's `tables`.
 pub fn decode(
+    bc: u8,
+    src: &[u8],
+    dst: &mut [u8],
+    tables: &BcPackTables,
+) -> Result<(), BcPackError> {
+    if let Some(r) = decode_mdu(bc, src, dst) {
+        return r;
+    }
+    decode_table_driven(bc, src, dst, tables)
+}
+
+fn decode_table_driven(
     bc: u8,
     src: &[u8],
     dst: &mut [u8],
@@ -608,6 +656,32 @@ mod tests {
             decode(1, &[0u8; 4], &mut dst, &tables),
             Err(BcPackError::TruncatedStream)
         );
+    }
+
+    /// BC1/BC3/BC4/BC5/BC7 decode through the vendored MDU decoder:
+    /// synthetic chunks from bcpack-rs's encoder decode identically through
+    /// Strata's entry point and bcpack-rs's own.
+    #[test]
+    fn mdu_chunks_decode_through_bcpack_rs() {
+        use bcpack::format::Mode;
+        for (bc, mode, bytes) in [
+            (1u8, Mode::Bc1, 8usize),
+            (3, Mode::Bc3, 16),
+            (4, Mode::Bc4, 8),
+            (5, Mode::Bc5, 16),
+            (7, Mode::Bc7, 16),
+        ] {
+            let blocks = 64;
+            let (chunk, _) = bcpack::encode::synthetic(mode, 0x5eed + u64::from(bc), blocks, 17);
+            let w = bcpack::bc1::Window::default_table();
+            let q = bcpack::bc1::QuadTable::default_table();
+            let reference = bcpack::decode_chunk(mode, &chunk, blocks, &w, &q).unwrap();
+            let mut dst = vec![0u8; blocks * bytes];
+            decode(bc, &chunk, &mut dst, &BcPackTables::uniform_default()).unwrap();
+            assert_eq!(dst, reference.blocks, "BC{bc}");
+        }
+        // BC6H stays on the table-driven path.
+        assert!(decode_mdu(6, &[], &mut [0u8; 16]).is_none());
     }
 
     #[test]

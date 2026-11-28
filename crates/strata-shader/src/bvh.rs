@@ -56,6 +56,115 @@ pub fn intersect_box32(ray: &Ray, node: &Box32Node) -> [u32; 4] {
     hits
 }
 
+/// Strata metadata in the Box32 node trailer (bytes `112..128`), which the
+/// RDNA2 box test never reads. Written by the SBVH builder; read by the BMA
+/// traversal shortcut (`depth`) and the optional child-prior pruning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Box32Meta {
+    /// Parent node pointer (`offset >> 3 | type`), [`INVALID_NODE`] at the root.
+    pub parent: u32,
+    /// Depth below the root (root = 0).
+    pub depth: u16,
+    /// Leaves under the node (saturating).
+    pub leaf_count: u16,
+    /// Per-child surface-area ratio `SA(child) / SA(node)` as binary16
+    /// (0 for empty slots).
+    pub child_priors: [u16; 4],
+}
+
+impl Box32Meta {
+    /// Byte offset of the trailer in a Box32 node.
+    pub const OFFSET: usize = 112;
+    /// Byte offset of `depth` (low half of the dword) in a Box32 node.
+    pub const DEPTH_OFFSET: usize = 116;
+
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut o = [0u8; 16];
+        o[0..4].copy_from_slice(&self.parent.to_le_bytes());
+        o[4..6].copy_from_slice(&self.depth.to_le_bytes());
+        o[6..8].copy_from_slice(&self.leaf_count.to_le_bytes());
+        for (i, p) in self.child_priors.iter().enumerate() {
+            o[8 + 2 * i..10 + 2 * i].copy_from_slice(&p.to_le_bytes());
+        }
+        o
+    }
+
+    pub fn from_bytes(b: &[u8; 16]) -> Self {
+        let u16_at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+        Self {
+            parent: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            depth: u16_at(4),
+            leaf_count: u16_at(6),
+            child_priors: std::array::from_fn(|i| u16_at(8 + 2 * i)),
+        }
+    }
+
+    /// Child priors as `f32`.
+    pub fn priors(&self) -> [f32; 4] {
+        self.child_priors.map(f16_to_f32)
+    }
+}
+
+/// Box test with optional surface-area-prior pruning of the non-nearest
+/// children (a Strata heuristic built on [`Box32Meta::child_priors`]; the
+/// paper's BMA algorithm itself is [`crate::bma`], which never drops
+/// children and instead shortcuts the traversal start node).
+///
+/// Children after the nearest whose `prior / (1 + max(t_near, 0))` is below
+/// `threshold` are returned as [`INVALID_NODE`]. The nearest hit is always
+/// kept; `threshold <= 0` matches [`intersect_box32`] bit-for-bit.
+pub fn intersect_box32_prior_pruned(
+    ray: &Ray,
+    node: &Box32Node,
+    priors: [f32; 4],
+    bma_threshold: f32,
+) -> [u32; 4] {
+    let mut hits = [INVALID_NODE; 4];
+    let mut dists = [f32::INFINITY; 4];
+    let mut p = priors;
+
+    for i in 0..4 {
+        if node.children[i] == INVALID_NODE {
+            continue;
+        }
+        let mut tmin = 0.0f32;
+        let mut tmax = ray.t_max;
+        for axis in 0..3 {
+            let t0 = (node.bounds_min[i][axis] - ray.origin[axis]) * ray.inv_dir[axis];
+            let t1 = (node.bounds_max[i][axis] - ray.origin[axis]) * ray.inv_dir[axis];
+            let near = t0.min(t1);
+            let far = t0.max(t1);
+            tmin = tmin.max(near);
+            tmax = tmax.min(far);
+        }
+        if tmin <= tmax {
+            hits[i] = node.children[i];
+            dists[i] = tmin;
+        }
+    }
+
+    for (a, b) in [(0, 2), (1, 3), (0, 1), (2, 3), (1, 2)] {
+        if dists[b] < dists[a] {
+            dists.swap(a, b);
+            hits.swap(a, b);
+            p.swap(a, b);
+        }
+    }
+
+    if bma_threshold > 0.0 {
+        for k in 1..4 {
+            if hits[k] != INVALID_NODE {
+                let score = p[k] / (1.0 + dists[k].max(0.0));
+                if score < bma_threshold {
+                    hits[k] = INVALID_NODE;
+                }
+            }
+        }
+    }
+
+    hits
+}
+
 /// Watertight ray-triangle test returning `(t_num, t_den, u_num, v_num)`.
 /// Miss returns `(+inf, 1.0, 0.0, 0.0)` matching RDNA2 hardware convention.
 pub fn intersect_triangle(ray: &Ray, v0: [f32; 3], v1: [f32; 3], v2: [f32; 3]) -> [f32; 4] {

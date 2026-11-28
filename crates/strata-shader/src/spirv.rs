@@ -46,6 +46,7 @@ const OP_TYPE_FUNCTION: u16 = 33;
 const OP_CONSTANT_TRUE: u16 = 41;
 const OP_CONSTANT_FALSE: u16 = 42;
 const OP_CONSTANT: u16 = 43;
+const OP_SPEC_CONSTANT: u16 = 50;
 const OP_FUNCTION: u16 = 54;
 const OP_FUNCTION_END: u16 = 56;
 const OP_VARIABLE: u16 = 59;
@@ -65,6 +66,8 @@ const OP_IMAGE_FETCH: u16 = 95;
 const OP_IMAGE_GATHER: u16 = 96;
 const OP_IMAGE_WRITE: u16 = 99;
 const OP_IMAGE_QUERY_SIZE_LOD: u16 = 103;
+const OP_IMAGE: u16 = 100;
+const OP_IMAGE_QUERY_LOD: u16 = 105;
 
 const OP_CONVERT_F_TO_U: u16 = 109;
 const OP_CONVERT_F_TO_S: u16 = 110;
@@ -167,6 +170,7 @@ const SC_PUSH_CONSTANT: u32 = 9;
 const SC_PHYSICAL_STORAGE_BUFFER: u32 = 5349;
 
 // Decorations
+const DEC_SPEC_ID: u32 = 1;
 const DEC_BLOCK: u32 = 2;
 const DEC_ARRAY_STRIDE: u32 = 6;
 const DEC_BUILTIN: u32 = 11;
@@ -194,6 +198,7 @@ const MEM_ALIGNED: u32 = 0x2;
 // Image operands
 const IMG_OP_BIAS: u32 = 0x1;
 const IMG_OP_LOD: u32 = 0x2;
+const IMG_OP_GRAD: u32 = 0x4;
 
 /// Descriptor set 0 bindings images use (the runner's global layout).
 /// Each image class is its own binding (a SPIR-V image type fixes its
@@ -525,7 +530,7 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     let t_ptr_wg_ballot_arr = w.id();
     let t_ptr_wg_u32 = w.id();
 
-    let c_16384 = w.id();
+    let c_lds_len = w.id();
     let t_lds_arr = w.id();
     let t_ptr_wg_lds_arr = w.id();
 
@@ -533,8 +538,15 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     let c_spill_len = uses_spill.then(|| w.id());
     let t_spill_arr = uses_spill.then(|| w.id());
     let t_ptr_func_spill_arr = uses_spill.then(|| w.id());
-    let t_ptr_func_u32 = uses_spill.then(|| w.id());
+    // BMA traversal shortcuts (see `crate::bma`): compute shaders that test
+    // box nodes get the sampling / shortcut instrumentation.
+    let uses_bma = stage == Stage::Compute
+        && (module.bma || crate::bma::shader_instrumentation_enabled())
+        && live().any(|i| matches!(i.op, SsaOp::Bvh64IntersectBox32 { .. }));
+    let t_ptr_func_u32 = (uses_spill || uses_bma).then(|| w.id());
     let spill_var = uses_spill.then(|| w.id());
+    // (table address low, high spec constants, per-invocation ray counter)
+    let bma_ids = uses_bma.then(|| (w.id(), w.id(), w.id()));
 
     // PhysicalStorageBuffer pointer types (scalar u32 & 128-bit uvec4)
     let t_bda_u32_struct = w.id();
@@ -613,6 +625,16 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
             &[v, DEC_BUILTIN, BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID],
         );
     }
+    if let Some((lo, hi, _)) = bma_ids {
+        w.inst(
+            OP_DECORATE,
+            &[lo, DEC_SPEC_ID, crate::bma::SPEC_ID_TABLE_LO],
+        );
+        w.inst(
+            OP_DECORATE,
+            &[hi, DEC_SPEC_ID, crate::bma::SPEC_ID_TABLE_HI],
+        );
+    }
     w.inst(OP_DECORATE, &[t_sgpr_arr, DEC_ARRAY_STRIDE, 4]);
     w.inst(OP_DECORATE, &[t_push_struct, DEC_BLOCK]);
     w.inst(OP_MEMBER_DECORATE, &[t_push_struct, 0, DEC_OFFSET, 0]);
@@ -669,8 +691,34 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     );
     w.inst(OP_TYPE_POINTER, &[t_ptr_wg_u32, SC_WORKGROUP, t_u32]);
 
-    w.inst(OP_CONSTANT, &[t_u32, c_16384, 16384]);
-    w.inst(OP_TYPE_ARRAY, &[t_lds_arr, t_u32, c_16384]);
+    const MAX_LDS_DWORDS: u32 = 16384;
+    let lds_dwords = if module.uses_lds {
+        let constants: HashMap<_, _> = live()
+            .filter_map(|inst| match inst.op {
+                SsaOp::ConstU32(bits) => Some((inst.id, bits)),
+                _ => None,
+            })
+            .collect();
+        // Keep the console LDS capacity when any address depends on runtime
+        // values. Constant-only kernels only need the highest referenced word.
+        live()
+            .filter_map(|inst| match inst.op {
+                SsaOp::LdsLoadU32 { byte_addr }
+                | SsaOp::LdsStoreU32 { byte_addr, .. }
+                | SsaOp::LdsAtomicAddU32 { byte_addr, .. } => Some(byte_addr),
+                _ => None,
+            })
+            .try_fold(1, |size, address| {
+                constants
+                    .get(&address)
+                    .map(|&bytes| size.max((bytes / 4 + 1).min(MAX_LDS_DWORDS)))
+            })
+            .unwrap_or(MAX_LDS_DWORDS)
+    } else {
+        1
+    };
+    w.inst(OP_CONSTANT, &[t_u32, c_lds_len, lds_dwords]);
+    w.inst(OP_TYPE_ARRAY, &[t_lds_arr, t_u32, c_lds_len]);
     w.inst(
         OP_TYPE_POINTER,
         &[t_ptr_wg_lds_arr, SC_WORKGROUP, t_lds_arr],
@@ -684,6 +732,8 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
         w.inst(OP_CONSTANT, &[t_u32, c_len, module.spill_dwords.max(1)]);
         w.inst(OP_TYPE_ARRAY, &[t_arr, t_u32, c_len]);
         w.inst(OP_TYPE_POINTER, &[t_ptr_arr, SC_FUNCTION, t_arr]);
+        w.inst(OP_TYPE_POINTER, &[t_ptr_el, SC_FUNCTION, t_u32]);
+    } else if let Some(t_ptr_el) = t_ptr_func_u32 {
         w.inst(OP_TYPE_POINTER, &[t_ptr_el, SC_FUNCTION, t_u32]);
     }
 
@@ -917,7 +967,7 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
         }
     }
     // Constants the image coordinate builders use (cube face decoding).
-    for val in [4u32, 7] {
+    for val in [4u32, 6, 7, 8, 16] {
         const_u32.entry(val).or_insert_with(|| {
             let id = w.id();
             w.inst(OP_CONSTANT, &[t_u32, id, val]);
@@ -930,6 +980,49 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
             w.inst(OP_CONSTANT, &[t_f32, id, val.to_bits()]);
             id
         });
+    }
+    if let Some((lo, hi, _)) = bma_ids {
+        w.inst(OP_SPEC_CONSTANT, &[t_u32, lo, 0]);
+        w.inst(OP_SPEC_CONSTANT, &[t_u32, hi, 0]);
+        use crate::bma::{TABLE_HEADER_BYTES, hdr};
+        for off in [
+            hdr::MAP_BUILD,
+            hdr::TILES_X,
+            hdr::TILES_Y,
+            hdr::TILE_SHIFT,
+            hdr::RAYS,
+            hdr::DEPTH,
+            hdr::FLAGS,
+            hdr::ROOT_LO,
+            hdr::ROOT_HI,
+            hdr::SAMPLE_BUILD,
+            hdr::PATHS_OFFSET,
+            hdr::SINK,
+            TABLE_HEADER_BYTES,
+            crate::bma::BUILD_ID_BEFORE_ROOT,
+            crate::bma::SIZE_BEFORE_ROOT,
+            crate::bvh::Box32Meta::DEPTH_OFFSET as u64,
+        ] {
+            const_u64.entry(off).or_insert_with(|| {
+                let id = w.id();
+                w.inst(OP_CONSTANT, &[t_u64, id, off as u32, (off >> 32) as u32]);
+                id
+            });
+        }
+        for val in [
+            1u32,
+            2,
+            4,
+            0xffff,
+            crate::bma::FLAG_ENABLED,
+            crate::bma::FLAG_PRIMARY,
+        ] {
+            const_u32.entry(val).or_insert_with(|| {
+                let id = w.id();
+                w.inst(OP_CONSTANT, &[t_u32, id, val]);
+                id
+            });
+        }
     }
     if needs_bvh_offsets {
         for off in (16u64..112).step_by(4) {
@@ -1007,6 +1100,13 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
         t_ptr_sampler,
         samp_var,
     };
+    let ext_ids = ExtIds {
+        t_uv2,
+        t_uvec3,
+        glsl_ext,
+        c_bits: [const_u32[&0], const_u32[&8], const_u32[&16]],
+        c_six: const_u32[&6],
+    };
     let cube_ids = CoordIds {
         t_f32,
         t_u32,
@@ -1036,6 +1136,9 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
         if bi == 0 {
             if let (Some(sv), Some(t_ptr_arr)) = (spill_var, t_ptr_func_spill_arr) {
                 w.inst(OP_VARIABLE, &[t_ptr_arr, sv, SC_FUNCTION]);
+            }
+            if let (Some((_, _, counter)), Some(t_ptr)) = (bma_ids, t_ptr_func_u32) {
+                w.inst(OP_VARIABLE, &[t_ptr, counter, SC_FUNCTION, c_zero]);
             }
         }
 
@@ -1573,13 +1676,57 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                     lod,
                     bias,
                     implicit,
+                    ext,
                 } => {
                     let di = dim_index(*dim);
                     let si = sampled_image(&mut w, &img_ids, di, *slot, &const_u32);
-                    let coord =
-                        sample_coord(&mut w, &cube_ids, *dim, val_map[u], val_map[v], val_map[wc]);
+                    let (cu, cv, cw) = sample_ext_coords(
+                        &mut w,
+                        &cube_ids,
+                        &ext_ids,
+                        &img_ids,
+                        di,
+                        *dim,
+                        si,
+                        ext,
+                        lod.map(|l| val_map[&l]),
+                        [val_map[u], val_map[v], val_map[wc]],
+                        &val_map,
+                    );
+                    let coord = sample_coord(&mut w, &cube_ids, *dim, cu, cv, cw);
                     let texel = w.id();
-                    if *implicit {
+                    let grad = ext.grad.filter(|_| *dim != ImageDim::Cube);
+                    if let Some((dx, dy)) = grad {
+                        let gx = grad_vec(&mut w, &cube_ids, *dim, dx.map(|x| val_map[&x]));
+                        let gy = grad_vec(&mut w, &cube_ids, *dim, dy.map(|x| val_map[&x]));
+                        w.inst(
+                            OP_IMAGE_SAMPLE_EXPLICIT_LOD,
+                            &[t_v4f, texel, si, coord, IMG_OP_GRAD, gx, gy],
+                        );
+                    } else if let Some(min) = ext.min_lod {
+                        let base = if *implicit {
+                            query_lod(&mut w, &cube_ids, *dim, si, coord, [cu, cv, cw])
+                        } else {
+                            lod.map_or(c_fzero, |l| val_map[&l])
+                        };
+                        let lod_id = match bias {
+                            Some(b) => {
+                                let sum = w.id();
+                                w.inst(OP_F_ADD, &[t_f32, sum, base, val_map[b]]);
+                                sum
+                            }
+                            None => base,
+                        };
+                        let clamped = w.id();
+                        w.inst(
+                            OP_EXT_INST,
+                            &[t_f32, clamped, glsl_ext, GLSL_FMAX, lod_id, val_map[&min]],
+                        );
+                        w.inst(
+                            OP_IMAGE_SAMPLE_EXPLICIT_LOD,
+                            &[t_v4f, texel, si, coord, IMG_OP_LOD, clamped],
+                        );
+                    } else if *implicit {
                         let mut ops = vec![t_v4f, texel, si, coord];
                         if let Some(b) = bias {
                             ops.extend([IMG_OP_BIAS, val_map[b]]);
@@ -1614,19 +1761,64 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                     dref,
                     lod,
                     implicit,
+                    ext,
                 } => {
                     let di = dim_index(*dim);
                     let si = sampled_image(&mut w, &img_ids, di, *slot, &const_u32);
-                    let coord =
-                        sample_coord(&mut w, &cube_ids, *dim, val_map[u], val_map[v], val_map[wc]);
+                    let (cu, cv, cw) = sample_ext_coords(
+                        &mut w,
+                        &cube_ids,
+                        &ext_ids,
+                        &img_ids,
+                        di,
+                        *dim,
+                        si,
+                        ext,
+                        lod.map(|l| val_map[&l]),
+                        [val_map[u], val_map[v], val_map[wc]],
+                        &val_map,
+                    );
+                    let coord = sample_coord(&mut w, &cube_ids, *dim, cu, cv, cw);
                     let res = w.id();
-                    if *implicit {
+                    let grad = ext.grad.filter(|_| *dim != ImageDim::Cube);
+                    if let Some((dx, dy)) = grad {
+                        let gx = grad_vec(&mut w, &cube_ids, *dim, dx.map(|x| val_map[&x]));
+                        let gy = grad_vec(&mut w, &cube_ids, *dim, dy.map(|x| val_map[&x]));
                         w.inst(
-                            OP_IMAGE_SAMPLE_DREF_IMPLICIT_LOD,
-                            &[t_f32, res, si, coord, val_map[dref]],
+                            OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD,
+                            &[t_f32, res, si, coord, val_map[dref], IMG_OP_GRAD, gx, gy],
                         );
+                    } else if *implicit && ext.min_lod.is_none() {
+                        let mut ops = vec![t_f32, res, si, coord, val_map[dref]];
+                        if let Some(b) = ext.bias {
+                            ops.extend([IMG_OP_BIAS, val_map[&b]]);
+                        }
+                        w.inst(OP_IMAGE_SAMPLE_DREF_IMPLICIT_LOD, &ops);
                     } else {
-                        let lod_id = lod.map_or(c_fzero, |l| val_map[&l]);
+                        let base = if *implicit {
+                            query_lod(&mut w, &cube_ids, *dim, si, coord, [cu, cv, cw])
+                        } else {
+                            lod.map_or(c_fzero, |l| val_map[&l])
+                        };
+                        let biased = match ext.bias {
+                            Some(b) => {
+                                let sum = w.id();
+                                w.inst(OP_F_ADD, &[t_f32, sum, base, val_map[&b]]);
+                                sum
+                            }
+                            None => base,
+                        };
+                        let lod_id = match ext.min_lod {
+                            Some(m) => {
+                                let c = w.id();
+                                w.inst(
+                                    OP_EXT_INST,
+                                    &[t_f32, c, glsl_ext, GLSL_FMAX, biased, val_map[&m]],
+                                );
+                                c
+                            }
+                            None => biased,
+                        };
                         w.inst(
                             OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD,
                             &[t_f32, res, si, coord, val_map[dref], IMG_OP_LOD, lod_id],
@@ -1641,11 +1833,24 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                     v,
                     w: wc,
                     comp,
+                    ext,
                 } => {
                     let di = dim_index(*dim);
                     let si = sampled_image(&mut w, &img_ids, di, *slot, &const_u32);
-                    let coord =
-                        sample_coord(&mut w, &cube_ids, *dim, val_map[u], val_map[v], val_map[wc]);
+                    let (cu, cv, cw) = sample_ext_coords(
+                        &mut w,
+                        &cube_ids,
+                        &ext_ids,
+                        &img_ids,
+                        di,
+                        *dim,
+                        si,
+                        ext,
+                        None,
+                        [val_map[u], val_map[v], val_map[wc]],
+                        &val_map,
+                    );
+                    let coord = sample_coord(&mut w, &cube_ids, *dim, cu, cv, cw);
                     let texel = w.id();
                     w.inst(OP_IMAGE_GATHER, &[t_v4f, texel, si, coord, const_u32[comp]]);
                     let res = w.id();
@@ -1990,7 +2195,30 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                     inv_dy,
                     inv_dz,
                 } => {
-                    let base = val_map[node_addr];
+                    let base = match bma_ids {
+                        Some((lo, hi, counter)) => emit_bma_shortcut(
+                            &mut w,
+                            &BmaTypes {
+                                t_bool,
+                                t_u32,
+                                t_u64,
+                                t_uvec3,
+                                t_bda_u32_ptr,
+                                t_bda_u32_field_ptr,
+                                const_u32: &const_u32,
+                                const_u64: &const_u64,
+                            },
+                            &BmaIds {
+                                spec_lo: lo,
+                                spec_hi: hi,
+                                counter,
+                                global_id: global_id_var,
+                                c_32_u64,
+                            },
+                            val_map[node_addr],
+                        ),
+                        None => val_map[node_addr],
+                    };
                     let children_ptr = w.id();
                     w.inst(OP_CONVERT_U_TO_PTR, &[t_bda_uvec4_ptr, children_ptr, base]);
                     let children_fp = w.id();
@@ -2429,6 +2657,122 @@ fn sampled_image(
     si
 }
 
+/// Ids the sample modifiers ([`SampleExt`]) need.
+struct ExtIds {
+    t_uv2: u32,
+    t_uvec3: u32,
+    glsl_ext: u32,
+    /// Bit offsets 0, 8 and 16 of the packed offset components.
+    c_bits: [u32; 3],
+    c_six: u32,
+}
+
+/// `(u, v, w)` with a packed `_o` texel offset applied: each signed 6-bit
+/// component divided by the image size at the sampled level (`lod`, else
+/// level 0). Vulkan allows non-constant offsets only on gathers, so the
+/// offset is folded into the coordinates instead. Cube offsets are ignored.
+#[allow(clippy::too_many_arguments)]
+fn sample_ext_coords(
+    w: &mut Writer,
+    c: &CoordIds,
+    e: &ExtIds,
+    ids: &ImgIds,
+    di: usize,
+    dim: ImageDim,
+    si: u32,
+    ext: &crate::ssa::SampleExt,
+    lod: Option<u32>,
+    mut uvw: [u32; 3],
+    val_map: &HashMap<ValueId, u32>,
+) -> (u32, u32, u32) {
+    let Some(off) = ext.offset.filter(|_| dim != ImageDim::Cube) else {
+        return (uvw[0], uvw[1], uvw[2]);
+    };
+    let off = val_map[&off];
+    let img = w.id();
+    w.inst(OP_IMAGE, &[ids.t_img[di], img, si]);
+    let level = match lod {
+        Some(l) => {
+            let u = w.id();
+            w.inst(OP_CONVERT_F_TO_U, &[c.t_u32, u, l]);
+            u
+        }
+        None => c.c_u[0],
+    };
+    let t_size = if dim == ImageDim::D2 {
+        e.t_uv2
+    } else {
+        e.t_uvec3
+    };
+    let size = w.id();
+    w.inst(OP_IMAGE_QUERY_SIZE_LOD, &[t_size, size, img, level]);
+    let comps = if dim == ImageDim::D3 { 3 } else { 2 };
+    for (k, coord) in uvw.iter_mut().enumerate().take(comps) {
+        let extent = w.id();
+        w.inst(OP_COMPOSITE_EXTRACT, &[c.t_u32, extent, size, k as u32]);
+        let fext = w.id();
+        w.inst(OP_CONVERT_U_TO_F, &[c.t_f32, fext, extent]);
+        let o = w.id();
+        w.inst(
+            OP_BIT_FIELD_S_EXTRACT,
+            &[c.t_u32, o, off, e.c_bits[k], e.c_six],
+        );
+        let fo = w.id();
+        w.inst(OP_CONVERT_S_TO_F, &[c.t_f32, fo, o]);
+        let d = w.id();
+        w.inst(OP_F_DIV, &[c.t_f32, d, fo, fext]);
+        let sum = w.id();
+        w.inst(OP_F_ADD, &[c.t_f32, sum, *coord, d]);
+        *coord = sum;
+    }
+    let _ = e.glsl_ext;
+    (uvw[0], uvw[1], uvw[2])
+}
+
+/// The derivative vector of class `dim` (2D and arrays: vec2, 3D: vec3).
+fn grad_vec(w: &mut Writer, c: &CoordIds, dim: ImageDim, d: [u32; 3]) -> u32 {
+    let id = w.id();
+    if dim == ImageDim::D3 {
+        w.inst(OP_COMPOSITE_CONSTRUCT, &[c.t_v3f, id, d[0], d[1], d[2]]);
+    } else {
+        w.inst(OP_COMPOSITE_CONSTRUCT, &[c.t_v2f, id, d[0], d[1]]);
+    }
+    id
+}
+
+/// The implicit LOD a pixel-shader sample would use (`OpImageQueryLod`,
+/// component 0: the level accessed), for clamping it explicitly.
+fn query_lod(
+    w: &mut Writer,
+    c: &CoordIds,
+    dim: ImageDim,
+    si: u32,
+    coord: u32,
+    uvw: [u32; 3],
+) -> u32 {
+    let qc = match dim {
+        ImageDim::D2 | ImageDim::D2Array => {
+            let id = w.id();
+            w.inst(OP_COMPOSITE_CONSTRUCT, &[c.t_v2f, id, uvw[0], uvw[1]]);
+            id
+        }
+        ImageDim::D3 => {
+            let id = w.id();
+            w.inst(
+                OP_COMPOSITE_CONSTRUCT,
+                &[c.t_v3f, id, uvw[0], uvw[1], uvw[2]],
+            );
+            id
+        }
+        ImageDim::Cube => coord,
+    };
+    let q = w.id();
+    w.inst(OP_IMAGE_QUERY_LOD, &[c.t_v2f, q, si, qc]);
+    let lod = w.id();
+    w.inst(OP_COMPOSITE_EXTRACT, &[c.t_f32, lod, q, 0]);
+    lod
+}
+
 /// Types and constants the coordinate builders use.
 struct CoordIds {
     t_f32: u32,
@@ -2513,6 +2857,210 @@ fn sample_coord(w: &mut Writer, c: &CoordIds, dim: ImageDim, u: u32, v: u32, wc:
             dir
         }
     }
+}
+
+/// Type and constant ids [`emit_bma_shortcut`] needs.
+struct BmaTypes<'a> {
+    t_bool: u32,
+    t_u32: u32,
+    t_u64: u32,
+    t_uvec3: u32,
+    t_bda_u32_ptr: u32,
+    t_bda_u32_field_ptr: u32,
+    const_u32: &'a HashMap<u32, u32>,
+    const_u64: &'a HashMap<u64, u32>,
+}
+
+struct BmaIds {
+    spec_lo: u32,
+    spec_hi: u32,
+    counter: u32,
+    global_id: u32,
+    c_32_u64: u32,
+}
+
+/// BMA sampling and traversal shortcut around one box test (see
+/// [`crate::bma`] for the algorithm and the table layout). Returns the node
+/// address the box test uses.
+///
+/// Branch free, so it never splits the SSA block (phis and structured merges
+/// stay valid): every load reads the table, the registered root's header or
+/// the tested node, and masked-off writes go to the table's sink dword. A
+/// table whose flags are 0 leaves `node` unchanged.
+///
+/// - Each test of the registered root advances the invocation's ray counter
+///   (ray slot 0 = primary, 1.. = bounces).
+/// - The tile's centre invocation (the sampling pixel) records, per ray slot
+///   and depth, the first node of the root's structure it tests.
+/// - Every other invocation testing the root, with a shortcut mapped for its
+///   tile and ray slot from the same build generation, tests the shortcut
+///   node instead (slot 0 only with `FLAG_PRIMARY`).
+fn emit_bma_shortcut(w: &mut Writer, t: &BmaTypes<'_>, ids: &BmaIds, node: u32) -> u32 {
+    use crate::bma::{FLAG_ENABLED, FLAG_PRIMARY, TABLE_HEADER_BYTES, hdr};
+    let cu = |v: u32| t.const_u32[&v];
+    let cl = |v: u64| t.const_u64[&v];
+    let op = |w: &mut Writer, opc: u16, ty: u32, args: &[u32]| -> u32 {
+        let id = w.id();
+        let mut v = vec![ty, id];
+        v.extend_from_slice(args);
+        w.inst(opc, &v);
+        id
+    };
+    let field_ptr = |w: &mut Writer, addr: u32| -> u32 {
+        let p = op(w, OP_CONVERT_U_TO_PTR, t.t_bda_u32_ptr, &[addr]);
+        op(w, OP_ACCESS_CHAIN, t.t_bda_u32_field_ptr, &[p, cu(0)])
+    };
+    let ld = |w: &mut Writer, addr: u32| -> u32 {
+        let fp = field_ptr(w, addr);
+        let id = w.id();
+        w.inst(OP_LOAD, &[t.t_u32, id, fp, MEM_ALIGNED, 4]);
+        id
+    };
+    let add64 = |w: &mut Writer, a: u32, b: u32| op(w, OP_I_ADD, t.t_u64, &[a, b]);
+    let to64 = |w: &mut Writer, a: u32| op(w, OP_U_CONVERT, t.t_u64, &[a]);
+    let join64 = |w: &mut Writer, lo: u32, hi: u32| {
+        let l = op(w, OP_U_CONVERT, t.t_u64, &[lo]);
+        let h = op(w, OP_U_CONVERT, t.t_u64, &[hi]);
+        let hs = op(w, OP_SHIFT_LEFT_LOGICAL, t.t_u64, &[h, ids.c_32_u64]);
+        op(w, OP_BITWISE_OR, t.t_u64, &[l, hs])
+    };
+    let and = |w: &mut Writer, a: u32, b: u32| op(w, OP_LOGICAL_AND, t.t_bool, &[a, b]);
+    let ld_hdr = |w: &mut Writer, tbl: u32, off: u64| {
+        let a = add64(w, tbl, cl(off));
+        ld(w, a)
+    };
+
+    let tbl = join64(w, ids.spec_lo, ids.spec_hi);
+    let sink = add64(w, tbl, cl(hdr::SINK));
+    let flags = ld_hdr(w, tbl, hdr::FLAGS);
+    let root_lo = ld_hdr(w, tbl, hdr::ROOT_LO);
+    let root_hi = ld_hdr(w, tbl, hdr::ROOT_HI);
+    let root = join64(w, root_lo, root_hi);
+    let f_en = op(w, OP_BITWISE_AND, t.t_u32, &[flags, cu(FLAG_ENABLED)]);
+    let en = op(w, OP_I_NOT_EQUAL, t.t_bool, &[f_en, cu(0)]);
+    let at_root = op(w, OP_I_EQUAL, t.t_bool, &[node, root]);
+    let is_root = and(w, en, at_root);
+
+    // Ray slot: the counter after counting this root test, minus one.
+    let r_old = op(w, OP_LOAD, t.t_u32, &[ids.counter]);
+    let inc = op(w, OP_SELECT, t.t_u32, &[is_root, cu(1), cu(0)]);
+    let r_new = op(w, OP_I_ADD, t.t_u32, &[r_old, inc]);
+    w.inst(OP_STORE, &[ids.counter, r_new]);
+    let rr = op(w, OP_I_SUB, t.t_u32, &[r_new, cu(1)]);
+
+    // Tile of this invocation.
+    let gid = op(w, OP_LOAD, t.t_uvec3, &[ids.global_id]);
+    let gx = op(w, OP_COMPOSITE_EXTRACT, t.t_u32, &[gid, 0]);
+    let gy = op(w, OP_COMPOSITE_EXTRACT, t.t_u32, &[gid, 1]);
+    let shift = ld_hdr(w, tbl, hdr::TILE_SHIFT);
+    let tx = op(w, OP_SHIFT_RIGHT_LOGICAL, t.t_u32, &[gx, shift]);
+    let ty = op(w, OP_SHIFT_RIGHT_LOGICAL, t.t_u32, &[gy, shift]);
+    let tiles_x = ld_hdr(w, tbl, hdr::TILES_X);
+    let tiles_y = ld_hdr(w, tbl, hdr::TILES_Y);
+    let rays = ld_hdr(w, tbl, hdr::RAYS);
+    let depth = ld_hdr(w, tbl, hdr::DEPTH);
+    let in_x = op(w, OP_U_LESS_THAN, t.t_bool, &[tx, tiles_x]);
+    let in_y = op(w, OP_U_LESS_THAN, t.t_bool, &[ty, tiles_y]);
+    let in_r = op(w, OP_U_LESS_THAN, t.t_bool, &[rr, rays]);
+    let in_xy = and(w, in_x, in_y);
+    let in_range = and(w, in_xy, in_r);
+    let row = op(w, OP_I_MUL, t.t_u32, &[ty, tiles_x]);
+    let tile = op(w, OP_I_ADD, t.t_u32, &[row, tx]);
+    let tile_r = op(w, OP_I_MUL, t.t_u32, &[tile, rays]);
+    let slot = op(w, OP_I_ADD, t.t_u32, &[tile_r, rr]);
+    let edge = op(w, OP_SHIFT_LEFT_LOGICAL, t.t_u32, &[cu(1), shift]);
+    let half = op(w, OP_SHIFT_RIGHT_LOGICAL, t.t_u32, &[edge, cu(1)]);
+    let mask = op(w, OP_I_SUB, t.t_u32, &[edge, cu(1)]);
+    let px = op(w, OP_BITWISE_AND, t.t_u32, &[gx, mask]);
+    let py = op(w, OP_BITWISE_AND, t.t_u32, &[gy, mask]);
+    let sx = op(w, OP_I_EQUAL, t.t_bool, &[px, half]);
+    let sy = op(w, OP_I_EQUAL, t.t_bool, &[py, half]);
+    let is_sample = and(w, sx, sy);
+
+    // The root's header (build generation, size); the table when disabled.
+    let tbl_hdr_end = add64(w, tbl, cl(TABLE_HEADER_BYTES));
+    let hdr_base = op(w, OP_SELECT, t.t_u64, &[en, root, tbl_hdr_end]);
+    let a = op(
+        w,
+        OP_I_SUB,
+        t.t_u64,
+        &[hdr_base, cl(crate::bma::BUILD_ID_BEFORE_ROOT)],
+    );
+    let cur_build = ld(w, a);
+    let a = op(
+        w,
+        OP_I_SUB,
+        t.t_u64,
+        &[hdr_base, cl(crate::bma::SIZE_BEFORE_ROOT)],
+    );
+    let size = ld(w, a);
+    let map_build = ld_hdr(w, tbl, hdr::MAP_BUILD);
+
+    // Shortcut.
+    let f_pri = op(w, OP_BITWISE_AND, t.t_u32, &[flags, cu(FLAG_PRIMARY)]);
+    let pri_ok = op(w, OP_I_NOT_EQUAL, t.t_bool, &[f_pri, cu(0)]);
+    let secondary = op(w, OP_U_GREATER_THAN, t.t_bool, &[rr, cu(0)]);
+    let ray_ok = op(w, OP_LOGICAL_OR, t.t_bool, &[secondary, pri_ok]);
+    let not_sample = op(w, OP_LOGICAL_NOT, t.t_bool, &[is_sample]);
+    let e0 = and(w, is_root, in_range);
+    let e1 = and(w, e0, not_sample);
+    let ok_entry = and(w, e1, ray_ok);
+    let slot4 = op(w, OP_I_MUL, t.t_u32, &[slot, cu(4)]);
+    let slot4 = to64(w, slot4);
+    let entries = add64(w, tbl, cl(TABLE_HEADER_BYTES));
+    let entry_at = add64(w, entries, slot4);
+    let entry_addr = op(w, OP_SELECT, t.t_u64, &[ok_entry, entry_at, sink]);
+    let entry = ld(w, entry_addr);
+    let has = op(w, OP_I_NOT_EQUAL, t.t_bool, &[entry, cu(0)]);
+    let same_build = op(w, OP_I_EQUAL, t.t_bool, &[map_build, cur_build]);
+    let u0 = and(w, ok_entry, has);
+    let use_short = and(w, u0, same_build);
+    let off = op(w, OP_I_SUB, t.t_u32, &[entry, cu(1)]);
+    let off = to64(w, off);
+    let short = add64(w, root, off);
+    let eff = op(w, OP_SELECT, t.t_u64, &[use_short, short, node]);
+
+    // Sampling: the first node tested per (tile, ray slot, depth).
+    let ge_root = op(w, OP_U_GREATER_THAN_EQUAL, t.t_bool, &[eff, root]);
+    let base = op(w, OP_I_SUB, t.t_u64, &[root, cl(TABLE_HEADER_BYTES)]);
+    let size = to64(w, size);
+    let end = add64(w, base, size);
+    let lt_end = op(w, OP_U_LESS_THAN, t.t_bool, &[eff, end]);
+    let t0 = and(w, en, ge_root);
+    let in_tree = and(w, t0, lt_end);
+    let d_at = add64(w, eff, cl(crate::bvh::Box32Meta::DEPTH_OFFSET as u64));
+    let d_addr = op(w, OP_SELECT, t.t_u64, &[in_tree, d_at, sink]);
+    let d_word = ld(w, d_addr);
+    let d = op(w, OP_BITWISE_AND, t.t_u32, &[d_word, cu(0xffff)]);
+    let in_d = op(w, OP_U_LESS_THAN, t.t_bool, &[d, depth]);
+    let r0 = and(w, in_tree, is_sample);
+    let r1 = and(w, r0, in_range);
+    let rec = and(w, r1, in_d);
+    let paths_off = ld_hdr(w, tbl, hdr::PATHS_OFFSET);
+    let sd = op(w, OP_I_MUL, t.t_u32, &[slot, depth]);
+    let sdd = op(w, OP_I_ADD, t.t_u32, &[sd, d]);
+    let idx = op(w, OP_I_MUL, t.t_u32, &[sdd, cu(4)]);
+    let rel = op(w, OP_I_ADD, t.t_u32, &[paths_off, idx]);
+    let rel = to64(w, rel);
+    let path_at = add64(w, tbl, rel);
+    let path_addr = op(w, OP_SELECT, t.t_u64, &[rec, path_at, sink]);
+    let node_rel = op(w, OP_I_SUB, t.t_u64, &[eff, root]);
+    let node_rel = op(w, OP_U_CONVERT, t.t_u32, &[node_rel]);
+    let node_rel1 = op(w, OP_I_ADD, t.t_u32, &[node_rel, cu(1)]);
+    let pp = field_ptr(w, path_addr);
+    // Device scope, relaxed: the mapping pass runs after a queue barrier.
+    // First visit wins (compare against 0).
+    op(
+        w,
+        OP_ATOMIC_COMPARE_EXCHANGE,
+        t.t_u32,
+        &[pp, cu(1), cu(0), cu(0), node_rel1, cu(0)],
+    );
+    let sb_at = add64(w, tbl, cl(hdr::SAMPLE_BUILD));
+    let sb_addr = op(w, OP_SELECT, t.t_u64, &[rec, sb_at, sink]);
+    let sbp = field_ptr(w, sb_addr);
+    w.inst(OP_STORE, &[sbp, cur_build, MEM_ALIGNED, 4]);
+    eff
 }
 
 struct Writer {

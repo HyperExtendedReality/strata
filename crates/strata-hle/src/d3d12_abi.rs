@@ -571,6 +571,7 @@ pub struct Backend {
     pub uma: Arc<Mutex<UmaManager>>,
     pub pipelines: PipelineTable,
     pub textures: SharedTextures,
+    precompiler: Option<crate::pipeline_warm::Precompiler>,
 }
 
 // SAFETY: the runner is internally synchronised; the rest is behind mutexes.
@@ -619,6 +620,13 @@ impl Backend {
 
 impl Drop for Backend {
     fn drop(&mut self) {
+        drop(self.precompiler.take());
+        // A queue keeps its device alive, so the backend outlives all of
+        // its queues and can retire their shared images and upload tickets.
+        self.textures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .destroy(&self.runner);
         if let Err(error) = self.runner.flush_pipeline_cache() {
             crate::crash::log_line(&format!("pipeline cache: {error}"));
         }
@@ -2677,11 +2685,13 @@ unsafe extern "system" fn q_execute_command_lists(
     let slice = unsafe { std::slice::from_raw_parts(lists, n as usize) };
     if slice.len() == 1 {
         if let Some(l) = unsafe { inner::<CommandListInner>(slice[0]) } {
+            unsafe { (*e.0).prepare_submission() };
             let thin = l.thin.lock().unwrap();
             unsafe { (*e.0).execute_thin(&thin) };
         }
         return;
     }
+    let prepare = strata_gpu::perf::start();
     let mut batch = Vec::with_capacity(slice.len());
     for &p in slice {
         if let Some(l) = unsafe { inner::<CommandListInner>(p) } {
@@ -2693,6 +2703,9 @@ unsafe extern "system" fn q_execute_command_lists(
             copy.hoisted_clamps = thin.hoisted_clamps.clone();
             batch.push(copy);
         }
+    }
+    if let Some(prepare) = prepare {
+        strata_gpu::perf::preparation_ns(prepare.elapsed().as_nanos() as u64);
     }
     if !batch.is_empty() {
         unsafe { (*e.0).execute_command_lists(batch) };
@@ -3138,6 +3151,18 @@ fn make_graphics_pso(
             }
         }
     }
+    if let Some(b) = &device_inner(dev).backend
+        && let Some(worker) = &b.precompiler
+        && let Some(formats) = d.rtv_formats[..d.num_render_targets.min(8) as usize]
+            .iter().map(|&format| {
+                let format = dxgi_format(format)?;
+                let (vk, _, _) = strata_gpu::texture::texel_format(format.gfx10).ok()?;
+                Some(strata_gpu::texture::rgba8_order(vk, format.bgra, format.srgb))
+            }).collect::<Option<Vec<_>>>()
+        && let Some(pipeline) = b.pipelines.lock().unwrap().get(&key)
+    {
+        worker.enqueue(Some(key.0), pipeline, formats);
+    }
     Com::boxed(
         &PIPELINE_STATE_VTABLE,
         dev,
@@ -3199,6 +3224,12 @@ fn make_compute_pso(dev: *mut c_void, cs: &[u8], rs: *mut c_void) -> *mut Com<Pi
                 }
             }
         }
+    }
+    if let Some(b) = &device_inner(dev).backend
+        && let Some(worker) = &b.precompiler
+        && let Some(pipeline) = b.pipelines.lock().unwrap().get(&key)
+    {
+        worker.enqueue(None, pipeline, Vec::new());
     }
     Com::boxed(
         &PIPELINE_STATE_VTABLE,
@@ -4904,11 +4935,15 @@ impl Com<DeviceInner> {
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new_boxed() -> *mut Self {
         let backend = ComputeRunner::new().ok().map(|runner| {
+            let runner = Arc::new(runner);
+            let precompiler = crate::pipeline_cache::background_warmup_enabled()
+                .then(|| crate::pipeline_warm::Precompiler::spawn(&runner)).flatten();
             let backend = Arc::new(Backend {
-                runner: Arc::new(runner),
+                runner,
                 uma: Arc::new(Mutex::new(UmaManager::new())),
                 pipelines: Arc::new(Mutex::new(HashMap::new())),
                 textures: Arc::new(Mutex::new(TextureCache::new())),
+                precompiler,
             });
             crate::pipeline_cache::register(&backend);
             backend
