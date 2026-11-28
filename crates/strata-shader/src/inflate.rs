@@ -47,7 +47,8 @@ fn inflate_raw_bounded(data: &[u8], limit: usize) -> Result<Vec<u8>, InflateErro
     let mut br = BitReader::new(data);
     let mut out = Vec::new();
     if limit != usize::MAX {
-        out.try_reserve_exact(limit).map_err(|_| InflateError::OutputLimit)?;
+        out.try_reserve_exact(limit)
+            .map_err(|_| InflateError::OutputLimit)?;
     }
 
     loop {

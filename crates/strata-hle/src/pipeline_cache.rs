@@ -73,7 +73,13 @@ pub fn end_frame() {
 }
 
 pub fn streaming_stats() -> strata_gpu::texture::StreamingStats {
-    let devices: Vec<_> = RUN.lock().unwrap().devices.iter().filter_map(Weak::upgrade).collect();
+    let devices: Vec<_> = RUN
+        .lock()
+        .unwrap()
+        .devices
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect();
     let mut total = strata_gpu::texture::StreamingStats::default();
     for backend in devices {
         if let Ok(textures) = backend.textures.try_lock() {

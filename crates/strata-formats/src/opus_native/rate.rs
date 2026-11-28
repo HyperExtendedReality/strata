@@ -20,7 +20,11 @@ fn eb(i: usize) -> i32 {
 
 /// `get_pulses`: the pulse count of pseudo-pulse index `i`.
 pub fn get_pulses(i: i32) -> i32 {
-    if i < 8 { i } else { (8 + (i & 7)) << ((i >> 3) - 1) }
+    if i < 8 {
+        i
+    } else {
+        (8 + (i & 7)) << ((i >> 3) - 1)
+    }
 }
 
 fn cache_row(band: usize, lm: i32) -> &'static [u8] {
@@ -42,7 +46,11 @@ pub fn bits2pulses(band: usize, lm: i32, bits: i32) -> i32 {
             lo = mid;
         }
     }
-    let lo_bits = if lo == 0 { -1 } else { i32::from(cache[lo as usize]) };
+    let lo_bits = if lo == 0 {
+        -1
+    } else {
+        i32::from(cache[lo as usize])
+    };
     if bits - lo_bits <= i32::from(cache[hi as usize]) - bits {
         lo
     } else {
@@ -64,7 +72,7 @@ pub fn init_caps(cap: &mut [i32; NB_EBANDS], lm: i32, c: i32) {
     for (i, cp) in cap.iter_mut().enumerate() {
         let n = (eb(i + 1) - eb(i)) << lm;
         let caps = i32::from(t::CACHE_CAPS50[NB_EBANDS * (2 * lm + c - 1) as usize + i]);
-        *cp = (caps + 64) * c * n >> 2;
+        *cp = ((caps + 64) * c * n) >> 2;
     }
 }
 
@@ -107,7 +115,7 @@ fn interp_bits2pulses(
         let mut psum = 0i32;
         let mut done = false;
         for j in (start..end).rev() {
-            let tmp = bits1[j] + (mid * bits2[j] >> ALLOC_STEPS);
+            let tmp = bits1[j] + ((mid * bits2[j]) >> ALLOC_STEPS);
             if tmp >= thresh[j] || done {
                 done = true;
                 psum += tmp.min(cap[j]);
@@ -125,7 +133,7 @@ fn interp_bits2pulses(
     let mut done = false;
     let bits = &mut a.pulses;
     for j in (start..end).rev() {
-        let mut tmp = bits1[j] + (lo * bits2[j] >> ALLOC_STEPS);
+        let mut tmp = bits1[j] + ((lo * bits2[j]) >> ALLOC_STEPS);
         if tmp < thresh[j] && !done {
             tmp = if tmp >= alloc_floor { alloc_floor } else { 0 };
         } else {
@@ -207,9 +215,9 @@ fn interp_bits2pulses(
             if n == 2 {
                 offset += den << BITRES >> 2;
             }
-            if bits[j] + offset < den * 2 << BITRES {
+            if bits[j] + offset < (den * 2) << BITRES {
                 offset += nclogn >> 2;
-            } else if bits[j] + offset < den * 3 << BITRES {
+            } else if bits[j] + offset < (den * 3) << BITRES {
                 offset += nclogn >> 3;
             }
             ebits[j] = (bits[j] + offset + (den << (BITRES - 1))).max(0);
@@ -219,7 +227,7 @@ fn interp_bits2pulses(
             }
             ebits[j] = ebits[j].min(MAX_FINE_BITS);
             fine[j] = i32::from(ebits[j] * (den << BITRES) >= bits[j] + offset);
-            bits[j] -= c * ebits[j] << BITRES;
+            bits[j] -= (c * ebits[j]) << BITRES;
         } else {
             excess = (bit - (c << BITRES)).max(0);
             bits[j] = bit - excess;
@@ -229,7 +237,7 @@ fn interp_bits2pulses(
         if excess > 0 {
             let extra_fine = (excess >> (stereo + BITRES as i32)).min(MAX_FINE_BITS - ebits[j]);
             ebits[j] += extra_fine;
-            let extra_bits = extra_fine * c << BITRES;
+            let extra_bits = (extra_fine * c) << BITRES;
             fine[j] = i32::from(extra_bits >= excess - balance);
             excess -= extra_bits;
         }
@@ -282,9 +290,10 @@ pub fn compute_allocation(
     let mut trim_offset = [0i32; NB_EBANDS];
     for j in start..end {
         let n = eb(j + 1) - eb(j);
-        thresh[j] = (c << BITRES).max((3 * n << lm << BITRES) >> 4);
+        thresh[j] = (c << BITRES).max(((3 * n) << lm << BITRES) >> 4);
         trim_offset[j] =
-            c * n * (alloc_trim - 5 - lm) * (end - j - 1) as i32 * (1 << (lm + BITRES as i32)) >> 6;
+            (c * n * (alloc_trim - 5 - lm) * (end - j - 1) as i32 * (1 << (lm + BITRES as i32)))
+                >> 6;
         if n << lm == 1 {
             trim_offset[j] -= c << BITRES;
         }
@@ -297,7 +306,7 @@ pub fn compute_allocation(
         let mid = (lo + hi) >> 1;
         for j in (start..end).rev() {
             let n = eb(j + 1) - eb(j);
-            let mut bitsj = c * n * alloc(mid as usize, j) << lm >> 2;
+            let mut bitsj = (c * n * alloc(mid as usize, j)) << lm >> 2;
             if bitsj > 0 {
                 bitsj = (bitsj + trim_offset[j]).max(0);
             }
@@ -322,11 +331,11 @@ pub fn compute_allocation(
     lo -= 1;
     for j in start..end {
         let n = eb(j + 1) - eb(j);
-        let mut b1 = c * n * alloc(lo as usize, j) << lm >> 2;
+        let mut b1 = (c * n * alloc(lo as usize, j)) << lm >> 2;
         let mut b2 = if hi as usize >= NB_ALLOC_VECTORS {
             cap[j]
         } else {
-            c * n * alloc(hi as usize, j) << lm >> 2
+            (c * n * alloc(hi as usize, j)) << lm >> 2
         };
         if b1 > 0 {
             b1 = (b1 + trim_offset[j]).max(0);

@@ -4,6 +4,122 @@ use ash::vk;
 
 use crate::{context::GpuError, runner::ComputeRunner, vram::TILE_BYTES};
 
+/// A live Tier-3 sparse `VkImage` backed by a 64 KiB tile memory pool, keyed by
+/// console resource VA in [`ComputeRunner::sparse_images`].
+pub struct LiveSparseImage {
+    pub image: vk::Image,
+    pub tile_memory: vk::DeviceMemory,
+}
+
+impl ComputeRunner {
+    /// Issue a live `vkQueueBindSparse` tile mapping update for a reserved/tiled
+    /// resource VA when the physical device supports sparse aliased images.
+    pub fn bind_sparse_tiles(
+        &self,
+        resource_va: u64,
+        start_tile: u32,
+        tile_count: u32,
+        unbind: bool,
+    ) -> Result<bool, GpuError> {
+        if !self.sparse_aliased_images || tile_count == 0 {
+            return Ok(false);
+        }
+        let mut map = self.sparse_images.lock().unwrap_or_else(|e| e.into_inner());
+        if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(resource_va) {
+            let flags = vk::ImageCreateFlags::SPARSE_BINDING
+                | vk::ImageCreateFlags::SPARSE_RESIDENCY
+                | vk::ImageCreateFlags::SPARSE_ALIASED;
+            let ci = vk::ImageCreateInfo::default()
+                .flags(flags)
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .extent(vk::Extent3D {
+                    width: 256,
+                    height: 256,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC);
+            let dev = &self.device;
+            let image = unsafe { dev.create_image(&ci, None)? };
+            let req = unsafe { dev.get_image_memory_requirements(image) };
+            let props = unsafe {
+                self.instance
+                    .get_physical_device_memory_properties(self.pdev)
+            };
+            let mem_type = (0..props.memory_type_count).find(|&i| {
+                req.memory_type_bits & (1 << i) != 0
+                    && props.memory_types[i as usize]
+                        .property_flags
+                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            });
+            let Some(mem_type) = mem_type else {
+                unsafe { dev.destroy_image(image, None) };
+                return Err(GpuError::Io(
+                    "no device-local memory type for sparse tiles".into(),
+                ));
+            };
+            let tile_memory = unsafe {
+                dev.allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(TILE_BYTES.max(req.alignment))
+                        .memory_type_index(mem_type),
+                    None,
+                )
+            };
+            let tile_memory = match tile_memory {
+                Ok(m) => m,
+                Err(e) => {
+                    unsafe { dev.destroy_image(image, None) };
+                    return Err(e.into());
+                }
+            };
+            slot.insert(LiveSparseImage { image, tile_memory });
+        }
+        let live = &map[&resource_va];
+        let mem = if unbind {
+            vk::DeviceMemory::null()
+        } else {
+            live.tile_memory
+        };
+        let sub = vk::ImageSubresource {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            array_layer: 0,
+        };
+        let bind = vk::SparseImageMemoryBind {
+            subresource: sub,
+            offset: vk::Offset3D {
+                x: ((start_tile % 2) * 128) as i32,
+                y: (((start_tile / 2) % 2) * 128) as i32,
+                z: 0,
+            },
+            extent: vk::Extent3D {
+                width: 128,
+                height: 128,
+                depth: 1,
+            },
+            memory: mem,
+            memory_offset: 0,
+            flags: vk::SparseMemoryBindFlags::empty(),
+        };
+        let binds = [bind];
+        let img_bind = [vk::SparseImageMemoryBindInfo::default()
+            .image(live.image)
+            .binds(&binds)];
+        let info = [vk::BindSparseInfo::default().image_binds(&img_bind)];
+        let _q = self.queue_lock.lock().unwrap();
+        unsafe {
+            self.device
+                .queue_bind_sparse(self.queue, &info, vk::Fence::null())?;
+        }
+        Ok(true)
+    }
+}
+
 struct AliasResources<'a> {
     runner: &'a ComputeRunner,
     images: [vk::Image; 2],

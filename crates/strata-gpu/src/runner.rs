@@ -40,6 +40,15 @@ impl BdaBuffer {
 /// Stages that see the 128 bytes of push constants (user SGPRs).
 pub use crate::layout::PUSH_STAGES;
 
+/// One image-free compute dispatch of a list recorded by
+/// [`ComputeRunner::dispatch_lists_parallel`].
+#[derive(Clone, Copy, Debug)]
+pub struct ListDispatch<'a> {
+    pub spirv: &'a [u32],
+    pub push: &'a [u8],
+    pub groups: [u32; 3],
+}
+
 pub struct ComputeRunner {
     pub(crate) _entry: ash::Entry,
     pub(crate) instance: ash::Instance,
@@ -127,6 +136,14 @@ pub struct ComputeRunner {
     pub(crate) bma: Mutex<Option<crate::bma::BmaTable>>,
     /// Dedicated transfer queue for asynchronous uploads, if the device has one.
     pub(crate) transfer: Option<crate::images::TransferQueue>,
+    /// Deferred Synchronization2 barrier coalescer flushed before draws/dispatches.
+    pub(crate) barriers: Mutex<crate::barriers::BarrierCoalescer>,
+    /// Multi-queue timeline scheduler across Graphics, AsyncCompute, and TransferCopy.
+    pub(crate) scheduler: Mutex<crate::queues::TimelineScheduler>,
+    /// Transient upload/detile ring trimmer.
+    pub(crate) ring_trimmer: Mutex<crate::memory_stack::TransientRingTrimmer>,
+    /// Live Tier-3 sparse aliased images keyed by console VA.
+    pub(crate) sparse_images: Mutex<HashMap<u64, crate::sparse_alias::LiveSparseImage>>,
 }
 
 /// FNV-1a over SPIR-V words: the pipeline table's key.
@@ -586,6 +603,13 @@ impl ComputeRunner {
                 idle_recording: Mutex::default(),
                 queue_lock: Mutex::new(()),
                 transfer,
+                barriers: Mutex::new(crate::barriers::BarrierCoalescer::new()),
+                scheduler: Mutex::new(crate::queues::TimelineScheduler::new()),
+                ring_trimmer: Mutex::new(crate::memory_stack::TransientRingTrimmer::new(
+                    64 << 20,
+                    60,
+                )),
+                sparse_images: Mutex::new(HashMap::new()),
                 pipe_layout,
                 set_layout,
                 desc_pool: Mutex::new(desc_pool),
@@ -650,13 +674,20 @@ impl ComputeRunner {
         }
         let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
         let mut properties = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
-        unsafe { self.instance.get_physical_device_memory_properties2(self.pdev, &mut properties) };
+        unsafe {
+            self.instance
+                .get_physical_device_memory_properties2(self.pdev, &mut properties)
+        };
         let memory = properties.memory_properties;
         let heap = memory.memory_types[..memory.memory_type_count as usize]
             .iter()
-            .find(|ty| ty.property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))?
+            .find(|ty| {
+                ty.property_flags
+                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            })?
             .heap_index as usize;
-        (budget.heap_budget[heap] != 0).then_some((budget.heap_usage[heap], budget.heap_budget[heap]))
+        (budget.heap_budget[heap] != 0)
+            .then_some((budget.heap_usage[heap], budget.heap_budget[heap]))
     }
 
     /// The 1x1 image (storage-capable) and sampler empty slots are bound to.
@@ -1449,6 +1480,83 @@ impl ComputeRunner {
         result
     }
 
+    /// Records several command lists of image-free compute dispatches into
+    /// command buffers on worker threads (one transient pool per worker) and
+    /// submits them in list order in one submission.
+    ///
+    /// Each dispatch is fenced from the one before it with a full
+    /// compute-to-compute memory barrier, and the first one waits on every
+    /// earlier write (including host writes), so the GPU sees the same
+    /// ordering the serial one-dispatch-per-submission path gives.
+    /// Pipelines are resolved serially first: creating one can itself
+    /// dispatch (the BMA table).
+    pub fn dispatch_lists_parallel(&self, lists: &[Vec<ListDispatch<'_>>]) -> Result<(), GpuError> {
+        let mut resolved = Vec::with_capacity(lists.len());
+        for list in lists {
+            let mut out = Vec::with_capacity(list.len());
+            for d in list {
+                out.push((self.pipeline_for(d.spirv, None)?, d.push, d.groups));
+            }
+            resolved.push(out);
+        }
+        if resolved.iter().all(Vec::is_empty) {
+            return Ok(());
+        }
+        // SAFETY: freed below, after the submission is waited on.
+        let set = unsafe { self.image_set(&Default::default())? };
+        let layout = self.pipe_layout;
+        let max = self.max_workgroup_count;
+        let result = self.record_and_submit_independent(&resolved, |dev, cmd, list| unsafe {
+            let full = [vk::MemoryBarrier2::default()
+                .src_stage_mask(
+                    vk::PipelineStageFlags2::ALL_COMMANDS | vk::PipelineStageFlags2::HOST,
+                )
+                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE | vk::AccessFlags2::HOST_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)];
+            let mut bound = None;
+            for &(pipeline, push, groups) in list {
+                dev.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().memory_barriers(&full),
+                );
+                if bound != Some(pipeline) {
+                    dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    dev.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        layout,
+                        0,
+                        &[set],
+                        &[],
+                    );
+                    bound = Some(pipeline);
+                }
+                if !push.is_empty() {
+                    dev.cmd_push_constants(cmd, layout, PUSH_STAGES, 0, push);
+                }
+                for (base, count) in crate::thin_list::split_dispatch(groups, max) {
+                    dev.cmd_dispatch_base(
+                        cmd, base[0], base[1], base[2], count[0], count[1], count[2],
+                    );
+                }
+            }
+            let host_read = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(
+                    vk::PipelineStageFlags2::HOST | vk::PipelineStageFlags2::ALL_COMMANDS,
+                )
+                .dst_access_mask(vk::AccessFlags2::HOST_READ | vk::AccessFlags2::MEMORY_READ)];
+            dev.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&host_read),
+            );
+        });
+        unsafe { self.free_image_set(set) };
+        result
+    }
+
     /// # Safety
     /// `set` stays valid until this returns.
     unsafe fn dispatch_recorded<'a>(
@@ -1493,9 +1601,17 @@ impl ComputeRunner {
             );
             for (push_bytes, groups) in dispatches {
                 if !push_bytes.is_empty() {
-                    self.device.cmd_push_constants(cmd, self.pipe_layout, PUSH_STAGES, 0, push_bytes);
+                    self.device.cmd_push_constants(
+                        cmd,
+                        self.pipe_layout,
+                        PUSH_STAGES,
+                        0,
+                        push_bytes,
+                    );
                 }
-                for (base, count) in crate::thin_list::split_dispatch(groups, self.max_workgroup_count) {
+                for (base, count) in
+                    crate::thin_list::split_dispatch(groups, self.max_workgroup_count)
+                {
                     self.device.cmd_dispatch_base(
                         cmd, base[0], base[1], base[2], count[0], count[1], count[2],
                     );
@@ -1543,7 +1659,12 @@ impl ComputeRunner {
             None
         };
         let _cache = self.pipeline_cache_lock.lock().unwrap();
-        if let Some(&(_, p)) = self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        if let Some(&(_, p)) = self
+            .pipelines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
             return Ok(p);
         }
         self.check_shader_images(spirv_words)?;
@@ -1595,7 +1716,10 @@ impl ComputeRunner {
                     return Err(e.into());
                 }
             };
-            self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).insert(key, (module, pipeline));
+            self.pipelines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, (module, pipeline));
             crate::perf::pipeline_creation_ns(start.elapsed().as_nanos() as u64);
             self.record_pipeline(
                 format!("cs-{:016x}-{}", key.0, key.1),
@@ -1830,7 +1954,9 @@ impl ComputeRunner {
             let cached = self.idle_fences.lock().unwrap().pop();
             let fence = match cached {
                 Some(fence) => fence,
-                None => self.device.create_fence(&vk::FenceCreateInfo::default(), None)?,
+                None => self
+                    .device
+                    .create_fence(&vk::FenceCreateInfo::default(), None)?,
             };
             let submitted = {
                 let _queue = self.queue_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1924,17 +2050,28 @@ impl ComputeRunner {
             })?;
             unsafe { self.submit_buffers_and_wait(&recorded, None) }
         })();
-        let mut idle = self.idle_recording.lock().unwrap();
         for (pool, cmd) in buffers {
-            unsafe {
-                if idle.len() < 8 && self.device.reset_command_pool(pool, vk::CommandPoolResetFlags::empty()).is_ok() {
-                    idle.push((pool, cmd));
-                } else {
-                    self.device.destroy_command_pool(pool, None);
-                }
-            }
+            self.recycle_recording_buffer(pool, cmd);
         }
         result
+    }
+
+    /// Return a transient recording pool to the idle list (bounded at 8) after
+    /// its command buffer has completed, or destroy it.
+    fn recycle_recording_buffer(&self, pool: vk::CommandPool, cmd: vk::CommandBuffer) {
+        let mut idle = self.idle_recording.lock().unwrap();
+        unsafe {
+            if idle.len() < 8
+                && self
+                    .device
+                    .reset_command_pool(pool, vk::CommandPoolResetFlags::empty())
+                    .is_ok()
+            {
+                idle.push((pool, cmd));
+            } else {
+                self.device.destroy_command_pool(pool, None);
+            }
+        }
     }
 
     fn take_recording_buffer(&self) -> Result<(vk::CommandPool, vk::CommandBuffer), vk::Result> {
@@ -1945,11 +2082,14 @@ impl ComputeRunner {
             let pool = self.device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
                     .queue_family_index(self.queue_family)
-                    .flags(vk::CommandPoolCreateFlags::TRANSIENT), None,
+                    .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+                None,
             )?;
             let result = self.device.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default().command_pool(pool)
-                    .level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
             );
             match result {
                 Ok(commands) => Ok((pool, commands[0])),
@@ -1985,12 +2125,108 @@ impl ComputeRunner {
             result
         }
     }
+
+    /// Record a deferred Synchronization2 UAV memory barrier in the coalescer.
+    pub fn push_uav_barrier(&self) {
+        self.barriers.lock().unwrap().push_uav();
+    }
+
+    /// Record a deferred Synchronization2 memory barrier derived from D3D12 resource states.
+    pub fn push_memory_barrier(&self, state_before: u32, state_after: u32) {
+        if state_before == state_after && state_before != 0 {
+            return;
+        }
+        self.barriers.lock().unwrap().push_memory(
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_WRITE,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+        );
+    }
+
+    /// Snapshot Synchronization2 barrier coalescing telemetry.
+    pub fn barrier_stats(&self) -> crate::barriers::BarrierStats {
+        self.barriers.lock().unwrap().stats()
+    }
+
+    /// Flush all pending coalesced barriers via a single `vkCmdPipelineBarrier2`
+    /// and advance the `Graphics` queue timeline in [`TimelineScheduler`].
+    pub fn flush_barriers(&self) -> Result<bool, GpuError> {
+        let mut coalescer = self.barriers.lock().unwrap();
+        if coalescer.is_empty() {
+            return Ok(false);
+        }
+        let (pool, cmd) = self.take_recording_buffer()?;
+        let result = unsafe {
+            (|| -> Result<(), GpuError> {
+                self.device.begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )?;
+                coalescer.flush(&self.device, cmd);
+                self.device.end_command_buffer(cmd)?;
+                drop(coalescer);
+                // The buffer lives in its own transient pool, so it is borrowed
+                // for the wait and recycled below rather than freed from `cmd_pool`.
+                self.submit_buffers_and_wait(&[cmd], None)
+            })()
+        };
+        self.recycle_recording_buffer(pool, cmd);
+        result?;
+        let mut sched = self.scheduler.lock().unwrap();
+        let plan = sched.plan_submit(
+            crate::queues::QueueKind::Graphics,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+        );
+        sched.observe_completed(crate::queues::QueueKind::Graphics, plan.signal.value);
+        Ok(true)
+    }
+
+    /// Advance and observe a submission on `queue` in [`TimelineScheduler`].
+    pub fn timeline_advance(&self, queue: crate::queues::QueueKind) -> u64 {
+        let mut sched = self.scheduler.lock().unwrap();
+        let plan = sched.plan_submit(queue, vk::PipelineStageFlags2::ALL_COMMANDS);
+        sched.observe_completed(queue, plan.signal.value);
+        plan.signal.value
+    }
+
+    /// Current completed timeline value for `queue`.
+    pub fn timeline_completed(&self, queue: crate::queues::QueueKind) -> u64 {
+        self.scheduler.lock().unwrap().completed(queue)
+    }
+
+    /// Evaluate [`TransientRingTrimmer`] at frame end and return the target
+    /// capacity if transient upload/staging rings should be trimmed.
+    ///
+    /// Usage is recorded every frame; the shrink decision is evaluated once per
+    /// [`TRIM_WINDOW_FRAMES`] window (~30 s at 60 Hz).
+    pub fn trim_transient_rings(&self, current_bytes: u64, frame: u64) -> Option<u64> {
+        let mut trimmer = self.ring_trimmer.lock().unwrap();
+        trimmer.record_usage(current_bytes);
+        if frame == 0 || !frame.is_multiple_of(TRIM_WINDOW_FRAMES) {
+            return None;
+        }
+        trimmer.tick_trim()
+    }
 }
+
+/// Frames per transient-ring trim evaluation window.
+pub const TRIM_WINDOW_FRAMES: u64 = 1800;
 
 impl Drop for ComputeRunner {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            for (_, live) in self
+                .sparse_images
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain()
+            {
+                self.device.destroy_image(live.image, None);
+                self.device.free_memory(live.tile_memory, None);
+            }
             for fence in self.idle_fences.get_mut().unwrap().drain(..) {
                 self.device.destroy_fence(fence, None);
             }

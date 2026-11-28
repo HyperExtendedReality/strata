@@ -232,7 +232,7 @@ fn coalesce_bda_loads(module: &mut SsaModule) -> usize {
     coalesced
 }
 
-fn is_pure(op: &SsaOp) -> bool {
+pub(crate) fn is_pure(op: &SsaOp) -> bool {
     matches!(
         op,
         SsaOp::ConstU32(_)
@@ -287,19 +287,25 @@ fn is_pure(op: &SsaOp) -> bool {
             | SsaOp::LogicalNot(_)
             | SsaOp::SelectU32 { .. }
             | SsaOp::ExtractLane(_, _)
-    )
+    ) || matches!(op, SsaOp::Alu { op, .. } if op.is_pure())
 }
 
-fn has_side_effect(op: &SsaOp) -> bool {
+pub(crate) fn has_side_effect(op: &SsaOp) -> bool {
     matches!(
         op,
         SsaOp::BdaStore { .. }
             | SsaOp::BdaAtomic { .. }
             | SsaOp::LdsStoreU32 { .. }
             | SsaOp::LdsAtomicAddU32 { .. }
+            | SsaOp::LdsAtomic { .. }
             | SsaOp::SpillStore { .. }
             | SsaOp::ImageStore { .. }
+            | SsaOp::ImageAtomic { .. }
             | SsaOp::Export { .. }
+            | SsaOp::EmitVertex
+            | SsaOp::EndPrimitive
+            | SsaOp::SetMeshOutputs { .. }
+            | SsaOp::TaskCounts { .. }
             | SsaOp::WorkgroupBarrier
             | SsaOp::WaveBallot64(_)
     )
@@ -326,6 +332,23 @@ fn rewrite_operands(op: &mut SsaOp, repl: &HashMap<ValueId, ValueId>) {
         SsaOp::Phi { incoming } => {
             for (_, v) in incoming {
                 f(v);
+            }
+        }
+        SsaOp::Alu { args, .. } => {
+            for v in args {
+                f(v);
+            }
+        }
+        SsaOp::LdsAtomic {
+            byte_addr,
+            val,
+            cmp,
+            ..
+        } => {
+            f(byte_addr);
+            f(val);
+            if let Some(c) = cmp {
+                f(c);
             }
         }
         SsaOp::BitcastU32ToF32(a)
@@ -387,14 +410,57 @@ fn rewrite_operands(op: &mut SsaOp, repl: &HashMap<ValueId, ValueId>) {
             lod.iter_mut().for_each(&f);
             ext.values_mut().for_each(&f);
         }
-        SsaOp::ImageGather { u, v, w, ext, .. } => {
+        SsaOp::ImageGather {
+            u, v, w, dref, ext, ..
+        } => {
             f(u);
             f(v);
             f(w);
+            dref.iter_mut().for_each(&f);
             ext.values_mut().for_each(&f);
         }
         SsaOp::ImageQuerySize { lod, .. } => {
             f(lod);
+        }
+        SsaOp::ImageQueryLod { u, v, w, .. } => {
+            f(u);
+            f(v);
+            f(w);
+        }
+        SsaOp::ImageAtomic {
+            x, y, z, val, cmp, ..
+        } => {
+            f(x);
+            f(y);
+            f(z);
+            f(val);
+            if let Some(c) = cmp {
+                f(c);
+            }
+        }
+        SsaOp::RayQueryClosestHit {
+            flags,
+            cull_mask,
+            ox,
+            oy,
+            oz,
+            t_min,
+            dx,
+            dy,
+            dz,
+            t_max,
+            ..
+        } => {
+            f(flags);
+            f(cull_mask);
+            f(ox);
+            f(oy);
+            f(oz);
+            f(t_min);
+            f(dx);
+            f(dy);
+            f(dz);
+            f(t_max);
         }
         SsaOp::ImageFetch { x, y, z, lod, .. } => {
             f(x);
@@ -420,6 +486,19 @@ fn rewrite_operands(op: &mut SsaOp, repl: &HashMap<ValueId, ValueId>) {
             f(lane);
         }
         SsaOp::Export { values, .. } => values.iter_mut().for_each(&f),
+        SsaOp::EmitVertex | SsaOp::EndPrimitive => {}
+        SsaOp::SetMeshOutputs {
+            vertices,
+            primitives,
+        } => {
+            f(vertices);
+            f(primitives);
+        }
+        SsaOp::TaskCounts { x, y, z } => {
+            f(x);
+            f(y);
+            f(z);
+        }
         SsaOp::PackU64 { lo: a, hi: b }
         | SsaOp::AddU32(a, b)
         | SsaOp::SubU32(a, b)
@@ -508,7 +587,7 @@ fn rewrite_operands(op: &mut SsaOp, repl: &HashMap<ValueId, ValueId>) {
     }
 }
 
-fn for_each_operand(op: &SsaOp, mut f: impl FnMut(ValueId)) {
+pub(crate) fn for_each_operand(op: &SsaOp, mut f: impl FnMut(ValueId)) {
     match op {
         SsaOp::ConstU32(_)
         | SsaOp::ConstF32(_)
@@ -521,6 +600,23 @@ fn for_each_operand(op: &SsaOp, mut f: impl FnMut(ValueId)) {
         SsaOp::Phi { incoming } => {
             for &(_, v) in incoming {
                 f(v);
+            }
+        }
+        SsaOp::Alu { args, .. } => {
+            for &v in args {
+                f(v);
+            }
+        }
+        SsaOp::LdsAtomic {
+            byte_addr,
+            val,
+            cmp,
+            ..
+        } => {
+            f(*byte_addr);
+            f(*val);
+            if let Some(c) = cmp {
+                f(*c);
             }
         }
         SsaOp::BitcastU32ToF32(a)
@@ -581,14 +677,55 @@ fn for_each_operand(op: &SsaOp, mut f: impl FnMut(ValueId)) {
             lod.iter().for_each(|&x| f(x));
             ext.values().for_each(&mut f);
         }
-        SsaOp::ImageGather { u, v, w, ext, .. } => {
+        SsaOp::ImageGather {
+            u, v, w, dref, ext, ..
+        } => {
             f(*u);
             f(*v);
             f(*w);
+            dref.iter().for_each(|&x| f(x));
             ext.values().for_each(&mut f);
         }
         SsaOp::ImageQuerySize { lod, .. } => {
             f(*lod);
+        }
+        SsaOp::ImageQueryLod { u, v, w, .. } => {
+            f(*u);
+            f(*v);
+            f(*w);
+        }
+        SsaOp::ImageAtomic {
+            x, y, z, val, cmp, ..
+        } => {
+            f(*x);
+            f(*y);
+            f(*z);
+            f(*val);
+            cmp.iter().for_each(|&c| f(c));
+        }
+        SsaOp::RayQueryClosestHit {
+            flags,
+            cull_mask,
+            ox,
+            oy,
+            oz,
+            t_min,
+            dx,
+            dy,
+            dz,
+            t_max,
+            ..
+        } => {
+            f(*flags);
+            f(*cull_mask);
+            f(*ox);
+            f(*oy);
+            f(*oz);
+            f(*t_min);
+            f(*dx);
+            f(*dy);
+            f(*dz);
+            f(*t_max);
         }
         SsaOp::ImageFetch { x, y, z, lod, .. } => {
             f(*x);
@@ -614,6 +751,19 @@ fn for_each_operand(op: &SsaOp, mut f: impl FnMut(ValueId)) {
             f(*lane);
         }
         SsaOp::Export { values, .. } => values.iter().for_each(|&v| f(v)),
+        SsaOp::EmitVertex | SsaOp::EndPrimitive => {}
+        SsaOp::SetMeshOutputs {
+            vertices,
+            primitives,
+        } => {
+            f(*vertices);
+            f(*primitives);
+        }
+        SsaOp::TaskCounts { x, y, z } => {
+            f(*x);
+            f(*y);
+            f(*z);
+        }
         SsaOp::PackU64 { lo: a, hi: b }
         | SsaOp::AddU32(a, b)
         | SsaOp::SubU32(a, b)

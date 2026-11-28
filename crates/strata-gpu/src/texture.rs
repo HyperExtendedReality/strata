@@ -381,9 +381,96 @@ fn fnv(bytes: &[u8]) -> u64 {
     })
 }
 
+/// Bytes per dirty-detection chunk (`chunk_dirty_hash.slang`).
+pub const CHUNK_BYTES: usize = 64;
+
+/// CPU mirror of `chunk_dirty_hash.slang`'s per-chunk hash (`common.slang`
+/// `mix32` over the chunk's 16 little-endian dwords, seeded by its index).
+pub fn chunk_hash(index: u32, chunk: &[u8]) -> u32 {
+    chunk.chunks_exact(4).fold(0x811C_9DC5 ^ index, |h, d| {
+        let v = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
+        let h = h ^ v.wrapping_mul(0x85EB_CA6B);
+        h.rotate_left(13).wrapping_mul(5).wrapping_add(0xE654_6B64)
+    })
+}
+
+/// `(dword offset, value)` writes for every dirty chunk (`flags[i] != 0`)
+/// of `src`, for `scatter_upload.slang`.
+pub fn dirty_chunk_writes(src: &[u8], flags: &[u32]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for (i, chunk) in src.chunks_exact(CHUNK_BYTES).enumerate() {
+        if flags.get(i).is_some_and(|&f| f != 0) {
+            let base = (i * CHUNK_BYTES / 4) as u32;
+            out.extend(chunk.chunks_exact(4).enumerate().map(|(j, d)| {
+                (
+                    base + j as u32,
+                    u32::from_le_bytes([d[0], d[1], d[2], d[3]]),
+                )
+            }));
+        }
+    }
+    out
+}
+
+/// A folded content hash of the per-chunk hashes (stands in for [`fnv`] on
+/// GPU-hashed textures).
+fn fold_chunk_hashes(hashes: &[u32]) -> u64 {
+    hashes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &c| {
+        (h ^ u64::from(c)).wrapping_mul(0x100_0000_01b3)
+    })
+}
+
+/// Title-memory bytes prepared off-thread by the prefetch worker
+/// ([`TextureCache::enable_prefetch`]).
+struct Prepared {
+    base_address: u64,
+    src: Vec<u8>,
+    hash: u64,
+}
+
+/// Reads title memory from any thread (prefetch worker).
+pub type SharedReadFn = std::sync::Arc<dyn Fn(u64, usize) -> Option<Vec<u8>> + Send + Sync>;
+
+type PreparedMap = std::sync::Arc<std::sync::Mutex<HashMap<TextureKey, Prepared>>>;
+
+/// Ahead-of-bind reader: a [`crate::async_submit::HeapTextureWorker`]
+/// draining a [`crate::async_submit::TextureAheadQueue`] reads and hashes
+/// title memory for textures the title is about to bind.
+struct Prefetcher {
+    worker: crate::async_submit::HeapTextureWorker,
+    ready: PreparedMap,
+    queued: std::collections::HashSet<TextureKey>,
+}
+
+/// The parker's slot id and descriptor hash for a texture key.
+fn park_id(k: &TextureKey) -> (u32, u64) {
+    let words: Vec<u32> = k.0.iter().copied().chain([k.1 as u32]).collect();
+    let h = fold_chunk_hashes(&words);
+    (h as u32 ^ (h >> 32) as u32, h)
+}
+
+/// At most this many prepared textures wait for their bind.
+const PREFETCH_CAP: usize = 64;
+
+/// A texture's device-local title-memory copy ([`Entry::raw_mirror`]).
+struct RawMirror(crate::runner::BdaBuffer);
+
+// SAFETY: a device-local buffer only the runner touches (its mapped pointer
+// is unused), like `PendingUpload`'s staging buffer.
+unsafe impl Send for RawMirror {}
+
 struct Entry {
     image: GpuImage,
     hash: u64,
+    /// Per-chunk hashes (`chunk_dirty_hash.slang`) for textures at least
+    /// `gpu_hash_min` bytes; empty until the first re-bind seeds them.
+    chunk_hashes: Vec<u32>,
+    /// Device-local copy of the title-memory bytes for textures that
+    /// changed after their first upload: dirty chunks are scattered into it
+    /// and it is detiled on the GPU (`None`: not dynamic or not GPU-detilable).
+    raw_mirror: Option<RawMirror>,
+    /// Re-uploads after the first.
+    reuploads: u32,
     base_address: u64,
     footprint: usize,
     /// A logged write overlapped the texture since it was last verified.
@@ -581,6 +668,8 @@ pub struct TextureCache {
     gpu_detile_min: usize,
     store: Option<crate::texstore::TextureStore>,
     evictor: crate::memory_stack::BindlessFeedbackEvictor,
+    bindless: crate::bindless::BindlessManager,
+    frame_counter: u64,
     pub telemetry: crate::memory_stack::MemoryTelemetry,
     pub uploads: u64,
     pub clean_skips: u64,
@@ -589,6 +678,22 @@ pub struct TextureCache {
     pub gpu_detiles: u64,
     /// First uploads started on the transfer queue.
     pub async_uploads: u64,
+    /// First uploads detiled on the GPU without waiting (main queue).
+    pub gpu_async_detiles: u64,
+    /// Re-binds whose change check ran on the GPU (`chunk_dirty_hash.slang`).
+    pub gpu_chunk_hashes: u64,
+    /// Dirty 64-byte chunks those checks found.
+    pub dirty_chunks: u64,
+    /// Re-uploads that scattered only dirty chunks into a VRAM mirror.
+    pub mirror_patches: u64,
+    /// Binds served from prefetched title-memory bytes.
+    pub prefetch_hits: u64,
+    /// Textures at least this large check for changes on the GPU
+    /// (`usize::MAX`: never).
+    gpu_hash_min: usize,
+    prefetch: Option<Prefetcher>,
+    /// Evicted textures: not read ahead again until a draw binds them.
+    parker: crate::mapped_cache::BindlessSlotParker,
     /// Binds that showed a placeholder while an upload ran.
     pub placeholder_binds: u64,
     /// Sampled textures at least this large upload asynchronously
@@ -633,6 +738,18 @@ fn gpu_detile_min_bytes() -> usize {
     }
 }
 
+/// `STRATA_GPU_HASH=0` keeps change detection on the CPU.
+fn gpu_hash_min_bytes() -> usize {
+    match std::env::var("STRATA_GPU_HASH")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("0" | "off" | "false") => usize::MAX,
+        _ => 8 << 20,
+    }
+}
+
 impl Default for TextureCache {
     fn default() -> Self {
         let budget = texture_budget_bytes();
@@ -651,6 +768,8 @@ impl Default for TextureCache {
             evictor: {
                 crate::memory_stack::BindlessFeedbackEvictor::new(30, budget, budget / 4 * 3)
             },
+            bindless: crate::bindless::BindlessManager::new(16_384),
+            frame_counter: 0,
             telemetry: crate::memory_stack::MemoryTelemetry::default(),
             uploads: 0,
             clean_skips: 0,
@@ -658,6 +777,14 @@ impl Default for TextureCache {
             evicted_images: 0,
             gpu_detiles: 0,
             async_uploads: 0,
+            gpu_async_detiles: 0,
+            gpu_chunk_hashes: 0,
+            dirty_chunks: 0,
+            mirror_patches: 0,
+            prefetch_hits: 0,
+            gpu_hash_min: gpu_hash_min_bytes(),
+            prefetch: None,
+            parker: Default::default(),
             placeholder_binds: 0,
             async_min: 1 << 20,
             staging_limit: 64 << 20,
@@ -777,6 +904,134 @@ impl TextureCache {
         self.gpu_detile_min = min_bytes;
     }
 
+    /// Check textures of at least `min_bytes` for changes on the GPU
+    /// (`usize::MAX` disables).
+    pub fn set_gpu_hash_min(&mut self, min_bytes: usize) {
+        self.gpu_hash_min = min_bytes;
+    }
+
+    /// Start the ahead-of-bind worker: [`Self::prefetch`] queues a T# whose
+    /// title-memory bytes `read` fetches and hashes off the calling thread.
+    /// Prepared bytes are used only with dirty tracking on, for write-watched
+    /// memory (a logged write discards them).
+    pub fn enable_prefetch(&mut self, read: SharedReadFn) {
+        let ready: PreparedMap = Default::default();
+        let sink = std::sync::Arc::clone(&ready);
+        let queue = std::sync::Arc::new(crate::async_submit::TextureAheadQueue::new());
+        let worker = crate::async_submit::HeapTextureWorker::spawn(queue, move |ticket| {
+            let Ok(model) = Self::model(&ticket.words, None) else {
+                return;
+            };
+            let Ok(footprint) = model.footprint() else {
+                return;
+            };
+            let base = model.desc.base_address;
+            let Some(src) = read(base, footprint) else {
+                return;
+            };
+            let hash = fnv(&src);
+            let mut ready = sink.lock().unwrap_or_else(|e| e.into_inner());
+            if ready.len() < PREFETCH_CAP {
+                ready.insert(
+                    key(&ticket.words, None),
+                    Prepared {
+                        base_address: base,
+                        src,
+                        hash,
+                    },
+                );
+            }
+        });
+        self.prefetch = Some(Prefetcher {
+            worker,
+            ready,
+            queued: Default::default(),
+        });
+    }
+
+    /// Queue a sampled T# for ahead-of-bind reading (see
+    /// [`Self::enable_prefetch`]); a no-op for cached, clean textures.
+    pub fn prefetch(&mut self, words: [u32; 8]) {
+        let k = key(&words, None);
+        let Some(pf) = &mut self.prefetch else {
+            return;
+        };
+        let (slot, h) = park_id(&k);
+        if self.textures.get(&k).is_some_and(|e| !e.dirty)
+            || self.parker.should_skip_upload(slot, h)
+            || !pf.queued.insert(k)
+        {
+            return;
+        }
+        let Ok(model) = Self::model(&words, None) else {
+            pf.queued.remove(&k);
+            return;
+        };
+        pf.worker.enqueue(crate::async_submit::TextureUploadTicket {
+            descriptor_hash: fold_chunk_hashes(&words),
+            src_addr: model.desc.base_address,
+            width: model.desc.width,
+            height: model.desc.height,
+            mip_levels: model.levels,
+            ready_fence: self.frame_counter,
+            words,
+        });
+    }
+
+    /// Whether [`Self::enable_prefetch`] ran.
+    pub fn prefetch_enabled(&self) -> bool {
+        self.prefetch.is_some()
+    }
+
+    /// Textures the parker kept from being read ahead after eviction.
+    pub fn parked_prefetch_skips(&self) -> u64 {
+        self.parker.skipped_reuploads
+    }
+
+    /// `ID3D12Device::Evict`: drops sampled images over `[addr, addr + len)`
+    /// (re-read from title memory when next bound). Storage images, depth
+    /// targets and uploads in flight keep their GPU contents. Returns the
+    /// images freed.
+    pub fn evict_range(&mut self, runner: &ComputeRunner, addr: u64, len: u64) -> usize {
+        let end = addr.saturating_add(len);
+        let keys: Vec<TextureKey> = self
+            .textures
+            .iter()
+            .filter(|(_, e)| {
+                e.slot != 0
+                    && e.pending.is_none()
+                    && e.base_address < end
+                    && addr < e.base_address.saturating_add(e.footprint as u64)
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for k in &keys {
+            if let Some(e) = self.textures.remove(k) {
+                let (slot, h) = park_id(k);
+                self.parker.park(slot, h);
+                self.destroy_entry(runner, e);
+                self.evicted_images += 1;
+            }
+        }
+        keys.len()
+    }
+
+    /// Prefetched bytes for `k`, if still valid for a bind now.
+    fn take_prepared(&mut self, k: TextureKey, base: u64, footprint: usize) -> Option<Prepared> {
+        let pf = self.prefetch.as_mut()?;
+        pf.queued.remove(&k);
+        let p = pf
+            .ready
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&k)?;
+        (self.dirty.is_some()
+            && p.base_address == base
+            && p.src.len() == footprint
+            && crate::dirty_log::is_watched(base, footprint as u64))
+        .then_some(p)
+    }
+
     /// Applies logged writes to the cached entries.
     fn apply_dirty_log(&mut self) {
         let Some(q) = &self.dirty else { return };
@@ -784,6 +1039,9 @@ impl TextureCache {
         if d.everything {
             for e in self.textures.values_mut() {
                 e.dirty = true;
+            }
+            if let Some(pf) = &self.prefetch {
+                pf.ready.lock().unwrap_or_else(|e| e.into_inner()).clear();
             }
         }
         for (a, n) in d.ranges {
@@ -827,6 +1085,14 @@ impl TextureCache {
                 entry.dirty = true;
             }
         }
+        if let Some(pf) = &self.prefetch {
+            pf.ready
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|_, p| {
+                    !(p.base_address < end && addr < p.base_address + p.src.len() as u64)
+                });
+        }
     }
 
     /// Evict idle GPU textures above the VRAM high-water mark, destroying their
@@ -835,7 +1101,9 @@ impl TextureCache {
     pub fn evict_idle(&mut self, runner: &ComputeRunner, now_sec: u64) -> usize {
         self.clock_sec = now_sec;
         let slots = self.evictor.sweep_at_most(now_sec, 8, |slot| {
-            self.key_by_slot.get(&slot).and_then(|key| self.textures.get(key))
+            self.key_by_slot
+                .get(&slot)
+                .and_then(|key| self.textures.get(key))
                 .is_some_and(|entry| entry.pending.is_none())
         });
         let mut count = 0usize;
@@ -844,12 +1112,17 @@ impl TextureCache {
             if let Some(k) = self.key_by_slot.remove(&slot)
                 && let Some(entry) = self.textures.remove(&k)
             {
+                let (park_slot, h) = park_id(&k);
+                self.parker.park(park_slot, h);
                 self.telemetry.vram_textures_bytes = self
                     .telemetry
                     .vram_textures_bytes
                     .saturating_sub(entry.footprint as u64);
                 let mut entry = entry;
                 let _ = settle(runner, &mut entry);
+                if let Some(m) = entry.raw_mirror.take() {
+                    runner.free_bda_buffer(m.0);
+                }
                 runner.destroy_image(entry.image);
                 self.evicted_images += 1;
                 count += 1;
@@ -878,12 +1151,17 @@ impl TextureCache {
             heap_budget: budget,
             commit_available: commit.unwrap_or_default(),
             resident_bytes: self.telemetry.vram_textures_bytes,
-            oldest_upload_ms: self.pending_order.first().map_or(0, |(start, _)| start.elapsed().as_millis() as u64),
+            oldest_upload_ms: self
+                .pending_order
+                .first()
+                .map_or(0, |(start, _)| start.elapsed().as_millis() as u64),
         };
         // Transfers use one FIFO queue. An unfinished oldest transfer also
         // means that newer uploads have yet to signal.
         for _ in 0..8 {
-            let Some(&(_, key)) = self.pending_order.first() else { break };
+            let Some(&(_, key)) = self.pending_order.first() else {
+                break;
+            };
             let upload = self.textures[&key].pending.as_ref().unwrap();
             if matches!(runner.upload_ready(upload), Ok(false)) {
                 break;
@@ -896,10 +1174,19 @@ impl TextureCache {
         let resident = self.evictor.resident_bytes();
         let goal = if self.pressure {
             let reclaim = usage.saturating_sub(heap_recovery);
-            self.configured_budget.min(resident.saturating_sub(reclaim.max(resident / 8)))
+            self.configured_budget
+                .min(resident.saturating_sub(reclaim.max(resident / 8)))
         } else {
             self.configured_budget
         };
+        self.frame_counter += 1;
+        let completed_copy = runner.timeline_completed(crate::queues::QueueKind::TransferCopy);
+        let _ = self.bindless.publish_ready(completed_copy);
+        if let Some(target_staging) =
+            runner.trim_transient_rings(self.pending_bytes, self.frame_counter)
+        {
+            self.staging_limit = self.staging_limit.min(target_staging.max(16 << 20));
+        }
         self.evictor.set_watermarks(goal, goal / 4 * 3);
         self.evict_idle(runner, self.epoch.elapsed().as_secs());
     }
@@ -998,37 +1285,50 @@ impl TextureCache {
         let model = Self::model(&words, depth)?;
         let d = model.desc;
         let footprint = model.footprint()?;
-        let src = read(d.base_address, footprint).ok_or(TextureError::Read {
-            addr: d.base_address,
-            len: footprint,
-        })?;
-        let hash = fnv(&src);
-
         let reuse = match self.textures.get(&k) {
             Some(e) => e.image.storage || !storage,
             None => false,
         };
+        let prepared = if depth.is_none() {
+            self.take_prepared(k, d.base_address, footprint)
+        } else {
+            None
+        };
+        let src = match &prepared {
+            Some(p) => {
+                self.prefetch_hits += 1;
+                p.src.clone()
+            }
+            None => read(d.base_address, footprint).ok_or(TextureError::Read {
+                addr: d.base_address,
+                len: footprint,
+            })?,
+        };
+        // Large re-binds check for changes per chunk on the GPU instead.
+        let gpu_check = reuse
+            && footprint >= self.gpu_hash_min
+            && footprint.is_multiple_of(CHUNK_BYTES)
+            && prepared.is_none();
+        let hash = match &prepared {
+            Some(p) => p.hash,
+            None if gpu_check => 0,
+            None => fnv(&src),
+        };
+
         if !reuse && let Some(old) = self.textures.remove(&k) {
             // Needed as storage now: made again with STORAGE usage below.
             self.destroy_entry(runner, old);
         }
         if reuse {
-            let need_upload = self.textures[&k].hash != hash;
-            if need_upload {
-                let mut e = self.textures.remove(&k).expect("present");
-                let filled = self.fill(runner, &e.image, &model, &src);
-                if let Err(error) = filled {
-                    self.destroy_entry(runner, e);
-                    return Err(error);
-                }
-                e.hash = hash;
-                e.dirty = false;
-                self.textures.insert(k, e);
-            } else {
-                let e = self.textures.get_mut(&k).expect("present");
-                e.dirty = false;
+            let mut e = self.textures.remove(&k).expect("present");
+            let result = self.refresh(runner, &mut e, &model, &src, hash, gpu_check);
+            if let Err(error) = result {
+                self.destroy_entry(runner, e);
+                return Err(error);
             }
-            let slot = self.textures[&k].slot;
+            e.dirty = false;
+            let slot = e.slot;
+            self.textures.insert(k, e);
             self.evictor.on_gpu_read(slot, self.clock_sec);
             return Ok(&self.textures[&k].image);
         }
@@ -1077,13 +1377,27 @@ impl TextureCache {
             components,
         })?;
         let mut pending = None;
-        if allow_async
+        let async_ok = allow_async
             && !storage
             && depth.is_none()
             && src.len() >= self.async_min
-            && runner.has_transfer_queue()
-            && self.pending_bytes.saturating_add(footprint as u64) <= self.staging_limit
+            && self.pending_bytes.saturating_add(footprint as u64) <= self.staging_limit;
+        // Large Morton surfaces: detile on the GPU without waiting.
+        if async_ok
+            && self.store.is_none()
+            && src.len() >= self.gpu_detile_min
+            && let Some((jobs, tight_len)) = model.gpu_detile_jobs()
+            && let Ok(p) =
+                runner.upload_image_detiled_gpu_async(&image, &src, &jobs, tight_len, model.block)
         {
+            self.gpu_async_detiles += 1;
+            self.gpu_detiles += 1;
+            self.uploads += 1;
+            self.pending_bytes += p.bytes;
+            self.pending_order.insert((p.started, k));
+            pending = Some(p);
+        }
+        if pending.is_none() && async_ok && runner.has_transfer_queue() {
             match self
                 .detile_or_store(&model, &src)
                 .map(|tight| runner.upload_image_levels_async(&image, &tight, model.block))
@@ -1113,19 +1427,39 @@ impl TextureCache {
         let slot = if storage || depth.is_some() {
             0
         } else {
-            let slot = self.next_slot;
-            self.next_slot = self.next_slot.wrapping_add(1).max(1);
+            let desc = crate::bindless::HardwareDesc([words[0], words[1], words[2], words[3]]);
+            let completed_copy = runner.timeline_completed(crate::queues::QueueKind::TransferCopy);
+            let upload_fence = if pending.is_some() {
+                runner.timeline_advance(crate::queues::QueueKind::TransferCopy)
+            } else {
+                completed_copy
+            };
+            let resolved =
+                self.bindless
+                    .resolve(desc, upload_fence, completed_copy, self.frame_counter);
+            let slot = if resolved.0 != 0 {
+                resolved.0
+            } else {
+                let s = self.next_slot;
+                self.next_slot = self.next_slot.wrapping_add(1).max(1);
+                s
+            };
             self.key_by_slot.insert(slot, k);
             self.evictor
                 .on_write(slot, hash, footprint as u64, self.clock_sec);
             slot
         };
         self.telemetry.vram_textures_bytes += footprint as u64;
+        // A draw bound it: read-ahead may resume after a later eviction.
+        self.parker.apply_gpu_feedback(&[park_id(&k).0]);
         self.textures.insert(
             k,
             Entry {
                 image,
-                hash,
+                hash: if hash == 0 { fnv(&src) } else { hash },
+                chunk_hashes: Vec::new(),
+                raw_mirror: None,
+                reuploads: 0,
                 base_address: d.base_address,
                 footprint,
                 dirty: false,
@@ -1135,6 +1469,116 @@ impl TextureCache {
             },
         );
         Ok(&self.textures[&k].image)
+    }
+
+    /// Brings a cached entry up to date with `src` (re-bind). With
+    /// `gpu_check`, the change test runs per 64-byte chunk on the GPU and a
+    /// dynamic texture's dirty chunks are scattered into its VRAM mirror and
+    /// detiled there; otherwise the whole-footprint hash decides.
+    fn refresh(
+        &mut self,
+        runner: &ComputeRunner,
+        e: &mut Entry,
+        model: &SurfaceModel,
+        src: &[u8],
+        hash: u64,
+        gpu_check: bool,
+    ) -> Result<(), TextureError> {
+        let chunks = src.len() / CHUNK_BYTES;
+        let flags = if gpu_check && e.chunk_hashes.len() == chunks {
+            match runner.chunk_dirty_hash_gpu(src, &mut e.chunk_hashes) {
+                Ok(f) => Some(f),
+                Err(_) => {
+                    e.chunk_hashes.clear();
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let (changed, new_hash) = match &flags {
+            Some(f) => {
+                self.gpu_chunk_hashes += 1;
+                let dirty = f.iter().filter(|&&v| v != 0).count();
+                self.dirty_chunks += dirty as u64;
+                (dirty != 0, fold_chunk_hashes(&e.chunk_hashes))
+            }
+            None => {
+                let h = if hash == 0 { fnv(src) } else { hash };
+                if gpu_check {
+                    // Seed the chunk hashes for the next re-bind.
+                    e.chunk_hashes = src
+                        .chunks_exact(CHUNK_BYTES)
+                        .enumerate()
+                        .map(|(i, c)| chunk_hash(i as u32, c))
+                        .collect();
+                }
+                (h != e.hash, h)
+            }
+        };
+        if !changed {
+            return Ok(());
+        }
+        e.reuploads = e.reuploads.saturating_add(1);
+        let jobs = (gpu_check && self.store.is_none())
+            .then(|| model.gpu_detile_jobs())
+            .flatten();
+        let patched = match (&jobs, &e.raw_mirror, &flags) {
+            // Dirty chunks only: scatter into the VRAM mirror, detile there.
+            (Some((jobs, tight_len)), Some(mirror), Some(f)) => {
+                let writes = dirty_chunk_writes(src, f);
+                (writes.len() * 4 <= src.len() / 2
+                    && runner
+                        .patch_mirror_and_detile(
+                            &e.image,
+                            mirror.0.bda,
+                            &writes,
+                            jobs,
+                            *tight_len,
+                            model.block,
+                        )
+                        .is_ok())
+                .then_some(())
+            }
+            _ => None,
+        };
+        if patched.is_some() {
+            self.mirror_patches += 1;
+            self.uploads += 1;
+        } else {
+            if let Some(m) = e.raw_mirror.take() {
+                runner.free_bda_buffer(m.0);
+            }
+            match &jobs {
+                // A texture that changed after its first upload: keep its
+                // bytes in VRAM so later changes move only dirty chunks.
+                Some((jobs, tight_len)) if e.reuploads >= 1 => {
+                    let mirror = runner.alloc_vram_bda_buffer(src.len() as u64, src)?;
+                    let done = runner.patch_mirror_and_detile(
+                        &e.image,
+                        mirror.bda,
+                        &[],
+                        jobs,
+                        *tight_len,
+                        model.block,
+                    );
+                    match done {
+                        Ok(()) => {
+                            e.raw_mirror = Some(RawMirror(mirror));
+                            self.gpu_detiles += 1;
+                            self.uploads += 1;
+                        }
+                        Err(_) => {
+                            runner.free_bda_buffer(mirror);
+                            self.fill(runner, &e.image, model, src)?;
+                        }
+                    }
+                }
+                _ => self.fill(runner, &e.image, model, src)?,
+            }
+        }
+        e.hash = new_hash;
+        Ok(())
     }
 
     /// Uploads `src` (title-memory bytes) into `image`: from the texture
@@ -1299,6 +1743,9 @@ impl TextureCache {
             .telemetry
             .vram_textures_bytes
             .saturating_sub(entry.footprint as u64);
+        if let Some(m) = entry.raw_mirror {
+            runner.free_bda_buffer(m.0);
+        }
         runner.destroy_image(entry.image);
     }
 
@@ -1391,6 +1838,10 @@ impl TextureCache {
             return Err(TextureError::Write(d.base_address));
         }
         e.hash = fnv(&dst); // what title memory now holds: no re-upload needed
+        e.chunk_hashes.clear();
+        if let Some(m) = e.raw_mirror.take() {
+            runner.free_bda_buffer(m.0);
+        }
         Ok(())
     }
 
@@ -1446,8 +1897,12 @@ impl TextureCache {
     pub fn destroy(&mut self, runner: &ComputeRunner) {
         for (_, mut e) in self.textures.drain() {
             let _ = settle(runner, &mut e);
+            if let Some(m) = e.raw_mirror.take() {
+                runner.free_bda_buffer(m.0);
+            }
             runner.destroy_image(e.image);
         }
+        self.prefetch = None;
         for (_, s) in self.samplers.drain() {
             runner.destroy_sampler(s);
         }
@@ -1459,6 +1914,51 @@ impl TextureCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_hash_and_dirty_writes() {
+        let mut src = vec![0u8; CHUNK_BYTES * 4];
+        let before: Vec<u32> = src
+            .chunks_exact(CHUNK_BYTES)
+            .enumerate()
+            .map(|(i, c)| chunk_hash(i as u32, c))
+            .collect();
+        // Identical chunks at different indices hash differently.
+        assert_ne!(before[0], before[1]);
+        src[CHUNK_BYTES * 2 + 5] = 0x7F;
+        let after: Vec<u32> = src
+            .chunks_exact(CHUNK_BYTES)
+            .enumerate()
+            .map(|(i, c)| chunk_hash(i as u32, c))
+            .collect();
+        let flags: Vec<u32> = before
+            .iter()
+            .zip(&after)
+            .map(|(a, b)| u32::from(a != b))
+            .collect();
+        assert_eq!(flags, [0, 0, 1, 0]);
+        let writes = dirty_chunk_writes(&src, &flags);
+        assert_eq!(writes.len(), 16);
+        assert_eq!(writes[0].0, 32);
+        assert_eq!(writes[1], (33, 0x7F00));
+    }
+
+    #[test]
+    fn gpu_chunk_hash_matches_cpu_mirror() {
+        let Ok(runner) = ComputeRunner::new() else {
+            return;
+        };
+        let src: Vec<u8> = (0..CHUNK_BYTES * 130).map(|i| (i * 7 + 3) as u8).collect();
+        let mut prev = vec![0u32; 130];
+        let flags = runner.chunk_dirty_hash_gpu(&src, &mut prev).unwrap();
+        assert_eq!(flags.len(), 130);
+        let cpu: Vec<u32> = src
+            .chunks_exact(CHUNK_BYTES)
+            .enumerate()
+            .map(|(i, c)| chunk_hash(i as u32, c))
+            .collect();
+        assert_eq!(prev, cpu);
+    }
 
     fn desc(w: u32, h: u32, sw_mode: u8) -> ImageDescriptor {
         ImageDescriptor {

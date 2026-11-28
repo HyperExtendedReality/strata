@@ -85,6 +85,17 @@ pub const FLAG_PRIMARY: u32 = 2;
 /// specialize them to a valid table (one with `FLAGS = 0` disables BMA).
 pub const SPEC_ID_TABLE_LO: u32 = 0x5342;
 pub const SPEC_ID_TABLE_HI: u32 = 0x5343;
+/// SPIR-V `SpecId` for the BMH child-prior pruning threshold (`f32`, `0.0` disables).
+pub const SPEC_ID_PRIOR_THRESHOLD: u32 = 0x5344;
+
+/// Child-prior pruning threshold from `STRATA_BVH_BMA_PRIOR` (or `0.0` when unset/disabled).
+pub fn prior_threshold_from_env() -> f32 {
+    std::env::var("STRATA_BVH_BMA_PRIOR")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|&v| v > 0.0 && v <= 1.0)
+        .unwrap_or(0.0)
+}
 
 /// Whether compiled compute shaders get the BMA instrumentation
 /// (`STRATA_BVH_BMA` set to an enabling value; read once).

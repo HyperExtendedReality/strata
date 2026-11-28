@@ -14,6 +14,7 @@ pub struct TranslatedBatch {
     pub op_count: usize,
     pub draw_count: usize,
     pub dispatch_count: usize,
+    pub coalesced_barriers: usize,
     pub ops: Vec<ThinCommand>,
     pub hoisted_clamps: Vec<(u64, u32, u32)>,
 }
@@ -79,11 +80,13 @@ impl ThinTranslationPool {
 }
 
 fn translate_one(ticket: u64, list: ThinCommandList) -> TranslatedBatch {
-    let (ops, hoisted_clamps) = list.into_recording();
+    let (raw_ops, hoisted_clamps) = list.into_recording();
+    let mut ops = Vec::with_capacity(raw_ops.len());
     let mut draw_count = 0usize;
     let mut dispatch_count = 0usize;
-    for op in &ops {
-        match op {
+    let mut coalesced_barriers = 0usize;
+    for op in raw_ops {
+        match &op {
             ThinCommand::DrawInstanced { .. }
             | ThinCommand::DrawIndexedInstanced { .. }
             | ThinCommand::DrawIndirect { .. } => {
@@ -92,14 +95,39 @@ fn translate_one(ticket: u64, list: ThinCommandList) -> TranslatedBatch {
             ThinCommand::Dispatch { .. } | ThinCommand::DispatchIndirect { .. } => {
                 dispatch_count += 1;
             }
+            ThinCommand::ResourceBarrier {
+                resource_va,
+                state_before,
+                state_after,
+            } => {
+                // Parallel barrier coalescing: drop redundant read-to-read no-ops and
+                // fold duplicate consecutive barriers on the same resource.
+                if state_before == state_after && *state_before != 0 {
+                    coalesced_barriers += 1;
+                    continue;
+                }
+                if let Some(ThinCommand::ResourceBarrier {
+                    resource_va: prev_va,
+                    state_after: prev_after,
+                    ..
+                }) = ops.last_mut()
+                    && *prev_va == *resource_va
+                {
+                    *prev_after = *state_after;
+                    coalesced_barriers += 1;
+                    continue;
+                }
+            }
             _ => {}
         }
+        ops.push(op);
     }
     TranslatedBatch {
         ticket,
         op_count: ops.len(),
         draw_count,
         dispatch_count,
+        coalesced_barriers,
         ops,
         hoisted_clamps,
     }
@@ -114,6 +142,8 @@ pub struct TextureUploadTicket {
     pub height: u32,
     pub mip_levels: u32,
     pub ready_fence: u64,
+    /// The T# to prepare.
+    pub words: [u32; 8],
 }
 
 /// Asynchronous copy-queue staging list for ahead-of-time texture uploads.
@@ -151,6 +181,23 @@ impl TextureAheadQueue {
     pub fn pending(&self) -> usize {
         self.inner.0.lock().unwrap().len()
     }
+
+    /// [`Self::drain_ready`], blocking up to `timeout` for the first ticket.
+    pub fn wait_drain(
+        &self,
+        max_items: usize,
+        timeout: std::time::Duration,
+    ) -> Vec<TextureUploadTicket> {
+        let (lock, cv) = &*self.inner;
+        let q = lock.lock().unwrap();
+        let (mut q, _) = cv.wait_timeout_while(q, timeout, |q| q.is_empty()).unwrap();
+        let n = q.len().min(max_items);
+        q.drain(..n).collect()
+    }
+
+    fn wake(&self) {
+        self.inner.1.notify_all();
+    }
 }
 
 /// Dedicated background texture-heap worker (inspired by `VIctory-Fast`'s
@@ -177,11 +224,7 @@ impl HeapTextureWorker {
             .name("strata-heap-worker".into())
             .spawn(move || {
                 while !s.load(std::sync::atomic::Ordering::Acquire) {
-                    let batch = q.drain_ready(16);
-                    if batch.is_empty() {
-                        thread::sleep(std::time::Duration::from_millis(2));
-                        continue;
-                    }
+                    let batch = q.wait_drain(16, std::time::Duration::from_millis(50));
                     for ticket in &batch {
                         on_upload(ticket);
                         p.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -210,6 +253,7 @@ impl Drop for HeapTextureWorker {
     fn drop(&mut self) {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Release);
+        self.queue.wake();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -336,6 +380,7 @@ mod tests {
             height: 256,
             mip_levels: 9,
             ready_fence: 1,
+            words: [0; 8],
         });
         q.enqueue(TextureUploadTicket {
             descriptor_hash: 0x22,
@@ -344,6 +389,7 @@ mod tests {
             height: 512,
             mip_levels: 10,
             ready_fence: 2,
+            words: [0; 8],
         });
         assert_eq!(q.pending(), 2);
         let first = q.drain_ready(1);

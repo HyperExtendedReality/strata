@@ -255,6 +255,12 @@ impl ComputeRunner {
             t: f32::from_bits(result[1]),
             barycentrics: [f32::from_bits(result[2]), f32::from_bits(result[3])],
         });
-        Ok((hit, RayQueryTiming { build, trace: trace.elapsed() }))
+        Ok((
+            hit,
+            RayQueryTiming {
+                build,
+                trace: trace.elapsed(),
+            },
+        ))
     }
 }

@@ -39,7 +39,9 @@ pub fn command() -> Result<(), String> {
             "--window" => window = true,
             "--require-gpu" => require_gpu = true,
             "--frames" => {
-                frames = args.next().and_then(|value| value.parse().ok())
+                frames = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
                     .filter(|&count| (1..=1_000_000).contains(&count))
                     .ok_or("--frames requires a value between 1 and 1000000")?;
             }
@@ -234,27 +236,49 @@ fn ray_query_parity(runner: &ComputeRunner) -> Result<Value, String> {
 
     let triangle = |z| [[0.0, 0.0, z], [1.0, 0.0, z], [0.0, 1.0, z]];
     let triangles = [triangle(4.0), triangle(2.0)];
-    let rays = [([0.25, 0.125, 0.0], 10.0), ([2.0, 1.0, 0.0], 10.0), ([0.25, 0.125, 0.0], 1.0)];
+    let rays = [
+        ([0.25, 0.125, 0.0], 10.0),
+        ([2.0, 1.0, 0.0], 10.0),
+        ([0.25, 0.125, 0.0], 1.0),
+    ];
     let mut timings = Vec::new();
     for (origin, t_max) in rays {
-        let ray = Ray { origin, t_max, dir: [0.0, 0.0, 1.0], inv_dir: [f32::INFINITY, f32::INFINITY, 1.0] };
+        let ray = Ray {
+            origin,
+            t_max,
+            dir: [0.0, 0.0, 1.0],
+            inv_dir: [f32::INFINITY, f32::INFINITY, 1.0],
+        };
         let start = Instant::now();
-        let expected = triangles.iter().enumerate().filter_map(|(index, &[a, b, c])| {
-            let [num, den, u, v] = intersect_triangle(&ray, a, b, c);
-            num.is_finite().then_some((index as u32, num / den, [u / den, v / den]))
-        }).min_by(|a, b| a.1.total_cmp(&b.1));
+        let expected = triangles
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &[a, b, c])| {
+                let [num, den, u, v] = intersect_triangle(&ray, a, b, c);
+                num.is_finite()
+                    .then_some((index as u32, num / den, [u / den, v / den]))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1));
         let software_ms = start.elapsed().as_secs_f64() * 1_000.0;
-        let (actual, timing) = runner.query_opaque_triangles_timed(&triangles, origin, ray.dir, t_max)
+        let (actual, timing) = runner
+            .query_opaque_triangles_timed(&triangles, origin, ray.dir, t_max)
             .map_err(|error| error.to_string())?;
         let matches = match (expected, actual) {
             (None, None) => true,
-            (Some((primitive, t, uv)), Some(hit)) => primitive == hit.primitive
-                && (t - hit.t).abs() < 1e-5
-                && uv.into_iter().zip(hit.barycentrics).all(|(a, b)| (a - b).abs() < 1e-5),
+            (Some((primitive, t, uv)), Some(hit)) => {
+                primitive == hit.primitive
+                    && (t - hit.t).abs() < 1e-5
+                    && uv
+                        .into_iter()
+                        .zip(hit.barycentrics)
+                        .all(|(a, b)| (a - b).abs() < 1e-5)
+            }
             _ => false,
         };
         if !matches {
-            return Err(format!("ray query parity for {origin:?}, tMax={t_max}: CPU {expected:?}, GPU {actual:?}"));
+            return Err(format!(
+                "ray query parity for {origin:?}, tMax={t_max}: CPU {expected:?}, GPU {actual:?}"
+            ));
         }
         timings.push(json!({
             "hit": actual.is_some(), "software_ms": software_ms,

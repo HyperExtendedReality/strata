@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use strata_gpu::async_submit::{TextureAheadQueue, ThinTranslationPool};
+use strata_gpu::async_submit::ThinTranslationPool;
 use strata_gpu::graphics::{DrawArgs, GraphicsPsoState};
 use strata_gpu::images::ImageBindings;
 use strata_gpu::indirect_upload::{PipelineLibrary, UploadQueue};
@@ -388,8 +388,19 @@ pub(crate) fn readable(addr: u64, len: usize) -> bool {
     }
     const MEM_COMMIT: u32 = 0x1000;
     const NO_READ: u32 = 0x01 | 0x100; // PAGE_NOACCESS | PAGE_GUARD
+    const WRITABLE: u32 = 0x04 | 0x08 | 0x40 | 0x80;
     if addr == 0 {
         return false;
+    }
+    let cached = IN_SUBMISSION.with(std::cell::Cell::get);
+    if cached
+        && MAPPED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .contains(addr, len as u64, false)
+    {
+        return true;
     }
     let mut info = std::mem::MaybeUninit::<Mbi>::zeroed();
     // SAFETY: a query only.
@@ -405,11 +416,20 @@ pub(crate) fn readable(addr: u64, len: usize) -> bool {
     }
     // SAFETY: filled by VirtualQuery.
     let info = unsafe { info.assume_init() };
-    info.state == MEM_COMMIT
-        && info.protect & NO_READ == 0
-        && (addr as usize)
-            .checked_add(len)
-            .is_some_and(|end| end <= info.base.saturating_add(info.region_size))
+    let ok = info.state == MEM_COMMIT && info.protect & NO_READ == 0;
+    if ok
+        && cached
+        && let Some(c) = MAPPED.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+    {
+        c.insert(
+            info.base as u64,
+            info.region_size as u64,
+            info.protect & WRITABLE != 0,
+        );
+    }
+    ok && (addr as usize)
+        .checked_add(len)
+        .is_some_and(|end| end <= info.base.saturating_add(info.region_size))
 }
 
 /// The three group counts of an indirect dispatch, from console memory.
@@ -539,6 +559,74 @@ pub struct CommandQueueVTable {
 /// Graphics pipelines and textures, shared by every queue of a device.
 pub type PipelineTable = Arc<Mutex<HashMap<PipelineKey, PipelineEntry>>>;
 pub type SharedTextures = Arc<Mutex<TextureCache>>;
+/// A device's residency bookkeeping (shared by its queues).
+pub type SharedResidency = Arc<Mutex<strata_gpu::residency::ResidencyManager>>;
+
+/// Console memory handed to the prefetch worker thread.
+struct SharedUma(Arc<Mutex<UmaManager>>);
+
+// SAFETY: the UMA's raw host pointers are only used behind its mutex, as
+// every queue of a device already does from its own thread.
+unsafe impl Send for SharedUma {}
+unsafe impl Sync for SharedUma {}
+
+impl SharedUma {
+    // A method (not a field access) so closures capture the whole wrapper.
+    fn get(&self) -> &Mutex<UmaManager> {
+        &self.0
+    }
+}
+
+/// T#s written by `CreateShaderResourceView` since the last submission:
+/// read ahead by the texture cache's heap worker before the draws bind them.
+static SRV_PREFETCH: Mutex<Vec<[u32; 8]>> = Mutex::new(Vec::new());
+
+/// Queue a new SRV's T# for ahead-of-bind reading (bounded; duplicates of
+/// the previous entry are dropped).
+pub(crate) fn queue_srv_prefetch(words: [u32; 8]) {
+    let mut q = SRV_PREFETCH.lock().unwrap_or_else(|e| e.into_inner());
+    if q.len() < 4096 && q.last() != Some(&words) {
+        q.push(words);
+    }
+}
+
+/// `VirtualQuery` results, valid until the next submission or title
+/// memory release ([`invalidate_mapped_ranges`]).
+static MAPPED: Mutex<Option<strata_gpu::mapped_cache::MappedRangeCache>> = Mutex::new(None);
+
+thread_local! {
+    /// Whether this thread is executing a submission ([`MappedScope`]).
+    static IN_SUBMISSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While alive, [`readable`] on this thread trusts and fills [`MAPPED`].
+/// Outside a submission every check asks the OS, so a release Strata does
+/// not hook (a title's own `VirtualFree`) cannot leave a stale answer.
+struct MappedScope(bool);
+
+impl MappedScope {
+    fn enter() -> Self {
+        let outer = IN_SUBMISSION.with(|f| f.replace(true));
+        if !outer {
+            invalidate_mapped_ranges();
+        }
+        Self(outer)
+    }
+}
+
+impl Drop for MappedScope {
+    fn drop(&mut self) {
+        IN_SUBMISSION.with(|f| f.set(self.0));
+    }
+}
+
+/// Forget cached `VirtualQuery` spans (title memory was freed or re-protected,
+/// or a new submission starts).
+pub(crate) fn invalidate_mapped_ranges() {
+    if let Some(c) = MAPPED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        c.bump_generation();
+    }
+}
 
 #[repr(C)]
 pub struct D3D12CommandQueueX {
@@ -547,6 +635,8 @@ pub struct D3D12CommandQueueX {
     pub submitted_commands: AtomicU32,
     pub hoisted_clamps: AtomicU32,
     pub executed_gpu_dispatches: AtomicU32,
+    /// Lists run by parallel command-buffer recording.
+    pub parallel_lists: AtomicU32,
     pub frame_clock: Mutex<FramePacingClock>,
     /// Optional live Vulkan 1.3 BDA runner + compiled SPIR-V pipeline table.
     pub gpu_runner: Option<Arc<ComputeRunner>>,
@@ -555,6 +645,8 @@ pub struct D3D12CommandQueueX {
     pub textures: SharedTextures,
     /// Render targets by console address, described like textures.
     pub render_targets: Mutex<HashMap<u64, [u32; 8]>>,
+    /// `RECTLIST` geometry shaders by the vertex shader's parameter locations.
+    rect_gs: Mutex<HashMap<Vec<u32>, std::sync::Arc<Vec<u32>>>>,
     pub executed_draws: AtomicU32,
     /// Draws and dispatches `SetPredication` skipped.
     pub predicated_skips: AtomicU32,
@@ -574,8 +666,6 @@ pub struct D3D12CommandQueueX {
     logged: Mutex<std::collections::HashSet<&'static str>>,
     /// Parallel thin-list flattener for multi-list `ExecuteCommandLists` batches.
     pub translation_pool: ThinTranslationPool,
-    /// Ahead-of-time texture upload staging queue.
-    pub texture_ahead: TextureAheadQueue,
     /// Dedicated copy/upload staging queue.
     pub upload_queue: Mutex<UploadQueue>,
     /// Persistent `ID3D12PipelineLibrary` store.
@@ -584,6 +674,13 @@ pub struct D3D12CommandQueueX {
     pub texture_store: Mutex<Option<TextureStore>>,
     /// CPU/GPU timeline profiler (Chrome Trace JSON export).
     pub timeline: Mutex<TimelineProfiler>,
+    /// VRAM residency (`ID3D12Device::MakeResident` / `Evict`), shared by
+    /// every queue of a device.
+    pub residency: SharedResidency,
+    /// Packed 64 KiB slab sub-allocator for small indirect/budget buffers.
+    pub budget_slabs: Mutex<strata_gpu::memory_stack::BudgetSlabPacker>,
+    /// Hardware acceleration structure tracker (`BuildAccel` / `CopyAccel`).
+    pub accel_structs: Mutex<strata_gpu::raytracing::AccelStructManager>,
 }
 
 static CMD_QUEUE_VTABLE: CommandQueueVTable = CommandQueueVTable {
@@ -635,8 +732,33 @@ impl D3D12CommandQueueX {
         if uma.is_some()
             && std::env::var("STRATA_TEXTURE_DIRTY_TRACKING").map_or(true, |v| v.trim() != "0")
         {
-            textures.lock().unwrap().set_dirty_tracking(true);
+            let mut t = textures.lock().unwrap();
+            t.set_dirty_tracking(true);
+            // Read new SRVs' title memory on a worker before draws bind them.
+            if let Some(uma) = &uma
+                && !t.prefetch_enabled()
+                && std::env::var("STRATA_TEXTURE_PREFETCH").map_or(true, |v| v.trim() != "0")
+            {
+                let uma = SharedUma(Arc::clone(uma));
+                t.enable_prefetch(Arc::new(move |a: u64, n: usize| {
+                    let host = uma.get().lock().ok()?.host_ptr_any(a)?;
+                    // SAFETY: checked readable for `n` bytes just before.
+                    readable(host as u64, n)
+                        .then(|| unsafe { std::slice::from_raw_parts(host, n) }.to_vec())
+                }));
+            }
         }
+        let auto_store = std::env::var("STRATA_TEXTURE_STORE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|dir| {
+                let path = std::path::PathBuf::from(dir);
+                let s1 = TextureStore::open(&path).ok()?;
+                if let Ok(s2) = TextureStore::open(&path) {
+                    textures.lock().unwrap().attach_store(s2);
+                }
+                Some(s1)
+            });
         Box::into_raw(Box::new(Self {
             header: ComHeader {
                 vtable: &CMD_QUEUE_VTABLE,
@@ -646,11 +768,13 @@ impl D3D12CommandQueueX {
             submitted_commands: AtomicU32::new(0),
             hoisted_clamps: AtomicU32::new(0),
             executed_gpu_dispatches: AtomicU32::new(0),
+            parallel_lists: AtomicU32::new(0),
             frame_clock: Mutex::new(FramePacingClock::new(60)),
             gpu_runner,
             pipelines,
             textures,
             render_targets: Mutex::new(HashMap::new()),
+            rect_gs: Mutex::new(HashMap::new()),
             executed_draws: AtomicU32::new(0),
             predicated_skips: AtomicU32::new(0),
             uma,
@@ -664,11 +788,15 @@ impl D3D12CommandQueueX {
                     .map(|n| n.get().clamp(1, 8))
                     .unwrap_or(4),
             ),
-            texture_ahead: TextureAheadQueue::new(),
             upload_queue: Mutex::new(UploadQueue::default()),
             pipeline_library: Mutex::new(PipelineLibrary::default()),
-            texture_store: Mutex::new(None),
+            texture_store: Mutex::new(auto_store),
             timeline: Mutex::new(TimelineProfiler::new()),
+            residency: Arc::new(Mutex::new(strata_gpu::residency::ResidencyManager::new(
+                4 << 30,
+            ))),
+            budget_slabs: Mutex::new(strata_gpu::memory_stack::BudgetSlabPacker::default()),
+            accel_structs: Mutex::new(strata_gpu::raytracing::AccelStructManager::new()),
         }))
     }
 
@@ -691,6 +819,15 @@ impl D3D12CommandQueueX {
 
     pub(crate) fn prepare_submission(&self) {
         let prepare = strata_gpu::perf::start();
+        let srvs = std::mem::take(&mut *SRV_PREFETCH.lock().unwrap_or_else(|e| e.into_inner()));
+        if !srvs.is_empty() {
+            let mut textures = self.textures.lock().unwrap();
+            if textures.prefetch_enabled() {
+                for words in srvs {
+                    textures.prefetch(words);
+                }
+            }
+        }
         // Drain any queued host-to-UMA uploads before running commands.
         {
             let mem = TitleMemory {
@@ -745,14 +882,162 @@ impl D3D12CommandQueueX {
                 dur,
             );
         }
-        for batch in batches {
-            let mut flattened = ThinCommandList::new();
-            flattened.hoisted_clamps = batch.hoisted_clamps;
-            for op in batch.ops {
-                flattened.push(op);
-            }
-            self.execute_thin(&flattened);
+        let flattened: Vec<ThinCommandList> = batches
+            .into_iter()
+            .map(|batch| {
+                let mut list = ThinCommandList::new();
+                list.hoisted_clamps = batch.hoisted_clamps;
+                for op in batch.ops {
+                    list.push(op);
+                }
+                list
+            })
+            .collect();
+        if self.execute_parallel(&flattened) {
+            return;
         }
+        for list in &flattened {
+            self.execute_thin(list);
+        }
+    }
+
+    /// Plans one list for [`Self::execute_parallel`]: its dispatches with
+    /// their push constants, or `None` when it holds anything the serial
+    /// replay does on the CPU between GPU commands (draws, copies, queries,
+    /// predication, root/vertex tables, image bindings, indirect clamps).
+    fn plan_compute_list(
+        &self,
+        runner: &ComputeRunner,
+        pipes: &HashMap<PipelineKey, PipelineEntry>,
+        list: &ThinCommandList,
+    ) -> Option<Vec<(PipelineKey, Vec<u8>, [u32; 3])>> {
+        if !list.hoisted_clamps.is_empty() {
+            return None;
+        }
+        let mem = TitleMemory {
+            uma: self.uma.as_deref(),
+        };
+        // A fresh list state: no root spill and no vertex table, so the
+        // push constants are exactly the first 32 shadowed SGPRs.
+        let st = DrawState::default();
+        let mut active: Option<PipelineKey> = None;
+        let mut shadow = [0u32; 256];
+        let mut out = Vec::new();
+        for cmd in list.commands() {
+            match cmd {
+                ThinCommand::BindPipeline(k) => active = Some(*k),
+                ThinCommand::PushUserSgprs { offset_dw, values } => {
+                    for (i, &v) in values.iter().enumerate() {
+                        let idx = (*offset_dw as usize) + i;
+                        if idx < shadow.len() {
+                            shadow[idx] = v;
+                        }
+                    }
+                }
+                ThinCommand::Dispatch {
+                    x,
+                    y,
+                    z,
+                    is_thread_count,
+                } => {
+                    let groups = if *is_thread_count {
+                        [(*x).div_ceil(64).max(1), (*y).max(1), (*z).max(1)]
+                    } else {
+                        [*x, *y, *z]
+                    };
+                    // Serially a dispatch with no known pipeline is skipped.
+                    let Some((k, entry)) = active.and_then(|k| pipes.get(&k).map(|e| (k, e)))
+                    else {
+                        continue;
+                    };
+                    // Image bindings write back to title memory after each
+                    // dispatch, and a pipeline that fails to build is
+                    // skipped serially: both stay on the serial path.
+                    if !entry.images.is_empty() || runner.pipeline_for(&entry.spirv, None).is_err()
+                    {
+                        return None;
+                    }
+                    let sgprs = self.push_sgprs(runner, &mem, &shadow, &st);
+                    let push = sgprs.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    out.push((k, push, groups));
+                }
+                ThinCommand::ResourceBarrier { .. } => {}
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    /// Runs a batch of compute-only lists by recording one Vulkan command
+    /// buffer per worker in parallel and submitting them in list order.
+    /// Returns `false` (having run nothing) when any list needs the serial
+    /// replay; `STRATA_SERIAL_LISTS=1` forces that.
+    fn execute_parallel(&self, lists: &[ThinCommandList]) -> bool {
+        let Some(runner) = &self.gpu_runner else {
+            return false;
+        };
+        if lists.len() < 2 || std::env::var_os("STRATA_SERIAL_LISTS").is_some() {
+            return false;
+        }
+        let _mapped = MappedScope::enter();
+        let pipes = self.pipelines.lock().unwrap();
+        let mut plans = Vec::with_capacity(lists.len());
+        for list in lists {
+            match self.plan_compute_list(runner, &pipes, list) {
+                Some(plan) => plans.push(plan),
+                None => return false,
+            }
+        }
+        // Serially every list syncs the title's CPU writes first; nothing
+        // the title does lands between lists of one call, so once suffices.
+        if let Some(uma) = &self.uma
+            && let Ok(stats) = uma.lock().unwrap().sync_mirrors(runner)
+        {
+            self.synced_bytes.fetch_add(stats.bytes, Ordering::Relaxed);
+        }
+        for list in lists {
+            crate::frame_capture::record(list);
+            self.submitted_lists.fetch_add(1, Ordering::Relaxed);
+            self.submitted_commands
+                .fetch_add(list.commands().len() as u32, Ordering::Relaxed);
+        }
+        let jobs: Vec<Vec<strata_gpu::runner::ListDispatch<'_>>> = plans
+            .iter()
+            .map(|plan| {
+                plan.iter()
+                    .map(|(k, push, groups)| strata_gpu::runner::ListDispatch {
+                        spirv: &pipes[k].spirv,
+                        push,
+                        groups: *groups,
+                    })
+                    .collect()
+            })
+            .collect();
+        match runner.dispatch_lists_parallel(&jobs) {
+            Ok(()) => {
+                let n: usize = jobs.iter().map(Vec::len).sum();
+                self.executed_gpu_dispatches
+                    .fetch_add(n as u32, Ordering::Relaxed);
+                self.parallel_lists
+                    .fetch_add(lists.len() as u32, Ordering::Relaxed);
+            }
+            Err(e) => crate::crash::log_line(&format!("parallel list recording: {e}")),
+        }
+        drop(pipes);
+        for list in lists {
+            for cmd in list.commands() {
+                if let ThinCommand::ResourceBarrier {
+                    state_before,
+                    state_after,
+                    ..
+                } = cmd
+                {
+                    runner.push_memory_barrier(*state_before, *state_after);
+                }
+            }
+            let _ = runner.flush_barriers();
+        }
+        true
     }
 
     pub fn register_pipeline(&self, key: PipelineKey, spirv_words: Vec<u32>) {
@@ -888,6 +1173,7 @@ pub fn translate_graphics(
         storage_slot_base: stor_base,
         require_full_quads: quad_control,
         ps_input_vgprs: None,
+        tess_factor_srsrc: None,
     };
     let ps = strata_shader::compile_rdna2_with(ps_words, [1, 1, 1], &ps_opts)?;
     let ps_decoded = strata_shader::rdna2::decode_program(ps_words)?;
@@ -1436,8 +1722,29 @@ impl D3D12CommandQueueX {
             return false;
         }
         let mut state = entry.gfx.clone().unwrap_or_default();
-        if let Some(t) = st.topology {
-            state.topology = ash::vk::PrimitiveTopology::from_raw(t);
+        // RECTLIST: triangles through a GS that adds each rect's 4th corner.
+        let mut rect_gs = None;
+        match st.topology {
+            Some(strata_shader::rect::RECTLIST_VK_MARKER) => {
+                state.topology = ash::vk::PrimitiveTopology::TRIANGLE_LIST;
+                if entry.geometry.is_none() && runner.geometry_shader {
+                    let locs = strata_shader::rect::vs_param_locations(vs);
+                    let mut cache = self.rect_gs.lock().unwrap();
+                    rect_gs = Some(std::sync::Arc::clone(cache.entry(locs).or_insert_with_key(
+                        |locs| {
+                            std::sync::Arc::new(strata_shader::rect::emit_rectlist_gs_spirv(locs))
+                        },
+                    )));
+                } else {
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        crate::crash::log_line("rect lists drawn as triangles: no geometry shader");
+                    }
+                }
+            }
+            Some(t) => state.topology = ash::vk::PrimitiveTopology::from_raw(t),
+            None => {}
         }
         state.viewport = st.viewport;
         state.scissor = st.scissor.map(|[l, t, r, b]| ash::vk::Rect2D {
@@ -1487,7 +1794,9 @@ impl D3D12CommandQueueX {
         };
         st.query_acc.capture_time = strata_gpu::perf::enabled();
         st.query_acc.gpu_ms = None;
-        let want_query = st.active_occlusion_query.is_some() || st.active_stats_query.is_some() || st.query_acc.capture_time;
+        let want_query = st.active_occlusion_query.is_some()
+            || st.active_stats_query.is_some()
+            || st.query_acc.capture_time;
         if want_query {
             st.query_acc.capture_occlusion = st.active_occlusion_query.is_some();
             st.query_acc.capture_pipeline_stats = st.active_stats_query.is_some();
@@ -1505,7 +1814,10 @@ impl D3D12CommandQueueX {
                         vs,
                         hs: entry.hull.as_deref(),
                         ds: entry.domain.as_deref(),
-                        gs: entry.geometry.as_deref(),
+                        gs: entry
+                            .geometry
+                            .as_deref()
+                            .or(rect_gs.as_deref().map(Vec::as_slice)),
                         ps: &entry.spirv,
                     },
                     &push,
@@ -1611,7 +1923,9 @@ impl D3D12CommandQueueX {
         state.shading_rate_combiners = st.shading_rate_combiners;
         st.query_acc.capture_time = strata_gpu::perf::enabled();
         st.query_acc.gpu_ms = None;
-        let want_query = st.active_occlusion_query.is_some() || st.active_stats_query.is_some() || st.query_acc.capture_time;
+        let want_query = st.active_occlusion_query.is_some()
+            || st.active_stats_query.is_some()
+            || st.query_acc.capture_time;
         if want_query {
             st.query_acc.capture_occlusion = st.active_occlusion_query.is_some();
             st.query_acc.capture_pipeline_stats = st.active_stats_query.is_some();
@@ -1657,6 +1971,7 @@ impl D3D12CommandQueueX {
 
     /// Executes one closed command list's thin commands, in order.
     pub fn execute_thin(&self, list: &ThinCommandList) {
+        let _mapped = MappedScope::enter();
         crate::frame_capture::record(list);
         self.submitted_lists.fetch_add(1, Ordering::Relaxed);
         self.submitted_commands
@@ -1931,10 +2246,25 @@ impl D3D12CommandQueueX {
                     match crate::d3d12_rt::build(&mem_reader(&mem, runner), build) {
                         // The latest top-level structure is the one BMA
                         // samples and shortcuts (`STRATA_BVH_BMA`).
-                        Ok(_) if build.top_level => {
-                            runner.bma_set_root(build.dest + crate::d3d12_rt::HEADER_BYTES);
+                        Ok(written) => {
+                            let mut rt = self.accel_structs.lock().unwrap();
+                            if build.top_level {
+                                let root_va = build.dest + crate::d3d12_rt::HEADER_BYTES;
+                                rt.set_tlas_bda(root_va);
+                                runner.bma_set_root(root_va);
+                            } else {
+                                if rt.stats().slab_count == 0 {
+                                    rt.add_slab(build.dest, strata_gpu::raytracing::AS_SLAB_BYTES);
+                                }
+                                let _ = rt.register_blas(
+                                    build.dest,
+                                    written.max(256),
+                                    (written / 128).max(1) as u32,
+                                    true,
+                                    u64::from(self.submitted_lists.load(Ordering::Relaxed)),
+                                );
+                            }
                         }
-                        Ok(_) => {}
                         Err(e) => {
                             crate::crash::log_line(&format!("acceleration structure build: {e}"));
                         }
@@ -2062,8 +2392,13 @@ impl D3D12CommandQueueX {
                         }
                         if sc > 1 && src.bpe == 4 && dst.bpe == 4 {
                             if let Some(b) = mem.read(s_va, src_row_bytes as usize) {
-                                let mut resolved = vec![0u8; dst_row_bytes as usize];
-                                strata_gpu::readback::resolve_msaa_rgba8(&b, sc, &mut resolved);
+                                let resolved = runner
+                                    .msaa_resolve_gpu(&b, w, 1, sc, 0)
+                                    .unwrap_or_else(|_| {
+                                        let mut out = vec![0u8; dst_row_bytes as usize];
+                                        strata_gpu::readback::resolve_msaa_rgba8(&b, sc, &mut out);
+                                        out
+                                    });
                                 mem.write(d_va, &resolved);
                             }
                         } else if let Some(b) = mem.read(s_va, dst_row_bytes as usize) {
@@ -2146,6 +2481,8 @@ impl D3D12CommandQueueX {
                             *unbind,
                         );
                     }
+                    let _ =
+                        runner.bind_sparse_tiles(*resource_va, *start_tile, *tile_count, *unbind);
                 }
                 ThinCommand::CopyTileMappings {
                     dst_va,
@@ -2158,11 +2495,16 @@ impl D3D12CommandQueueX {
                             .copy_tile_mappings(*dst_va, *src_va, *tile_count);
                     }
                 }
-                // Execution is in order and every submission is waited on:
-                // barriers have nothing left to order.
-                ThinCommand::ResourceBarrier { .. } => {}
+                ThinCommand::ResourceBarrier {
+                    state_before,
+                    state_after,
+                    ..
+                } => {
+                    runner.push_memory_barrier(*state_before, *state_after);
+                }
             }
         }
+        let _ = runner.flush_barriers();
     }
 
     /// One draw, honouring predication and the root/vertex tables.
@@ -2500,12 +2842,31 @@ unsafe extern "system" fn queue_execute_command_lists(
     }
     let queue = unsafe { &*(this as *const D3D12CommandQueueX) };
     let slice = unsafe { std::slice::from_raw_parts(lists, num_lists as usize) };
+    let live: Vec<&D3D12CommandListX> = slice
+        .iter()
+        .filter(|p| !p.is_null())
+        .map(|&p| unsafe { &*(p as *const D3D12CommandListX) })
+        .collect();
+    if live.len() > 1 {
+        // Multi-list batches go through the translation pool and, when
+        // every list is compute-only, parallel command-buffer recording.
+        let batch = live
+            .iter()
+            .map(|cl| {
+                let guard = cl.list.lock().unwrap();
+                let mut copy = ThinCommandList::new();
+                for cmd in guard.commands() {
+                    copy.push(cmd.clone());
+                }
+                copy.hoisted_clamps = guard.hoisted_clamps.clone();
+                copy
+            })
+            .collect();
+        queue.execute_command_lists(batch);
+        return;
+    }
     queue.prepare_submission();
-    for &ptr in slice {
-        if ptr.is_null() {
-            continue;
-        }
-        let cl = unsafe { &*(ptr as *const D3D12CommandListX) };
+    for cl in live {
         let guard = cl.list.lock().unwrap();
         queue.execute_thin(&guard);
     }

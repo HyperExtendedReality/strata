@@ -631,7 +631,9 @@ pub fn translate_hull_rdna2(
     let mut descriptor = None;
     let (outer_count, inner_count) = base_desc.domain.factor_counts();
     let factor_count = outer_count + inner_count;
-    for di in crate::rdna2::decode_program(words)? {
+    let program = crate::rdna2::decode_program(words)?;
+    let mut needs_dynamic_ssa = false;
+    for di in &program {
         let fail = || unsupported(words, di.pc);
         match di.inst {
             Inst::SEndpgm => break,
@@ -664,8 +666,14 @@ pub fn translate_hull_rdna2(
                 }
             }
             ref inst if registers.execute(inst) => {}
-            _ => return Err(fail()),
+            _ => {
+                needs_dynamic_ssa = true;
+                break;
+            }
         }
+    }
+    if needs_dynamic_ssa {
+        return translate_hull_dynamic(&program, base_desc, words);
     }
     let mut desc = *base_desc;
     if descriptor.is_some() {
@@ -683,6 +691,66 @@ pub fn translate_hull_rdna2(
     Ok(emit_hull_spirv(&desc))
 }
 
+/// Dynamic merged LS+HS lowering: the optimized SSA body is emitted as a
+/// `TessellationControl` module. Unindexed stores at fixed offsets through
+/// the first such store's descriptor (the static path's tess-factor
+/// block) write `TessLevelOuter` then `TessLevelInner`; every other store
+/// reaches memory. Control-point positions pass through.
+fn translate_hull_dynamic(
+    program: &[crate::rdna2::DecodedInst],
+    desc: &HullShaderDesc,
+    words: &[u32],
+) -> Result<Vec<u32>, crate::rdna2::DecodeError> {
+    let factor_srsrc = program.iter().find_map(|di| match di.inst {
+        Inst::BufferStore {
+            srsrc,
+            soffset: Operand::InlineInt(0),
+            offen: false,
+            idxen: false,
+            typed_format: None,
+            ..
+        } => Some(srsrc),
+        _ => None,
+    });
+    let opts = crate::ssa::BuildOptions {
+        stage: crate::ssa::Stage::TessControl,
+        tess_factor_srsrc: factor_srsrc,
+        ..Default::default()
+    };
+    let wave = crate::wave::analyze_wave_liveness(program);
+    let mut module = crate::ssa::build_ssa_with(program, &wave, [1, 1, 1], &opts)
+        .map_err(|_| unsupported(words, 0))?;
+    crate::opt::optimize(&mut module);
+    let cp = desc.output_control_points.clamp(1, 32);
+    let (outer, inner) = desc.domain.factor_counts();
+    module.stage_config.tess_control = Some(crate::ssa::TessControlLayout {
+        output_control_points: cp,
+        outer_factors: outer as u32,
+        inner_factors: inner as u32,
+    });
+    module.stage_config.modes = vec![vec![26 /* OutputVertices */, cp]];
+    Ok(crate::spirv::emit_spirv(&module))
+}
+
+/// A domain shader's domain, spacing and winding `OpExecutionMode`s.
+fn domain_modes(desc: &DomainShaderDesc) -> (u32, u32, u32) {
+    let domain = match desc.domain {
+        TessDomain::Triangles => 22, // Triangles
+        TessDomain::Quads => 24,     // Quads
+        TessDomain::Isolines => 25,  // Isolines
+    };
+    let spacing = match desc.spacing {
+        TessSpacing::Equal => 1,          // SpacingEqual
+        TessSpacing::FractionalEven => 2, // SpacingFractionalEven
+        TessSpacing::FractionalOdd => 3,  // SpacingFractionalOdd
+    };
+    let winding = match desc.winding {
+        TessWinding::Cw => 4,  // VertexOrderCw
+        TessWinding::Ccw => 5, // VertexOrderCcw
+    };
+    (domain, spacing, winding)
+}
+
 /// Translates straight-line domain shaders with static position exports.
 /// An empty program uses the descriptor's control-point interpolation.
 pub fn translate_domain_rdna2(
@@ -693,7 +761,9 @@ pub fn translate_domain_rdna2(
     let mut position = [None; 4];
     let mut export = None;
     let mut empty = true;
-    for di in crate::rdna2::decode_program(words)? {
+    let program = crate::rdna2::decode_program(words)?;
+    let mut needs_dynamic_ssa = false;
+    for di in &program {
         match di.inst {
             Inst::SEndpgm => break,
             Inst::SNop | Inst::SWaitcnt => continue,
@@ -708,9 +778,27 @@ pub fn translate_domain_rdna2(
                 export = Some(di.pc);
             }
             ref inst if registers.execute(inst) => {}
-            _ => return Err(unsupported(words, di.pc)),
+            _ => {
+                needs_dynamic_ssa = true;
+                break;
+            }
         }
         empty = false;
+    }
+    if needs_dynamic_ssa {
+        // RDNA2 domain shaders receive u, v in v0, v1 and the patch id in
+        // v3; control points come from memory through the body's loads.
+        let opts = crate::ssa::BuildOptions {
+            stage: crate::ssa::Stage::TessEval,
+            ..Default::default()
+        };
+        let wave = crate::wave::analyze_wave_liveness(&program);
+        let mut module = crate::ssa::build_ssa_with(&program, &wave, [1, 1, 1], &opts)
+            .map_err(|_| unsupported(words, 0))?;
+        crate::opt::optimize(&mut module);
+        let (domain, spacing, winding) = domain_modes(desc);
+        module.stage_config.modes = vec![vec![domain], vec![spacing], vec![winding]];
+        return Ok(crate::spirv::emit_spirv(&module));
     }
     if empty {
         return Ok(emit_domain_spirv(desc));

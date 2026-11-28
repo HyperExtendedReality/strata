@@ -418,7 +418,11 @@ fn cmd_translate(path: &str) -> Result<(), String> {
     let mut files = Vec::new();
     collect_files(root, &mut files);
     files.sort();
-    let base = if root.is_dir() { root } else { root.parent().unwrap_or(Path::new("")) };
+    let base = if root.is_dir() {
+        root
+    } else {
+        root.parent().unwrap_or(Path::new(""))
+    };
     let mut summary = Summary::default();
     let mut coverage = BTreeMap::<String, bool>::new();
     for file in &files {
@@ -427,7 +431,11 @@ fn cmd_translate(path: &str) -> Result<(), String> {
             Err(error) if baseline.is_some() => return Err(format!("{}: {error}", file.display())),
             Err(_) => continue,
         };
-        let name = file.strip_prefix(base).unwrap_or(file).to_string_lossy().replace('\\', "/");
+        let name = file
+            .strip_prefix(base)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace('\\', "/");
         for program in extract_programs(&name, &bytes) {
             let report = translate(&program);
             if let Outcome::Failed(why) = &report.outcome {
@@ -460,19 +468,26 @@ fn cmd_translate(path: &str) -> Result<(), String> {
             return Err("coverage corpus contains no shaders".into());
         }
         if check {
-            let baseline = std::fs::read(&file).map_err(|error| format!("{}: {error}", file.display()))?;
-            let previous: BTreeMap<String, bool> = serde_json::from_slice(&baseline).map_err(|error| error.to_string())?;
+            let baseline =
+                std::fs::read(&file).map_err(|error| format!("{}: {error}", file.display()))?;
+            let previous: BTreeMap<String, bool> =
+                serde_json::from_slice(&baseline).map_err(|error| error.to_string())?;
             if previous.is_empty() {
                 return Err("coverage baseline contains no shaders".into());
             }
-            let regressions: Vec<_> = previous.iter().filter(|&(id, &ok)| {
-                ok && coverage.get(id) != Some(&true)
-            }).map(|(id, _)| id.as_str()).collect();
+            let regressions: Vec<_> = previous
+                .iter()
+                .filter(|&(id, &ok)| ok && coverage.get(id) != Some(&true))
+                .map(|(id, _)| id.as_str())
+                .collect();
             if !regressions.is_empty() {
                 for id in &regressions {
                     eprintln!("[FAIL] Coverage regression: {id}");
                 }
-                return Err(format!("{} previously translated shaders regressed", regressions.len()));
+                return Err(format!(
+                    "{} previously translated shaders regressed",
+                    regressions.len()
+                ));
             }
             println!("[PASS] Shader coverage baseline");
         } else {

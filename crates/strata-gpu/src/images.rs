@@ -498,11 +498,7 @@ impl ComputeRunner {
         tight_len: usize,
         block: u32,
     ) -> Result<(), GpuError> {
-        let words: Vec<u32> = strata_runtime_shaders::DETILE_SPV
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        let pipeline = self.pipeline_for(&words, None)?;
+        let pipeline = self.pipeline_for(&detile_words(), None)?;
         let regions = copy_regions(img, tight_len, block);
         let mut staging = self.alloc_bda_buffer(src.len().max(16) as u64)?;
         // SAFETY: the staging buffer holds `src.len()` bytes.
@@ -514,61 +510,191 @@ impl ComputeRunner {
                 return Err(e);
             }
         };
-        let (src_bda, dst_bda, dst_buf) = (staging.bda, tight.bda, tight.buffer);
         let layout = self.pipe_layout;
+        let (src_bda, tight_bda, tight_buf) = (staging.bda, tight.bda, tight.buffer);
         let result = self.one_shot(|dev, cmd| unsafe {
-            let host = [vk::MemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::HOST)
-                .src_access_mask(vk::AccessFlags2::HOST_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_READ)];
-            dev.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&host));
-            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-            for j in jobs {
-                let mut pc = [0u8; 32];
-                pc[0..8].copy_from_slice(&(src_bda + j.src_offset).to_le_bytes());
-                pc[8..16].copy_from_slice(&(dst_bda + j.dst_offset).to_le_bytes());
-                pc[16..20].copy_from_slice(&j.width.to_le_bytes());
-                pc[20..24].copy_from_slice(&j.height.to_le_bytes());
-                pc[24..28].copy_from_slice(&j.bpp.to_le_bytes());
-                pc[28..32].copy_from_slice(&j.mode.to_le_bytes());
-                dev.cmd_push_constants(cmd, layout, crate::layout::PUSH_STAGES, 0, &pc);
-                dev.cmd_dispatch(cmd, j.width.div_ceil(8), j.height.div_ceil(8), 1);
-            }
-            let to_copy = [vk::MemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
-            dev.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().memory_barriers(&to_copy),
-            );
-            barrier_image(
-                dev,
-                cmd,
-                img,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            );
-            dev.cmd_copy_buffer_to_image(
-                cmd,
-                dst_buf,
-                img.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &regions,
-            );
-            barrier_image(
-                dev,
-                cmd,
-                img,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::GENERAL,
+            record_detile_upload(
+                dev, cmd, layout, pipeline, img, src_bda, tight_bda, tight_buf, jobs, &regions,
             );
         });
         self.free_bda_buffer(staging);
         self.free_bda_buffer(tight);
         result
+    }
+
+    /// Patches a device-local raw-texture mirror with dirty `(dword, value)`
+    /// writes (`scatter_upload.slang`), then detiles the mirror into `img`
+    /// (`detile.slang`), all in one submission: only the changed dwords cross
+    /// the bus. `mirror_bda` holds the title-memory layout `jobs` read.
+    pub fn patch_mirror_and_detile(
+        &self,
+        img: &GpuImage,
+        mirror_bda: u64,
+        entries: &[(u32, u32)],
+        jobs: &[GpuDetileJob],
+        tight_len: usize,
+        block: u32,
+    ) -> Result<(), GpuError> {
+        let detile = self.pipeline_for(&detile_words(), None)?;
+        let scatter = if entries.is_empty() {
+            None
+        } else {
+            Some(self.pipeline_for(
+                &crate::passes::spirv_words(strata_runtime_shaders::SCATTER_UPLOAD_SPV),
+                None,
+            )?)
+        };
+        let regions = copy_regions(img, tight_len, block);
+        let mut ent = self.alloc_bda_buffer((entries.len() * 8).max(16) as u64)?;
+        // SAFETY: the buffer holds `entries.len() * 8` bytes.
+        let dst = unsafe { ent.as_mut_slice::<u32>(entries.len() * 2) };
+        for (pair, &(off, val)) in dst.chunks_exact_mut(2).zip(entries) {
+            pair[0] = off;
+            pair[1] = val;
+        }
+        let tight = match self.alloc_vram_bda_buffer(tight_len.max(16) as u64, &[]) {
+            Ok(b) => b,
+            Err(e) => {
+                self.free_bda_buffer(ent);
+                return Err(e);
+            }
+        };
+        let layout = self.pipe_layout;
+        let (ent_bda, tight_bda, tight_buf) = (ent.bda, tight.bda, tight.buffer);
+        let count = entries.len() as u32;
+        let result = self.one_shot(|dev, cmd| unsafe {
+            if let Some(scatter) = scatter {
+                let host = [vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::HOST)
+                    .src_access_mask(vk::AccessFlags2::HOST_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_READ)];
+                dev.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().memory_barriers(&host),
+                );
+                dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, scatter);
+                let pc = crate::passes::scatter_upload_push(mirror_bda, ent_bda, count, 0, 0);
+                dev.cmd_push_constants(cmd, layout, crate::layout::PUSH_STAGES, 0, &pc);
+                dev.cmd_dispatch(cmd, count.div_ceil(64), 1, 1);
+            }
+            record_detile_upload(
+                dev, cmd, layout, detile, img, mirror_bda, tight_bda, tight_buf, jobs, &regions,
+            );
+        });
+        self.free_bda_buffer(ent);
+        self.free_bda_buffer(tight);
+        result
+    }
+
+    /// [`Self::upload_image_detiled_gpu`] without waiting: the detile and
+    /// copy run on the main queue while the title keeps recording. Works with
+    /// or without a dedicated transfer queue (the copy engine cannot run
+    /// compute). `img` must be new and unused until [`Self::finish_upload`].
+    pub fn upload_image_detiled_gpu_async(
+        &self,
+        img: &GpuImage,
+        src: &[u8],
+        jobs: &[GpuDetileJob],
+        tight_len: usize,
+        block: u32,
+    ) -> Result<PendingUpload, GpuError> {
+        let pipeline = self.pipeline_for(&detile_words(), None)?;
+        let regions = copy_regions(img, tight_len, block);
+        let mut staging = self.alloc_bda_buffer(src.len().max(16) as u64)?;
+        // SAFETY: the staging buffer holds `src.len()` bytes.
+        unsafe { staging.as_mut_slice::<u8>(src.len()).copy_from_slice(src) };
+        let tight = match self.alloc_vram_bda_buffer(tight_len.max(16) as u64, &[]) {
+            Ok(b) => b,
+            Err(e) => {
+                self.free_bda_buffer(staging);
+                return Err(e);
+            }
+        };
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(aspect_of(img.format))
+            .level_count(vk::REMAINING_MIP_LEVELS)
+            .layer_count(vk::REMAINING_ARRAY_LAYERS);
+        let layout = self.pipe_layout;
+        // SAFETY: a command buffer from the main pool (under its lock) and a
+        // submission to the main queue (under its lock); both are released in
+        // `finish_upload` after the fence signals.
+        let submitted = unsafe {
+            let _pool = self.cmd_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+            (|| -> Result<(vk::CommandBuffer, vk::Fence), vk::Result> {
+                let cmd = self.device.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(self.cmd_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )?[0];
+                let fence = self
+                    .device
+                    .begin_command_buffer(
+                        cmd,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .and_then(|()| {
+                        record_detile_upload(
+                            &self.device,
+                            cmd,
+                            layout,
+                            pipeline,
+                            img,
+                            staging.bda,
+                            tight.bda,
+                            tight.buffer,
+                            jobs,
+                            &regions,
+                        );
+                        self.device.end_command_buffer(cmd)
+                    })
+                    .and_then(|()| {
+                        self.device
+                            .create_fence(&vk::FenceCreateInfo::default(), None)
+                    });
+                let fence = match fence {
+                    Ok(f) => f,
+                    Err(e) => {
+                        self.device.free_command_buffers(self.cmd_pool, &[cmd]);
+                        return Err(e);
+                    }
+                };
+                let cmds = [cmd];
+                let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
+                let res = {
+                    let _queue = self.queue_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    self.device.queue_submit(self.queue, &submit, fence)
+                };
+                if let Err(e) = res {
+                    self.device.destroy_fence(fence, None);
+                    self.device.free_command_buffers(self.cmd_pool, &[cmd]);
+                    return Err(e);
+                }
+                Ok((cmd, fence))
+            })()
+        };
+        let (cmd, fence) = match submitted {
+            Ok(v) => v,
+            Err(e) => {
+                self.free_bda_buffer(staging);
+                self.free_bda_buffer(tight);
+                return Err(e.into());
+            }
+        };
+        crate::perf::upload_bytes(src.len() as u64);
+        let bytes = staging.size + tight.size;
+        Ok(PendingUpload {
+            fence,
+            cmd,
+            staging,
+            image: img.image,
+            range,
+            engine: UploadEngine::Compute { tight },
+            started: std::time::Instant::now(),
+            bytes,
+        })
     }
 
     /// Level 0 of a single-slice image as tightly packed rows of `bytes` total.
@@ -745,6 +871,78 @@ impl ComputeRunner {
             }
             self.submit_command_buffer_and_wait(cmd, wait)
         }
+    }
+}
+
+fn detile_words() -> Vec<u32> {
+    crate::passes::spirv_words(strata_runtime_shaders::DETILE_SPV)
+}
+
+/// Records `detile.slang` over `jobs` (reading `src_bda`, writing the tight
+/// VRAM buffer), then the tight-buffer-to-image copy, leaving `img` in
+/// `GENERAL`. Prior host and shader writes to `src_bda` are made visible.
+#[allow(clippy::too_many_arguments)]
+unsafe fn record_detile_upload(
+    dev: &ash::Device,
+    cmd: vk::CommandBuffer,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    img: &GpuImage,
+    src_bda: u64,
+    tight_bda: u64,
+    tight_buf: vk::Buffer,
+    jobs: &[GpuDetileJob],
+    regions: &[vk::BufferImageCopy],
+) {
+    unsafe {
+        let before = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::HOST | vk::PipelineStageFlags2::COMPUTE_SHADER)
+            .src_access_mask(vk::AccessFlags2::HOST_WRITE | vk::AccessFlags2::SHADER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_READ)];
+        dev.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&before));
+        dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+        for j in jobs {
+            let mut pc = [0u8; 32];
+            pc[0..8].copy_from_slice(&(src_bda + j.src_offset).to_le_bytes());
+            pc[8..16].copy_from_slice(&(tight_bda + j.dst_offset).to_le_bytes());
+            pc[16..20].copy_from_slice(&j.width.to_le_bytes());
+            pc[20..24].copy_from_slice(&j.height.to_le_bytes());
+            pc[24..28].copy_from_slice(&j.bpp.to_le_bytes());
+            pc[28..32].copy_from_slice(&j.mode.to_le_bytes());
+            dev.cmd_push_constants(cmd, layout, crate::layout::PUSH_STAGES, 0, &pc);
+            dev.cmd_dispatch(cmd, j.width.div_ceil(8), j.height.div_ceil(8), 1);
+        }
+        let to_copy = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+            .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
+        dev.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().memory_barriers(&to_copy),
+        );
+        barrier_image(
+            dev,
+            cmd,
+            img,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        dev.cmd_copy_buffer_to_image(
+            cmd,
+            tight_buf,
+            img.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            regions,
+        );
+        barrier_image(
+            dev,
+            cmd,
+            img,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::GENERAL,
+        );
     }
 }
 
@@ -955,13 +1153,22 @@ pub struct TransferQueue {
 /// used until [`ComputeRunner::finish_upload`] hands it to the main queue.
 pub struct PendingUpload {
     fence: vk::Fence,
-    released: vk::Semaphore,
     cmd: vk::CommandBuffer,
     staging: crate::runner::BdaBuffer,
     image: vk::Image,
     range: vk::ImageSubresourceRange,
+    engine: UploadEngine,
     pub(crate) started: std::time::Instant,
     pub(crate) bytes: u64,
+}
+
+/// Which engine runs a [`PendingUpload`].
+enum UploadEngine {
+    /// A copy on the dedicated transfer queue, released to the main queue
+    /// family and signalling `released` for the acquire.
+    Transfer { released: vk::Semaphore },
+    /// A GPU detile + copy on the main queue (`tight`: its VRAM scratch).
+    Compute { tight: crate::runner::BdaBuffer },
 }
 
 // SAFETY: Vulkan handles and a staging buffer only touched by the runner.
@@ -1096,11 +1303,11 @@ impl ComputeRunner {
             let bytes = staging.size;
             Ok(Some(PendingUpload {
                 fence,
-                released,
                 cmd,
                 staging,
                 image: img.image,
                 range,
+                engine: UploadEngine::Transfer { released },
                 started: std::time::Instant::now(),
                 bytes,
             }))
@@ -1118,6 +1325,22 @@ impl ComputeRunner {
     /// acquires the image on the main queue (layout `GENERAL`) and frees the
     /// staging memory.
     pub fn finish_upload(&self, p: PendingUpload) -> Result<(), GpuError> {
+        let released = match p.engine {
+            UploadEngine::Compute { tight } => {
+                // SAFETY: the fence and command buffer belong to the main
+                // queue and pool; released once the GPU is done with them.
+                let waited = unsafe { self.wait_submitted_fence(self.queue, p.fence) };
+                unsafe {
+                    self.device.destroy_fence(p.fence, None);
+                    let _pool = self.cmd_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    self.device.free_command_buffers(self.cmd_pool, &[p.cmd]);
+                }
+                self.free_bda_buffer(p.staging);
+                self.free_bda_buffer(tight);
+                return waited.map_err(GpuError::from);
+            }
+            UploadEngine::Transfer { released } => released,
+        };
         let t = self
             .transfer
             .as_ref()
@@ -1129,7 +1352,7 @@ impl ComputeRunner {
             unsafe { self.wait_submitted_fence(*queue, p.fence) }
         };
         let acquire = waited.map_err(GpuError::from).and_then(|()| {
-            self.one_shot_waiting_on(Some(p.released), |dev, cmd| unsafe {
+            self.one_shot_waiting_on(Some(released), |dev, cmd| unsafe {
                 let b = [vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::NONE)
                     .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
@@ -1147,7 +1370,7 @@ impl ComputeRunner {
             })
         });
         unsafe {
-            self.device.destroy_semaphore(p.released, None);
+            self.device.destroy_semaphore(released, None);
             self.device.destroy_fence(p.fence, None);
             let pool = t.pool.lock().unwrap_or_else(|e| e.into_inner());
             self.device.free_command_buffers(*pool, &[p.cmd]);
@@ -1164,5 +1387,52 @@ impl ComputeRunner {
             ImageShape::Cube { .. } => self.default_cube.as_ref(),
             _ => self.default_image.as_ref(),
         }
+    }
+}
+
+#[cfg(test)]
+mod detile_upload_tests {
+    use super::*;
+
+    fn linear_job(w: u32, h: u32) -> GpuDetileJob {
+        GpuDetileJob {
+            src_offset: 0,
+            dst_offset: 0,
+            width: w,
+            height: h,
+            bpp: 4,
+            mode: 0,
+        }
+    }
+
+    #[test]
+    fn async_gpu_detile_and_mirror_patch_round_trip() {
+        let Ok(runner) = ComputeRunner::new() else {
+            return;
+        };
+        let (w, h) = (64u32, 32u32);
+        let len = (w * h * 4) as usize;
+        let mut src: Vec<u8> = (0..len).map(|i| (i * 13 + 1) as u8).collect();
+        let img = runner
+            .create_image_2d(vk::Format::R8G8B8A8_UNORM, w, h, false, Default::default())
+            .unwrap();
+        let jobs = [linear_job(w, h)];
+        let p = runner
+            .upload_image_detiled_gpu_async(&img, &src, &jobs, len, 1)
+            .unwrap();
+        runner.finish_upload(p).unwrap();
+        assert_eq!(runner.read_image(&img, len).unwrap(), src);
+
+        // Patch two dwords through the VRAM mirror.
+        let mirror = runner.alloc_vram_bda_buffer(len as u64, &src).unwrap();
+        src[400..404].copy_from_slice(&0xA1B2_C3D4u32.to_le_bytes());
+        src[len - 4..].copy_from_slice(&7u32.to_le_bytes());
+        let writes = [(100, 0xA1B2_C3D4), ((len / 4 - 1) as u32, 7)];
+        runner
+            .patch_mirror_and_detile(&img, mirror.bda, &writes, &jobs, len, 1)
+            .unwrap();
+        assert_eq!(runner.read_image(&img, len).unwrap(), src);
+        runner.free_bda_buffer(mirror);
+        runner.destroy_image(img);
     }
 }

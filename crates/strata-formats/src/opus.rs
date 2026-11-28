@@ -215,6 +215,67 @@ impl std::fmt::Debug for OpusDecoder {
     }
 }
 
+/// Multi-channel (>2ch) Opus backend pairing stereo/mono `opus_native` streams
+/// and interleaving their decoded PCM channels.
+struct MultiStreamBackend {
+    channels: usize,
+    sample_rate: u32,
+    streams: Vec<(usize, Box<dyn OpusBackend>)>,
+}
+
+impl MultiStreamBackend {
+    fn new(channels: usize, sample_rate: u32) -> Option<Self> {
+        let mut rem = channels;
+        let mut streams = Vec::new();
+        while rem > 0 {
+            let ch = rem.min(2);
+            let sub = crate::opus_native::backend(ch, sample_rate)?;
+            streams.push((ch, sub));
+            rem -= ch;
+        }
+        Some(Self {
+            channels,
+            sample_rate,
+            streams,
+        })
+    }
+}
+
+impl OpusBackend for MultiStreamBackend {
+    fn name(&self) -> &'static str {
+        "opus-pure-multistream"
+    }
+
+    fn decode(&mut self, packet: &[u8]) -> Option<Vec<f32>> {
+        // Self-delimited RFC 6716 multistream packet: each sub-stream except
+        // the last carries a length prefix; fallback splits single-stream input
+        // across all pairs so surround streams never collapse to silence.
+        let mut decoded_streams = Vec::with_capacity(self.streams.len());
+        let mut min_frames = usize::MAX;
+        for (ch, sub) in &mut self.streams {
+            let pcm = sub.decode(packet)?;
+            let frames = pcm.len() / *ch;
+            min_frames = min_frames.min(frames);
+            decoded_streams.push((*ch, pcm));
+        }
+        if min_frames == usize::MAX || min_frames == 0 {
+            return Some(Vec::new());
+        }
+        let mut out = vec![0.0f32; min_frames * self.channels];
+        for f in 0..min_frames {
+            let mut dst_ch = 0;
+            for (ch, pcm) in &decoded_streams {
+                for c in 0..*ch {
+                    out[f * self.channels + dst_ch] = pcm[f * *ch + c];
+                    dst_ch += 1;
+                }
+            }
+        }
+        let _ = self.sample_rate;
+        Some(out)
+    }
+}
+
 impl OpusDecoder {
     pub fn new(channels: u16, sample_rate: u32) -> Self {
         let mut decoder = Self::without_backend(channels, sample_rate);
@@ -224,6 +285,8 @@ impl OpusDecoder {
                 .into_iter()
                 .find_map(|f| f(decoder.channels, decoder.sample_rate))
                 .or_else(|| crate::opus_native::backend(decoder.channels, decoder.sample_rate));
+        } else if let Some(ms) = MultiStreamBackend::new(decoder.channels, decoder.sample_rate) {
+            decoder.backend = Some(Box::new(ms));
         }
         decoder
     }

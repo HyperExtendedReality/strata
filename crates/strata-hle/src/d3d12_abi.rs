@@ -293,9 +293,28 @@ pub struct ComBase {
     pub refs: AtomicU32,
     /// The `ID3D12Device` that made the object (`GetDevice`).
     pub device: *mut c_void,
+    /// `+0x18..+0x38`: the console inline-writer fields (write cursor,
+    /// buffer start / end). Command lists point them at their own inline
+    /// buffer; every other object leaves them null. Nothing Strata needs
+    /// lives where a title's inlined code writes.
+    pub inline: crate::console_list::InlineRecordSlots,
     pub meta: Mutex<ObjectMeta>,
     drop_fn: unsafe fn(*mut c_void),
 }
+
+const _: () = {
+    assert!(std::mem::offset_of!(ComBase, inline) == 0x18);
+    assert!(
+        std::mem::offset_of!(ComBase, inline)
+            + std::mem::offset_of!(crate::console_list::InlineRecordSlots, buf_start)
+            == 0x28
+    );
+    assert!(
+        std::mem::offset_of!(ComBase, inline)
+            + std::mem::offset_of!(crate::console_list::InlineRecordSlots, buf_end)
+            == 0x30
+    );
+};
 
 /// A COM object: the header, then the interface's own state.
 #[repr(C)]
@@ -319,6 +338,7 @@ impl<T> Com<T> {
                 vtable: vtable.as_ptr(),
                 refs: AtomicU32::new(1),
                 device,
+                inline: Default::default(),
                 meta: Mutex::new(ObjectMeta::default()),
                 drop_fn: drop_com::<T>,
             },
@@ -571,6 +591,7 @@ pub struct Backend {
     pub uma: Arc<Mutex<UmaManager>>,
     pub pipelines: PipelineTable,
     pub textures: SharedTextures,
+    pub residency: crate::d3d12x::SharedResidency,
     precompiler: Option<crate::pipeline_warm::Precompiler>,
 }
 
@@ -1287,13 +1308,64 @@ pub struct CommandListInner {
     pub closed: AtomicBool,
     pub thin: Mutex<ThinCommandList>,
     state: Mutex<ListState>,
+    /// The buffer `+0x18` / `+0x28` / `+0x30` point at: what a title's
+    /// inlined fast paths write ([`crate::console_list`]).
+    pub inline_buf: crate::console_list::InlineBuffer,
+    inline_draining: AtomicBool,
 }
 
 pub type StandardCommandList = Com<CommandListInner>;
 
+/// The list behind `this`, after draining what the title wrote inline
+/// since the last call: every vtable method goes through here, so inline
+/// and vtable-recorded commands keep the title's order.
 fn cl<'a>(this: *mut c_void) -> &'a CommandListInner {
     // SAFETY: called from this list's own vtable methods.
-    unsafe { &Com::<CommandListInner>::from(this).inner }
+    let com = unsafe { Com::<CommandListInner>::from(this) };
+    drain_inline(this, com);
+    &com.inner
+}
+
+fn drain_inline(this: *mut c_void, com: &Com<CommandListInner>) {
+    let l = &com.inner;
+    if l.inline_buf.read.load(Ordering::Acquire) >= com.base.inline.written() {
+        return;
+    }
+    // Decoded draws flush the root through `cl` again: no re-entry.
+    if l.inline_draining.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let before = l.inline_buf.undecoded.load(Ordering::Relaxed);
+    for op in l.inline_buf.drain(&com.base.inline) {
+        match op {
+            crate::console_list::InlineOp::Draw {
+                vertex_count,
+                instance_count,
+            } => {
+                flush_root(this, true);
+                l.thin
+                    .lock()
+                    .unwrap()
+                    .draw_instanced(vertex_count, instance_count, 0, 0);
+            }
+            crate::console_list::InlineOp::Dispatch {
+                x,
+                y,
+                z,
+                is_thread_count,
+            } => {
+                flush_root(this, false);
+                l.thin
+                    .lock()
+                    .unwrap()
+                    .dispatch(x, y, z, [1, 1, 1], is_thread_count);
+            }
+        }
+    }
+    if l.inline_buf.undecoded.load(Ordering::Relaxed) != before {
+        log_once("inline command stream: packets Strata does not decode were skipped");
+    }
+    l.inline_draining.store(false, Ordering::Release);
 }
 
 fn record(this: *mut c_void, cmd: ThinCommand) {
@@ -1365,6 +1437,8 @@ unsafe extern "system" fn cl_reset(
     let l = cl(this);
     l.closed.store(false, Ordering::Release);
     l.thin.lock().unwrap().reset();
+    l.inline_buf
+        .reset(unsafe { &Com::<CommandListInner>::from(this).base.inline });
     *l.state.lock().unwrap() = ListState::default();
     if !pso.is_null() {
         unsafe { cl_set_pso(this, pso) };
@@ -1564,10 +1638,10 @@ unsafe extern "system" fn cl_resolve_subresource(
 }
 
 unsafe extern "system" fn cl_ia_set_topology(this: *mut c_void, t: u32) {
-    // Console D3D_PRIMITIVE_TOPOLOGY_RECTLIST (13) maps to Vulkan TRIANGLE_LIST (3)
-    // with vertex expansion handled at draw time via `strata_shader::rect`.
+    // Console D3D_PRIMITIVE_TOPOLOGY_RECTLIST (13): marked so the draw runs
+    // as a triangle list through the rect geometry shader (`strata_shader::rect`).
     let vk_t = if t == strata_shader::rect::RECTLIST_TOPOLOGY_ID {
-        3 // VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+        strata_shader::rect::RECTLIST_VK_MARKER
     } else {
         vk_topology(t)
     };
@@ -1623,16 +1697,14 @@ unsafe extern "system" fn cl_resource_barrier(
     n: u32,
     barriers: *const ResourceBarrier,
 ) {
-    // In-order synchronous execution leaves barriers nothing to order;
-    // they are recorded for the statistics only.
-    if n > 0 && !barriers.is_null() {
-        let b = unsafe { *barriers };
+    if n == 0 || barriers.is_null() {
+        return;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(barriers, n as usize) };
+    let mut thin = cl(this).thin.lock().unwrap();
+    for b in slice {
         let va = unsafe { resource(b.resource) }.map_or(0, |r| r.mem.gpu_va);
-        cl(this)
-            .thin
-            .lock()
-            .unwrap()
-            .resource_barrier(va, b.u[1], b.u[2]);
+        thin.resource_barrier(va, b.u[1], b.u[2]);
     }
 }
 
@@ -2628,7 +2700,7 @@ static CMDLIST_VTABLE: [VTableSlot; CMDLIST_VTABLE_LEN] = {
 
 impl Com<CommandListInner> {
     pub fn new_boxed(list_type: u32, device: *mut c_void) -> *mut Self {
-        Com::boxed(
+        let l = Com::boxed(
             &CMDLIST_VTABLE,
             device,
             CommandListInner {
@@ -2636,8 +2708,13 @@ impl Com<CommandListInner> {
                 closed: AtomicBool::new(false),
                 thin: Mutex::new(ThinCommandList::new()),
                 state: Mutex::new(ListState::default()),
+                inline_buf: crate::console_list::InlineBuffer::default(),
+                inline_draining: AtomicBool::new(false),
             },
-        )
+        );
+        // The buffer is heap-owned by the list, so the pointers stay valid.
+        unsafe { (*l).base.inline.attach(&(*l).inner.inline_buf) };
+        l
     }
 }
 
@@ -2879,12 +2956,15 @@ impl Com<QueueInner> {
             .then(|| device_inner(device).backend.clone())
             .flatten()
             .map(|b| {
-                EnginePtr(D3D12CommandQueueX::new_boxed_shared(
+                let engine = D3D12CommandQueueX::new_boxed_shared(
                     Some(Arc::clone(&b.runner)),
                     Some(Arc::clone(&b.uma)),
                     Arc::clone(&b.pipelines),
                     Arc::clone(&b.textures),
-                ))
+                );
+                // SAFETY: just created; nothing else references it yet.
+                unsafe { (*engine).residency = Arc::clone(&b.residency) };
+                EnginePtr(engine)
             });
         Com::boxed(
             &QUEUE_VTABLE,
@@ -3154,11 +3234,17 @@ fn make_graphics_pso(
     if let Some(b) = &device_inner(dev).backend
         && let Some(worker) = &b.precompiler
         && let Some(formats) = d.rtv_formats[..d.num_render_targets.min(8) as usize]
-            .iter().map(|&format| {
+            .iter()
+            .map(|&format| {
                 let format = dxgi_format(format)?;
                 let (vk, _, _) = strata_gpu::texture::texel_format(format.gfx10).ok()?;
-                Some(strata_gpu::texture::rgba8_order(vk, format.bgra, format.srgb))
-            }).collect::<Option<Vec<_>>>()
+                Some(strata_gpu::texture::rgba8_order(
+                    vk,
+                    format.bgra,
+                    format.srgb,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()
         && let Some(pipeline) = b.pipelines.lock().unwrap().get(&key)
     {
         worker.enqueue(Some(key.0), pipeline, formats);
@@ -3602,7 +3688,10 @@ unsafe extern "system" fn dev_create_srv(
                 slices,
                 mapping,
             ) {
-                Some(w) => write_descriptor(handle, w),
+                Some(w) => {
+                    write_descriptor(handle, w);
+                    crate::d3d12x::queue_srv_prefetch(w);
+                }
                 None => log_once("CreateShaderResourceView: unsupported format"),
             }
         }
@@ -4511,6 +4600,93 @@ fn parse_pso_stream(b: &[u8]) -> Option<PsoStream> {
     })
 }
 
+/// The VRAM budget residency is tracked against (the device heap budget,
+/// else 4 GiB).
+fn runner_budget(runner: &ComputeRunner) -> u64 {
+    runner
+        .texture_heap_budget()
+        .map(|(_, b)| b)
+        .filter(|&b| b > 0)
+        .unwrap_or(4 << 30)
+}
+
+/// A pageable object's memory (`ID3D12Resource` / `ID3D12Heap`).
+unsafe fn pageable_block(p: *mut c_void) -> Option<Block> {
+    if p.is_null() || !crate::d3d12x::readable(p as u64, size_of::<*const VTableSlot>()) {
+        return None;
+    }
+    let vt = unsafe { p.cast::<*const VTableSlot>().read_unaligned() };
+    if vt == RESOURCE_VTABLE.as_ptr() {
+        return unsafe { resource(p) }.map(|r| r.mem);
+    }
+    if vt == HEAP_VTABLE.as_ptr() {
+        return unsafe { inner::<HeapInner>(p) }.map(|h| h.mem);
+    }
+    None
+}
+
+/// `ID3D12Device::MakeResident` / `Evict`: reference-counted residency per
+/// object (created resident). An object whose count reaches zero has its
+/// sampled images dropped (they are re-read from title memory on the next
+/// bind); `MakeResident` only restores the count.
+unsafe fn residency_change(
+    this: *mut c_void,
+    n: u32,
+    objs: *const *mut c_void,
+    resident: bool,
+) -> i32 {
+    if n == 0 {
+        return S_OK;
+    }
+    if objs.is_null() {
+        return E_INVALIDARG;
+    }
+    let Some(b) = device_inner(this).backend.as_ref() else {
+        return S_OK;
+    };
+    let objs = unsafe { std::slice::from_raw_parts(objs, n as usize) };
+    let mut evicted = Vec::new();
+    {
+        let mut r = b.residency.lock().unwrap();
+        for &o in objs {
+            let Some(block) = (unsafe { pageable_block(o) }) else {
+                continue;
+            };
+            let id = o as u64;
+            if !r.is_known(id) {
+                r.register(id, block.size, 0);
+            }
+            if resident {
+                r.make_resident(id, 0);
+            } else if r.evict(id) && !r.is_resident(id) {
+                evicted.push(block);
+            }
+        }
+    }
+    if !evicted.is_empty() {
+        let mut t = b.textures.lock().unwrap();
+        for block in evicted {
+            t.evict_range(&b.runner, block.gpu_va, block.size);
+            if block.console_va != block.gpu_va {
+                t.evict_range(&b.runner, block.console_va, block.size);
+            }
+        }
+    }
+    S_OK
+}
+
+unsafe extern "system" fn dev_make_resident(
+    this: *mut c_void,
+    n: u32,
+    objs: *const *mut c_void,
+) -> i32 {
+    unsafe { residency_change(this, n, objs, true) }
+}
+
+unsafe extern "system" fn dev_evict(this: *mut c_void, n: u32, objs: *const *mut c_void) -> i32 {
+    unsafe { residency_change(this, n, objs, false) }
+}
+
 unsafe extern "system" fn dev_enqueue_make_resident(
     _this: *mut c_void,
     _flags: u32,
@@ -4893,8 +5069,8 @@ static DEVICE_VTABLE: [VTableSlot; DEVICE_VTABLE_LEN] = {
     vt[DEVICE_SLOT_CREATE_SHARED_HANDLE] = slot!(dev_create_shared_handle);
     vt[DEVICE_SLOT_OPEN_SHARED_HANDLE] = slot!(dev_open_shared_handle);
     vt[DEVICE_SLOT_OPEN_SHARED_HANDLE_BY_NAME] = slot!(dev_open_shared_handle_by_name);
-    vt[DEVICE_SLOT_MAKE_RESIDENT] = slot!(stub_ok);
-    vt[DEVICE_SLOT_EVICT] = slot!(stub_ok);
+    vt[DEVICE_SLOT_MAKE_RESIDENT] = slot!(dev_make_resident);
+    vt[DEVICE_SLOT_EVICT] = slot!(dev_evict);
     vt[DEVICE_SLOT_CREATE_FENCE] = slot!(dev_create_fence);
     vt[DEVICE_SLOT_GET_DEVICE_REMOVED_REASON] = slot!(stub_ok);
     vt[DEVICE_SLOT_GET_COPYABLE_FOOTPRINTS] = slot!(dev_get_copyable_footprints);
@@ -4936,13 +5112,18 @@ impl Com<DeviceInner> {
     pub fn new_boxed() -> *mut Self {
         let backend = ComputeRunner::new().ok().map(|runner| {
             let runner = Arc::new(runner);
+            let budget = runner_budget(&runner);
             let precompiler = crate::pipeline_cache::background_warmup_enabled()
-                .then(|| crate::pipeline_warm::Precompiler::spawn(&runner)).flatten();
+                .then(|| crate::pipeline_warm::Precompiler::spawn(&runner))
+                .flatten();
             let backend = Arc::new(Backend {
                 runner,
                 uma: Arc::new(Mutex::new(UmaManager::new())),
                 pipelines: Arc::new(Mutex::new(HashMap::new())),
                 textures: Arc::new(Mutex::new(TextureCache::new())),
+                residency: Arc::new(Mutex::new(strata_gpu::residency::ResidencyManager::new(
+                    budget,
+                ))),
                 precompiler,
             });
             crate::pipeline_cache::register(&backend);
@@ -5314,6 +5495,65 @@ mod tests {
                 assert_eq!(st.depth_format, Some(ash::vk::Format::D32_SFLOAT));
             }
             _ => panic!("expected a graphics stream"),
+        }
+    }
+
+    /// A title's inlined fast path writes through `+0x18` (bounded by
+    /// `+0x28..+0x30`) without corrupting the object, and its commands
+    /// land in order with the vtable calls around them.
+    #[test]
+    fn inline_writes_at_0x18_interleave_with_vtable_calls() {
+        use crate::console_list::{PKT3_DISPATCH_DIRECT, PKT3_DRAW_INDEX_AUTO, pkt3};
+        unsafe {
+            let list = StandardCommandList::new_boxed(0, std::ptr::null_mut()) as *mut c_void;
+            let obj = list as *mut u8;
+            let slot = |off: usize| obj.add(off) as *mut *mut u32;
+            let (start, end) = (*slot(0x28), *slot(0x30));
+            assert!(!start.is_null() && end > start);
+            assert_eq!(*slot(0x18), start, "an empty stream");
+            let title_write = |words: &[u32]| {
+                let cur = *slot(0x18);
+                assert!(cur.add(words.len()) <= *slot(0x30));
+                cur.copy_from_nonoverlapping(words.as_ptr(), words.len());
+                *slot(0x18) = cur.add(words.len());
+            };
+            let dispatch: unsafe extern "system" fn(*mut c_void, u32, u32, u32) =
+                f(list, CMDLIST_SLOT_DISPATCH);
+            let close: unsafe extern "system" fn(*mut c_void) -> i32 = f(list, CMDLIST_SLOT_CLOSE);
+            let reset: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 =
+                f(list, CMDLIST_SLOT_RESET);
+
+            title_write(&[pkt3(PKT3_DRAW_INDEX_AUTO, 2), 3, 2]);
+            dispatch(list, 7, 1, 1);
+            title_write(&[pkt3(PKT3_DISPATCH_DIRECT, 4), 2, 1, 1, 1]);
+            assert_eq!(close(list), S_OK);
+
+            // The object's own state survived the inline writes.
+            let l = &(*(list as *const StandardCommandList)).inner;
+            assert!(l.closed.load(Ordering::Acquire));
+            let shape: Vec<_> = l
+                .thin
+                .lock()
+                .unwrap()
+                .commands()
+                .iter()
+                .filter_map(|c| match c {
+                    ThinCommand::DrawInstanced { vertex_count, .. } => {
+                        Some(("draw", *vertex_count))
+                    }
+                    ThinCommand::Dispatch { x, .. } => Some(("dispatch", *x)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(shape, [("draw", 3), ("dispatch", 7), ("dispatch", 2)]);
+
+            assert_eq!(
+                reset(list, std::ptr::null_mut(), std::ptr::null_mut()),
+                S_OK
+            );
+            assert_eq!(*slot(0x18), start, "Reset rewinds the inline cursor");
+            assert!(l.thin.lock().unwrap().commands().is_empty());
+            com_release(list);
         }
     }
 }

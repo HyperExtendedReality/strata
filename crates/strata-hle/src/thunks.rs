@@ -320,6 +320,7 @@ unsafe extern "system" fn xmem_virtual_free(
     if address.is_null() {
         return 0;
     }
+    crate::d3d12x::invalidate_mapped_ranges();
     if (free_type & MEM_RELEASE) != 0 {
         return with_hle(|g| i32::from(g.runtime.xmem_free(&g.runner, address as u64)))
             .unwrap_or(0);
@@ -337,6 +338,7 @@ unsafe extern "system" fn xmem_virtual_protect(
     if address.is_null() || size == 0 || new_protect == 0 {
         return 0;
     }
+    crate::d3d12x::invalidate_mapped_ranges();
     if !old_protect.is_null() {
         unsafe { *old_protect = 0x04 }; // PAGE_READWRITE
     }
@@ -350,6 +352,7 @@ unsafe extern "system" fn xmem_unmap_physical_pages(
     if base_address.is_null() || num_pages == 0 {
         return 0;
     }
+    crate::d3d12x::invalidate_mapped_ranges();
     with_hle(|g| {
         let unmapped = g.runtime.phys_pool.unmap_range(
             &mut g.runtime.uma.address_space,
@@ -373,6 +376,7 @@ unsafe extern "system" fn xmem_free(ptr: *mut c_void, _attrs: u64) {
     if ptr.is_null() {
         return;
     }
+    crate::d3d12x::invalidate_mapped_ranges();
     let _ = with_hle(|g| {
         g.runtime.xmem_free(&g.runner, ptr as u64);
     });
@@ -538,6 +542,42 @@ struct Presenter {
 unsafe impl Send for Presenter {}
 
 static FRAMES_SHOWN: AtomicU64 = AtomicU64::new(0);
+
+/// Present-to-present times for the HUD (milliseconds, oldest first).
+static FRAME_TIMES: Mutex<(Option<std::time::Instant>, std::collections::VecDeque<f32>)> =
+    Mutex::new((None, std::collections::VecDeque::new()));
+
+/// The frame's post passes: the HUD with `STRATA_HUD=1`, the ambient clamp
+/// with `STRATA_AMBIENT_CLAMP=<floor>,<max>`.
+fn post_passes(runner: &strata_gpu::runner::ComputeRunner) -> strata_gpu::display::PostPasses {
+    static HUD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static AMBIENT: std::sync::OnceLock<Option<strata_gpu::display::AmbientClamp>> =
+        std::sync::OnceLock::new();
+    let hud_on = *HUD.get_or_init(|| std::env::var("STRATA_HUD").is_ok_and(|v| v.trim() == "1"));
+    let hud = hud_on.then(|| {
+        let mut t = FRAME_TIMES.lock().unwrap();
+        let now = std::time::Instant::now();
+        if let Some(last) = t.0.replace(now) {
+            t.1.push_back(now.duration_since(last).as_secs_f32() * 1000.0);
+            if t.1.len() > 120 {
+                t.1.pop_front();
+            }
+        }
+        let vram_ratio = runner
+            .texture_heap_budget()
+            .filter(|&(_, budget)| budget > 0)
+            .map_or(0.0, |(usage, budget)| usage as f32 / budget as f32);
+        strata_gpu::display::HudOverlay {
+            frametimes_ms: t.1.iter().copied().collect(),
+            vram_ratio,
+            ram_ratio: 0.0,
+        }
+    });
+    strata_gpu::display::PostPasses {
+        hud,
+        ambient: *AMBIENT.get_or_init(strata_gpu::display::AmbientClamp::from_env),
+    }
+}
 static PRESENTER: Mutex<Option<Presenter>> = Mutex::new(None);
 
 /// Whether the display can show HDR (for `XDisplayTryEnableHdrMode`).
@@ -673,7 +713,10 @@ fn show(resources: &[*mut c_void], frame_index: u64) -> Result<bool, String> {
         .map(|words| textures.image(words).expect("present plane was uploaded"))
         .collect();
     let base = planes[0];
-    let frame = if planes.len() == 1 {
+    let post = post_passes(&p.runner);
+    // Post passes write the frame: never into a borrowed title surface.
+    let composed = planes.len() > 1 || post.applies_to(base.format);
+    let frame = if !composed {
         base
     } else {
         // Scale the scene and overlay planes independently into the final
@@ -683,7 +726,11 @@ fn show(resources: &[*mut c_void], frame_index: u64) -> Result<bool, String> {
             .as_ref()
             .is_none_or(|i| (i.width, i.height, i.format) != (width, height, base.format))
         {
-            p.display.as_mut().unwrap().wait_for_frame(&p.runner).map_err(|e| e.to_string())?;
+            p.display
+                .as_mut()
+                .unwrap()
+                .wait_for_frame(&p.runner)
+                .map_err(|e| e.to_string())?;
             let new = p
                 .runner
                 .create_image_2d(base.format, width, height, false, Default::default())
@@ -697,12 +744,18 @@ fn show(resources: &[*mut c_void], frame_index: u64) -> Result<bool, String> {
         target
     };
     crate::frame_capture::finish(&p.runner, &planes, frame, frame_index);
+    if composed && post.applies_to(frame.format) {
+        strata_gpu::display::apply_post_passes(&p.runner, frame, &post)
+            .map_err(|e| e.to_string())?;
+    }
     let display = p.display.as_mut().unwrap();
     let shown = display.present(&p.runner, frame, w, h);
-    if planes.len() == 1 {
+    if !composed {
         // A single plane is borrowed from the evictable texture cache.
         // Keep the cache locked until the blit has stopped reading it.
-        display.wait_for_frame(&p.runner).map_err(|e| e.to_string())?;
+        display
+            .wait_for_frame(&p.runner)
+            .map_err(|e| e.to_string())?;
     }
     shown.map_err(|e| e.to_string())
 }
@@ -1598,10 +1651,19 @@ unsafe extern "system" fn xaudio2_create(
 // Legacy XAPUCreate object
 // ============================================================================
 
+#[derive(Default)]
+struct ComAcpState {
+    connected: bool,
+    fence_value: u64,
+    messages: std::collections::VecDeque<[u64; 3]>,
+    next_frame_at: Option<std::time::Instant>,
+}
+
 #[repr(C)]
 pub struct ComAcpHal {
     pub vtable: *const [ComSlot; 10],
     pub ref_count: AtomicU32,
+    state: Mutex<ComAcpState>,
 }
 
 unsafe extern "system" fn acp_qi(
@@ -1636,17 +1698,120 @@ unsafe extern "system" fn acp_release(this: *mut c_void) -> u32 {
     }
 }
 
+unsafe extern "system" fn acp_connect(this: *mut c_void, _cmd_cap: u32, _msg_cap: u32) -> i32 {
+    if this.is_null() {
+        return 0x8007_0057u32 as i32;
+    }
+    let obj = unsafe { &*(this as *const ComAcpHal) };
+    let mut st = obj.state.lock().unwrap_or_else(|e| e.into_inner());
+    st.connected = true;
+    st.messages.clear();
+    st.next_frame_at = Some(std::time::Instant::now() + std::time::Duration::from_nanos(2_666_667));
+    0
+}
+
+unsafe extern "system" fn acp_disconnect(this: *mut c_void) -> i32 {
+    if this.is_null() {
+        return 0x8007_0057u32 as i32;
+    }
+    let obj = unsafe { &*(this as *const ComAcpHal) };
+    let mut st = obj.state.lock().unwrap_or_else(|e| e.into_inner());
+    if st.connected {
+        st.connected = false;
+        st.next_frame_at = None;
+        st.messages.push_back([0x80, 0, 0]); // DISCONNECTED
+    }
+    0
+}
+
+unsafe extern "system" fn acp_submit_command(
+    this: *mut c_void,
+    cmd_type: u32,
+    cmd_id: u64,
+    _flags: u32,
+    _payload: *const c_void,
+    _payload_bytes: u32,
+) -> i32 {
+    if this.is_null() {
+        return 0x8007_0057u32 as i32;
+    }
+    let obj = unsafe { &*(this as *const ComAcpHal) };
+    let mut st = obj.state.lock().unwrap_or_else(|e| e.into_inner());
+    if !st.connected {
+        return 0x8000_FFFFu32 as i32; // E_UNEXPECTED
+    }
+    st.fence_value += 1;
+    st.messages.push_back([0x10, u64::from(cmd_type), cmd_id]); // COMMAND_DONE
+    0
+}
+
+unsafe extern "system" fn acp_get_message(this: *mut c_void, out_msg: *mut u64) -> i32 {
+    if this.is_null() || out_msg.is_null() {
+        return 0x8007_0057u32 as i32;
+    }
+    let obj = unsafe { &*(this as *const ComAcpHal) };
+    let mut st = obj.state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(due) = st.next_frame_at
+        && std::time::Instant::now() >= due
+    {
+        st.next_frame_at =
+            Some(std::time::Instant::now() + std::time::Duration::from_nanos(2_666_667));
+        st.messages.push_back([2, 0, 0]); // AUDIO_FRAME (128 samples @ 48 kHz)
+    }
+    if let Some(msg) = st.messages.pop_front() {
+        unsafe {
+            out_msg.write(msg[0]);
+            out_msg.add(1).write(msg[1]);
+            out_msg.add(2).write(msg[2]);
+        }
+        0 // S_OK
+    } else {
+        1 // S_FALSE (no message pending)
+    }
+}
+
+unsafe extern "system" fn acp_submit_with_fence(
+    this: *mut c_void,
+    cmd_type: u32,
+    cmd_id: u64,
+    out_fence: *mut u64,
+) -> i32 {
+    let hr = unsafe { acp_submit_command(this, cmd_type, cmd_id, 0, std::ptr::null(), 0) };
+    if hr == 0 && !out_fence.is_null() {
+        let obj = unsafe { &*(this as *const ComAcpHal) };
+        let val = obj
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fence_value;
+        unsafe { out_fence.write(val) };
+    }
+    hr
+}
+
+unsafe extern "system" fn acp_wait_on_fence(this: *mut c_void, fence: u64) -> i32 {
+    if this.is_null() {
+        return 0x8007_0057u32 as i32;
+    }
+    let obj = unsafe { &*(this as *const ComAcpHal) };
+    let mut st = obj.state.lock().unwrap_or_else(|e| e.into_inner());
+    if st.fence_value < fence {
+        st.fence_value = fence;
+    }
+    0
+}
+
 static ACPHAL_VTABLE: [ComSlot; 10] = [
-    ComSlot(acp_qi as *const ()),            // 0 QueryInterface
-    ComSlot(acp_add_ref as *const ()),       // 1 AddRef
-    ComSlot(acp_release as *const ()),       // 2 Release
-    ComSlot(xa2_voice_stub_ok as *const ()), // 3 Connect
-    ComSlot(xa2_voice_stub_ok as *const ()), // 4 Disconnect
-    ComSlot(xa2_voice_stub_ok as *const ()), // 5 SubmitCommand
-    ComSlot(xa2_voice_stub_ok as *const ()), // 6 GetMessage
-    ComSlot(xa2_voice_stub_ok as *const ()), // 7 SubmitCommandWithFence
-    ComSlot(xa2_voice_stub_ok as *const ()), // 8 WaitOnFence
-    ComSlot(xa2_voice_stub_ok as *const ()), // 9 Reserved
+    ComSlot(acp_qi as *const ()),                // 0 QueryInterface
+    ComSlot(acp_add_ref as *const ()),           // 1 AddRef
+    ComSlot(acp_release as *const ()),           // 2 Release
+    ComSlot(acp_connect as *const ()),           // 3 Connect
+    ComSlot(acp_disconnect as *const ()),        // 4 Disconnect
+    ComSlot(acp_submit_command as *const ()),    // 5 SubmitCommand
+    ComSlot(acp_get_message as *const ()),       // 6 GetMessage
+    ComSlot(acp_submit_with_fence as *const ()), // 7 SubmitCommandWithFence
+    ComSlot(acp_wait_on_fence as *const ()),     // 8 WaitOnFence
+    ComSlot(xa2_voice_stub_ok as *const ()),     // 9 Reserved
 ];
 
 impl ComAcpHal {
@@ -1654,6 +1819,7 @@ impl ComAcpHal {
         Box::into_raw(Box::new(Self {
             vtable: &ACPHAL_VTABLE,
             ref_count: AtomicU32::new(1),
+            state: Mutex::new(ComAcpState::default()),
         }))
     }
 }

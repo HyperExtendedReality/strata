@@ -342,6 +342,23 @@ pub fn trace_descriptors(program: &[DecodedInst]) -> Vec<DescriptorUse> {
                 u.compare = mode.is_compare();
                 uses.push(u);
             }
+            Inst::ImageGetLod {
+                rsrc_sgpr,
+                samp_sgpr,
+                dim,
+                ..
+            } => {
+                let mut u = describe(
+                    &sgpr,
+                    di.pc,
+                    ResourceKind::SampledImage,
+                    *rsrc_sgpr,
+                    8,
+                    Some(*samp_sgpr),
+                );
+                u.dim = ImageDim::from_mimg(*dim);
+                uses.push(u);
+            }
             Inst::ImageLoad { rsrc_sgpr, dim, .. }
             | Inst::ImageGetResInfo { rsrc_sgpr, dim, .. } => {
                 let mut u = describe(&sgpr, di.pc, ResourceKind::LoadedImage, *rsrc_sgpr, 8, None);
@@ -349,7 +366,7 @@ pub fn trace_descriptors(program: &[DecodedInst]) -> Vec<DescriptorUse> {
                 u.dim = ImageDim::from_mimg(*dim).for_storage();
                 uses.push(u);
             }
-            Inst::ImageStore { rsrc_sgpr, dim, .. } => {
+            Inst::ImageStore { rsrc_sgpr, dim, .. } | Inst::ImageAtomic { rsrc_sgpr, dim, .. } => {
                 let mut u = describe(
                     &sgpr,
                     di.pc,

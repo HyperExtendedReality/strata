@@ -1,5 +1,6 @@
 //! Strata RDNA2 → SPIR-V 1.6 (PhysicalStorageBuffer / No-API) shader compiler.
 
+pub mod alu;
 pub mod bma;
 pub mod bvh;
 pub mod cache;
@@ -65,6 +66,10 @@ pub fn compile_rdna2_with(
     let wave = wave::analyze_wave_liveness(&decoded);
     let mut module = ssa::build_ssa_with(&decoded, &wave, workgroup_size, opts)?;
     let opt_stats = opt::optimize(&mut module);
+    if rayquery::lifting_enabled() {
+        // Proves (or refuses) each traversal loop; see `lift_ray_loops`.
+        module.ray_query_verdicts = rayquery::lift_ray_loops(&module);
+    }
     let spirv = spirv::emit_spirv(&module);
     Ok(CompiledShader {
         spirv,

@@ -12,9 +12,11 @@
 
 use std::collections::HashMap;
 
+use crate::alu::AluOp;
 use crate::rdna2::{AtomicOp, CmpOp, CmpType};
 use crate::ssa::{
-    ExportTarget, ImageDim, SsaModule, SsaOp, Stage, StageInput, Terminator, Ty, ValueId,
+    ExportTarget, ImageDim, MeshLayout, SsaModule, SsaOp, Stage, StageInput, Terminator,
+    TessControlLayout, Ty, ValueId,
 };
 
 // SPIR-V header constants
@@ -64,10 +66,16 @@ const OP_IMAGE_SAMPLE_DREF_IMPLICIT_LOD: u16 = 89;
 const OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD: u16 = 90;
 const OP_IMAGE_FETCH: u16 = 95;
 const OP_IMAGE_GATHER: u16 = 96;
+const OP_IMAGE_DREF_GATHER: u16 = 97;
 const OP_IMAGE_WRITE: u16 = 99;
 const OP_IMAGE_QUERY_SIZE_LOD: u16 = 103;
 const OP_IMAGE: u16 = 100;
 const OP_IMAGE_QUERY_LOD: u16 = 105;
+const OP_IMAGE_TEXEL_POINTER: u16 = 107;
+const OP_TYPE_ACCELERATION_STRUCTURE_KHR: u16 = 5341;
+const SC_IMAGE: u32 = 11;
+/// Descriptor set 0 binding for hardware `VK_KHR_acceleration_structure` TLAS.
+pub const BINDING_TLAS: u32 = 8;
 
 const OP_CONVERT_F_TO_U: u16 = 109;
 const OP_CONVERT_F_TO_S: u16 = 110;
@@ -101,7 +109,34 @@ const OP_U_LESS_THAN: u16 = 176;
 const OP_S_LESS_THAN: u16 = 177;
 const OP_U_LESS_THAN_EQUAL: u16 = 178;
 const OP_S_LESS_THAN_EQUAL: u16 = 179;
+const OP_IS_NAN: u16 = 156;
+const OP_IS_INF: u16 = 157;
+const OP_S_CONVERT: u16 = 114;
+const OP_F_NEGATE: u16 = 127;
+const OP_BIT_FIELD_INSERT: u16 = 201;
+const OP_BIT_REVERSE: u16 = 204;
+const OP_BIT_COUNT: u16 = 205;
+const OP_READ_CLOCK_KHR: u16 = 5056;
+const CAP_SHADER_CLOCK_KHR: u32 = 5055;
+const GLSL_TRUNC: u32 = 3;
+const GLSL_FABS: u32 = 4;
+const GLSL_CEIL: u32 = 9;
+const GLSL_SIN: u32 = 13;
+const GLSL_COS: u32 = 14;
+const GLSL_SMIN: u32 = 39;
+const GLSL_UMAX: u32 = 41;
+const GLSL_SMAX: u32 = 42;
+const GLSL_LDEXP: u32 = 53;
+const GLSL_FIND_ILSB: u32 = 73;
+const GLSL_FIND_SMSB: u32 = 74;
+const GLSL_FIND_UMSB: u32 = 75;
 const OP_F_ORD_EQUAL: u16 = 180;
+const OP_F_UNORD_EQUAL: u16 = 181;
+const OP_F_UNORD_NOT_EQUAL: u16 = 183;
+const OP_F_UNORD_LESS_THAN: u16 = 185;
+const OP_F_UNORD_GREATER_THAN: u16 = 187;
+const OP_F_UNORD_LESS_THAN_EQUAL: u16 = 189;
+const OP_F_UNORD_GREATER_THAN_EQUAL: u16 = 191;
 const OP_F_ORD_NOT_EQUAL: u16 = 182;
 const OP_F_ORD_LESS_THAN: u16 = 184;
 const OP_F_ORD_GREATER_THAN: u16 = 186;
@@ -321,6 +356,18 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     w.inst(OP_CAPABILITY, &[CAP_GROUP_NON_UNIFORM_QUAD]);
     w.inst(OP_CAPABILITY, &[CAP_IMAGE_QUERY]);
     w.inst(OP_CAPABILITY, &[CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES]);
+    if module.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        !i.dead
+            && matches!(
+                &i.op,
+                SsaOp::Alu {
+                    op: AluOp::ClockDevice | AluOp::ClockSubgroup,
+                    ..
+                }
+            )
+    }) {
+        w.inst(OP_CAPABILITY, &[CAP_SHADER_CLOCK_KHR]);
+    }
     // Which image classes the live code reads (sampled) and writes (storage).
     let mut tex_dims = [false; 4];
     let mut stor_dims = [false; 4];
@@ -335,8 +382,11 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
             | SsaOp::ImageSampleDref { dim, .. }
             | SsaOp::ImageGather { dim, .. }
             | SsaOp::ImageQuerySize { dim, .. }
+            | SsaOp::ImageQueryLod { dim, .. }
             | SsaOp::ImageFetch { dim, .. } => tex_dims[dim_index(*dim)] = true,
-            SsaOp::ImageStore { dim, .. } => stor_dims[dim_index(dim.for_storage())] = true,
+            SsaOp::ImageStore { dim, .. } | SsaOp::ImageAtomic { dim, .. } => {
+                stor_dims[dim_index(dim.for_storage())] = true
+            }
             _ => {}
         }
     }
@@ -350,6 +400,12 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     }
     if uses_storage {
         w.inst(OP_CAPABILITY, &[CAP_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT]);
+    }
+    match module.stage {
+        Stage::Geometry => w.inst(OP_CAPABILITY, &[CAP_GEOMETRY]),
+        Stage::TessControl | Stage::TessEval => w.inst(OP_CAPABILITY, &[CAP_TESSELLATION]),
+        Stage::Task | Stage::Mesh => w.inst(OP_CAPABILITY, &[CAP_MESH_SHADING_EXT]),
+        _ => {}
     }
 
     // What the stage's interface needs.
@@ -377,9 +433,30 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     let full_quads = stage == Stage::Pixel
         && module.require_full_quads
         && live().any(|i| matches!(i.op, SsaOp::QuadSwap { .. } | SsaOp::QuadBroadcast { .. }));
+    let uses_ray_query = live().any(|i| matches!(i.op, SsaOp::RayQueryClosestHit { .. }));
+    if uses_ray_query {
+        w.inst(OP_CAPABILITY, &[crate::rayquery::CAP_RAY_QUERY_KHR]);
+        w.inst_str_plain(OP_EXTENSION, crate::rayquery::EXT_RAY_QUERY_KHR);
+    }
     if full_quads {
         w.inst(OP_CAPABILITY, &[CAP_QUAD_CONTROL_KHR]);
         w.inst_str_plain(OP_EXTENSION, "SPV_KHR_quad_control");
+    }
+
+    let uses_clock = live().any(|i| {
+        matches!(
+            &i.op,
+            SsaOp::Alu {
+                op: AluOp::ClockDevice | AluOp::ClockSubgroup,
+                ..
+            }
+        )
+    });
+    if uses_clock {
+        w.inst_str_plain(OP_EXTENSION, "SPV_KHR_shader_clock");
+    }
+    if matches!(stage, Stage::Task | Stage::Mesh) {
+        w.inst_str_plain(OP_EXTENSION, "SPV_EXT_mesh_shader");
     }
 
     let glsl_ext = w.id();
@@ -391,24 +468,45 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     let main_fn = w.id();
     let global_id_var = w.id(); // declared for compute only
     let push_var = w.id();
-    let local_idx_var = if module.uses_wave64_ballot {
-        Some(w.id())
-    } else {
-        None
+    let uses_sg_local_id = live().any(|i| matches!(i.op, SsaOp::WavePermute { .. }));
+    let alu_uses = |pred: fn(AluOp) -> bool| {
+        live().any(|i| matches!(&i.op, SsaOp::Alu { op, .. } if pred(*op)))
     };
+    let uses_lane64 = alu_uses(|o| matches!(o, AluOp::LaneId64 | AluOp::LaneBit));
+    let uses_sg_lane = alu_uses(|o| matches!(o, AluOp::SubgroupLane))
+        || (uses_lane64 && !stage.has_workgroup());
+
+    let uses_wave_lds = stage == Stage::Compute && uses_sg_local_id;
+    let uses_bda_scratch = module.spill_dwords > 0
+        && matches!(
+            module.spill_backing,
+            crate::spill::SpillBacking::BdaScratch { .. }
+        );
+    let local_idx_var =
+        if module.uses_wave64_ballot
+            || uses_wave_lds
+            || uses_bda_scratch
+            || stage == Stage::Mesh
+            || (uses_lane64 && stage.has_workgroup())
+        {
+            Some(w.id())
+        } else {
+            None
+        };
     let sg_size_var = if module.uses_wave64_ballot {
         Some(w.id())
     } else {
         None
     };
-    let uses_sg_local_id = live().any(|i| matches!(i.op, SsaOp::WavePermute { .. }));
-    let sg_local_id_var = uses_sg_local_id.then(|| w.id());
+    let sg_local_id_var = (uses_sg_local_id || uses_sg_lane).then(|| w.id());
     let ballot_shared_var = if module.uses_wave64_ballot {
         Some(w.id())
     } else {
         None
     };
+    let wave_lds_var = uses_wave_lds.then(|| w.id());
     let lds_var = if module.uses_lds { Some(w.id()) } else { None };
+    let tlas_var = uses_ray_query.then(|| w.id());
     let tex_vars: [Option<u32>; 4] = tex_dims.map(|u| u.then(|| w.id()));
     let samp_var = uses_textures.then(|| w.id());
     let simg_vars: [Option<u32>; 4] = stor_dims.map(|u| u.then(|| w.id()));
@@ -422,19 +520,31 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     let iid_var = uses_iid.then(|| w.id());
     let frag_coord_var = uses_frag_coord.then(|| w.id());
     let front_facing_var = uses_front_facing.then(|| w.id());
-    let out_vars: Vec<(ExportTarget, u32)> = exports.iter().map(|&t| (t, w.id())).collect();
+    // Tess factors and mesh primitives have their own variables.
+    let out_vars: Vec<(ExportTarget, u32)> = exports
+        .iter()
+        .filter(|t| !matches!(t, ExportTarget::Primitive | ExportTarget::TessFactor(_)))
+        .map(|&t| (t, w.id()))
+        .collect();
+    let mut prim = PrimIds::new(&mut w, module);
 
     // EntryPoint: GLCompute (5), Vertex (0) or Fragment (4).
     let model = match stage {
         Stage::Compute => 5,
         Stage::Vertex => 0,
         Stage::Pixel => 4,
+        Stage::Geometry => 3,
+        Stage::TessControl => 1,
+        Stage::TessEval => 2,
+        Stage::Task => 5364,
+        Stage::Mesh => 5365,
     };
     let mut ep = vec![model, main_fn];
     encode_str(&mut ep, "main");
-    if stage == Stage::Compute {
+    if stage.has_workgroup() {
         ep.push(global_id_var);
     }
+    ep.extend(prim.interface());
     ep.extend(attr_vars.iter().map(|a| a.2));
     ep.extend(vid_var.iter().chain(iid_var.iter()).copied());
     ep.extend(
@@ -457,7 +567,13 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     if let Some(v) = ballot_shared_var {
         ep.push(v);
     }
+    if let Some(v) = wave_lds_var {
+        ep.push(v);
+    }
     if let Some(v) = lds_var {
+        ep.push(v);
+    }
+    if let Some(v) = tlas_var {
         ep.push(v);
     }
     ep.extend(
@@ -472,7 +588,7 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
 
     match stage {
         // ExecutionMode LocalSize (17)
-        Stage::Compute => w.inst(
+        Stage::Compute | Stage::Task | Stage::Mesh => w.inst(
             OP_EXECUTION_MODE,
             &[
                 main_fn,
@@ -491,7 +607,12 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                 w.inst(OP_EXECUTION_MODE, &[main_fn, 5089]); // RequireFullQuadsKHR
             }
         }
-        Stage::Vertex => {}
+        Stage::Vertex | Stage::Geometry | Stage::TessControl | Stage::TessEval => {}
+    }
+    for mode in &module.stage_config.modes {
+        let mut ops = vec![main_fn];
+        ops.extend_from_slice(mode);
+        w.inst(OP_EXECUTION_MODE, &ops);
     }
 
     let image_array_len = module.texture_slots.max(module.storage_slots).max(1);
@@ -534,15 +655,28 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     let t_lds_arr = w.id();
     let t_ptr_wg_lds_arr = w.id();
 
-    let uses_spill = module.spill_dwords > 0;
+    let uses_spill = module.spill_dwords > 0 && !uses_bda_scratch;
     let c_spill_len = uses_spill.then(|| w.id());
     let t_spill_arr = uses_spill.then(|| w.id());
     let t_ptr_func_spill_arr = uses_spill.then(|| w.id());
+    let scratch_spec_ids = uses_bda_scratch.then(|| (w.id(), w.id()));
+    let c_64 = uses_wave_lds.then(|| w.id());
+    let t_wave_lds_arr = uses_wave_lds.then(|| w.id());
+    let t_ptr_wg_wave_lds_arr = uses_wave_lds.then(|| w.id());
+    let t_accel_struct = uses_ray_query.then(|| w.id());
+    let t_ptr_accel_struct = uses_ray_query.then(|| w.id());
+    let t_ray_query = uses_ray_query.then(|| w.id());
+    let t_ptr_func_ray_query = uses_ray_query.then(|| w.id());
+    let ray_query_var = uses_ray_query.then(|| w.id());
+    let t_ptr_img_u32 = uses_storage.then(|| w.id());
     // BMA traversal shortcuts (see `crate::bma`): compute shaders that test
     // box nodes get the sampling / shortcut instrumentation.
+    let has_bvh_box = live().any(|i| matches!(i.op, SsaOp::Bvh64IntersectBox32 { .. }));
     let uses_bma = stage == Stage::Compute
         && (module.bma || crate::bma::shader_instrumentation_enabled())
-        && live().any(|i| matches!(i.op, SsaOp::Bvh64IntersectBox32 { .. }));
+        && has_bvh_box;
+    let uses_bma_prior = (uses_bma || module.bma_prior_threshold > 0.0) && has_bvh_box;
+    let bma_prior_spec = uses_bma_prior.then(|| w.id());
     let t_ptr_func_u32 = (uses_spill || uses_bma).then(|| w.id());
     let spill_var = uses_spill.then(|| w.id());
     // (table address low, high spec constants, per-invocation ray counter)
@@ -577,12 +711,13 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     let t_ptr_sampler = w.id();
 
     // Decorations
-    if stage == Stage::Compute {
+    if stage.has_workgroup() {
         w.inst(
             OP_DECORATE,
             &[global_id_var, DEC_BUILTIN, BUILTIN_GLOBAL_INVOCATION_ID],
         );
     }
+    prim.decorate(&mut w);
     for &(loc, flat, var) in &attr_vars {
         w.inst(OP_DECORATE, &[var, DEC_LOCATION, u32::from(loc)]);
         if flat {
@@ -606,8 +741,11 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
             ExportTarget::Mrt(n) | ExportTarget::Param(n) => {
                 w.inst(OP_DECORATE, &[var, DEC_LOCATION, u32::from(n)])
             }
+            // Mesh vertices' Position is a member of the per-vertex block.
+            ExportTarget::Position if stage == Stage::Mesh => {}
             ExportTarget::Position => w.inst(OP_DECORATE, &[var, DEC_BUILTIN, BUILTIN_POSITION]),
             ExportTarget::Depth => w.inst(OP_DECORATE, &[var, DEC_BUILTIN, BUILTIN_FRAG_DEPTH]),
+            ExportTarget::Primitive | ExportTarget::TessFactor(_) => {}
         }
     }
     if let Some(v) = local_idx_var {
@@ -634,6 +772,26 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
             OP_DECORATE,
             &[hi, DEC_SPEC_ID, crate::bma::SPEC_ID_TABLE_HI],
         );
+    }
+    if let Some(spec) = bma_prior_spec {
+        w.inst(
+            OP_DECORATE,
+            &[spec, DEC_SPEC_ID, crate::bma::SPEC_ID_PRIOR_THRESHOLD],
+        );
+    }
+    if let Some((slo, shi)) = scratch_spec_ids {
+        w.inst(
+            OP_DECORATE,
+            &[slo, DEC_SPEC_ID, crate::spill::SPEC_ID_SCRATCH_LO],
+        );
+        w.inst(
+            OP_DECORATE,
+            &[shi, DEC_SPEC_ID, crate::spill::SPEC_ID_SCRATCH_HI],
+        );
+    }
+    if let Some(v) = tlas_var {
+        w.inst(OP_DECORATE, &[v, DEC_DESCRIPTOR_SET, 0]);
+        w.inst(OP_DECORATE, &[v, DEC_BINDING, BINDING_TLAS]);
     }
     w.inst(OP_DECORATE, &[t_sgpr_arr, DEC_ARRAY_STRIDE, 4]);
     w.inst(OP_DECORATE, &[t_push_struct, DEC_BLOCK]);
@@ -705,7 +863,8 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
             .filter_map(|inst| match inst.op {
                 SsaOp::LdsLoadU32 { byte_addr }
                 | SsaOp::LdsStoreU32 { byte_addr, .. }
-                | SsaOp::LdsAtomicAddU32 { byte_addr, .. } => Some(byte_addr),
+                | SsaOp::LdsAtomicAddU32 { byte_addr, .. }
+                | SsaOp::LdsAtomic { byte_addr, .. } => Some(byte_addr),
                 _ => None,
             })
             .try_fold(1, |size, address| {
@@ -735,6 +894,26 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
         w.inst(OP_TYPE_POINTER, &[t_ptr_el, SC_FUNCTION, t_u32]);
     } else if let Some(t_ptr_el) = t_ptr_func_u32 {
         w.inst(OP_TYPE_POINTER, &[t_ptr_el, SC_FUNCTION, t_u32]);
+    }
+    if let (Some(c64), Some(t_arr), Some(t_ptr_arr)) = (c_64, t_wave_lds_arr, t_ptr_wg_wave_lds_arr)
+    {
+        w.inst(OP_CONSTANT, &[t_u32, c64, 64]);
+        w.inst(OP_TYPE_ARRAY, &[t_arr, t_u32, c64]);
+        w.inst(OP_TYPE_POINTER, &[t_ptr_arr, SC_WORKGROUP, t_arr]);
+    }
+    if let Some(t_ptr) = t_ptr_img_u32 {
+        w.inst(OP_TYPE_POINTER, &[t_ptr, SC_IMAGE, t_u32]);
+    }
+    if let (Some(t_as), Some(t_ptr_as), Some(t_rq), Some(t_ptr_rq)) = (
+        t_accel_struct,
+        t_ptr_accel_struct,
+        t_ray_query,
+        t_ptr_func_ray_query,
+    ) {
+        w.inst(OP_TYPE_ACCELERATION_STRUCTURE_KHR, &[t_as]);
+        w.inst(OP_TYPE_POINTER, &[t_ptr_as, SC_UNIFORM_CONSTANT, t_as]);
+        w.inst(crate::rayquery::OP_TYPE_RAY_QUERY_KHR, &[t_rq]);
+        w.inst(OP_TYPE_POINTER, &[t_ptr_rq, SC_FUNCTION, t_rq]);
     }
 
     w.inst(OP_TYPE_STRUCT, &[t_bda_u32_struct, t_u32]);
@@ -1024,6 +1203,48 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
             });
         }
     }
+    if let Some(spec) = bma_prior_spec {
+        w.inst(
+            OP_SPEC_CONSTANT,
+            &[t_f32, spec, module.bma_prior_threshold.to_bits()],
+        );
+        for off in [120u64, 124u64] {
+            const_u64.entry(off).or_insert_with(|| {
+                let id = w.id();
+                w.inst(OP_CONSTANT, &[t_u64, id, off as u32, 0]);
+                id
+            });
+        }
+    }
+    if let Some((slo, shi)) = scratch_spec_ids {
+        w.inst(OP_SPEC_CONSTANT, &[t_u32, slo, 0]);
+        w.inst(OP_SPEC_CONSTANT, &[t_u32, shi, 0]);
+        if let crate::spill::SpillBacking::BdaScratch { bytes_per_lane } = module.spill_backing {
+            let bpl = u64::from(bytes_per_lane);
+            const_u64.entry(bpl).or_insert_with(|| {
+                let id = w.id();
+                w.inst(OP_CONSTANT, &[t_u64, id, bpl as u32, (bpl >> 32) as u32]);
+                id
+            });
+        }
+        for inst in live() {
+            if let SsaOp::SpillLoad { slot } | SsaOp::SpillStore { slot, .. } = inst.op {
+                let off = u64::from(slot) * 4;
+                const_u64.entry(off).or_insert_with(|| {
+                    let id = w.id();
+                    w.inst(OP_CONSTANT, &[t_u64, id, off as u32, (off >> 32) as u32]);
+                    id
+                });
+            }
+        }
+    }
+    if uses_wave_lds {
+        const_u32.entry(63).or_insert_with(|| {
+            let id = w.id();
+            w.inst(OP_CONSTANT, &[t_u32, id, 63]);
+            id
+        });
+    }
     if needs_bvh_offsets {
         for off in (16u64..112).step_by(4) {
             const_u64.entry(off).or_insert_with(|| {
@@ -1035,9 +1256,22 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     }
 
     // Interface variables
-    if stage == Stage::Compute {
+    if stage.has_workgroup() {
         w.inst(OP_VARIABLE, &[t_ptr_in_uvec3, global_id_var, SC_INPUT]);
     }
+    let prim_types = PrimTypes {
+        t_u32,
+        t_i32,
+        t_f32,
+        t_v3f,
+        t_v4f,
+        t_uv2,
+        t_uvec3,
+        t_ptr_in_i32,
+        t_ptr_in_v4f,
+        t_ptr_out_v4f,
+    };
+    let mesh_param_arr = prim.declare(&mut w, &prim_types, &mut const_u32);
     for &(_, _, var) in &attr_vars {
         w.inst(OP_VARIABLE, &[t_ptr_in_v4f, var, SC_INPUT]);
     }
@@ -1051,10 +1285,11 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
         w.inst(OP_VARIABLE, &[t_ptr_in_bool, v, SC_INPUT]);
     }
     for &(t, var) in &out_vars {
-        let ty = if t == ExportTarget::Depth {
-            t_ptr_out_f32
-        } else {
-            t_ptr_out_v4f
+        let ty = match (t, &prim.mesh) {
+            (ExportTarget::Position, Some(m)) => m.t_ptr_vtx_arr,
+            (_, Some(_)) => mesh_param_arr.expect("mesh shaders declare a parameter array"),
+            (ExportTarget::Depth, None) => t_ptr_out_f32,
+            (_, None) => t_ptr_out_v4f,
         };
         w.inst(OP_VARIABLE, &[ty, var, SC_OUTPUT]);
     }
@@ -1074,8 +1309,14 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
     if let Some(v) = ballot_shared_var {
         w.inst(OP_VARIABLE, &[t_ptr_wg_ballot_arr, v, SC_WORKGROUP]);
     }
+    if let (Some(v), Some(t_ptr)) = (wave_lds_var, t_ptr_wg_wave_lds_arr) {
+        w.inst(OP_VARIABLE, &[t_ptr, v, SC_WORKGROUP]);
+    }
     if let Some(v) = lds_var {
         w.inst(OP_VARIABLE, &[t_ptr_wg_lds_arr, v, SC_WORKGROUP]);
+    }
+    if let (Some(v), Some(t_ptr)) = (tlas_var, t_ptr_accel_struct) {
+        w.inst(OP_VARIABLE, &[t_ptr, v, SC_UNIFORM_CONSTANT]);
     }
     for i in 0..4 {
         if let Some(v) = tex_vars[i] {
@@ -1140,6 +1381,10 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
             if let (Some((_, _, counter)), Some(t_ptr)) = (bma_ids, t_ptr_func_u32) {
                 w.inst(OP_VARIABLE, &[t_ptr, counter, SC_FUNCTION, c_zero]);
             }
+            if let (Some(rqv), Some(t_ptr_rq)) = (ray_query_var, t_ptr_func_ray_query) {
+                w.inst(OP_VARIABLE, &[t_ptr_rq, rqv, SC_FUNCTION]);
+            }
+            prim.prologue(&mut w, &prim_types, c_zero);
         }
 
         // SPIR-V requires all OpPhi instructions at the very start of the block.
@@ -1441,6 +1686,15 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                         (CmpType::I32, CmpOp::Le) => OP_S_LESS_THAN_EQUAL,
                         (CmpType::I32, CmpOp::Gt) => OP_S_GREATER_THAN,
                         (CmpType::I32, CmpOp::Ge) => OP_S_GREATER_THAN_EQUAL,
+                        (CmpType::F32, CmpOp::Nge) => OP_F_UNORD_LESS_THAN,
+                        (CmpType::F32, CmpOp::Nlg) => OP_F_UNORD_EQUAL,
+                        (CmpType::F32, CmpOp::Ngt) => OP_F_UNORD_LESS_THAN_EQUAL,
+                        (CmpType::F32, CmpOp::Nle) => OP_F_UNORD_GREATER_THAN,
+                        (CmpType::F32, CmpOp::Neq) => OP_F_UNORD_NOT_EQUAL,
+                        (CmpType::F32, CmpOp::Nlt) => OP_F_UNORD_GREATER_THAN_EQUAL,
+                        // `ssa.rs` lowers F/T/O/U/Class and the 16/64-bit
+                        // types into the predicates above.
+                        (ty, op) => unreachable!("Cmp {op:?} on {ty:?} reaches SPIR-V"),
                     };
                     let res = w.id();
                     w.inst(spv_op, &[t_bool, res, val_map[a], val_map[b]]);
@@ -1590,6 +1844,23 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                             w.inst(OP_LOAD, &[t_bool, b, front_facing_var.unwrap()]);
                             w.inst(OP_SELECT, &[t_u32, res, b, c_one, c_zero]);
                         }
+                        StageInput::TessCoord(chan) => {
+                            let v3 = w.id();
+                            w.inst(OP_LOAD, &[t_v3f, v3, prim.tess_coord.unwrap()]);
+                            let f = w.id();
+                            w.inst(OP_COMPOSITE_EXTRACT, &[t_f32, f, v3, u32::from(chan)]);
+                            w.inst(OP_BITCAST, &[t_u32, res, f]);
+                        }
+                        StageInput::PrimitiveId | StageInput::InvocationId => {
+                            let var = if *input == StageInput::PrimitiveId {
+                                prim.primitive_id
+                            } else {
+                                prim.invocation_id
+                            };
+                            let i = w.id();
+                            w.inst(OP_LOAD, &[t_i32, i, var.unwrap()]);
+                            w.inst(OP_BITCAST, &[t_u32, res, i]);
+                        }
                         StageInput::Attr { loc, chan, .. } => {
                             let var = attr_vars.iter().find(|a| a.0 == loc).unwrap().2;
                             let v4 = w.id();
@@ -1600,6 +1871,119 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                         }
                     }
                     val_map.insert(inst.id, res);
+                }
+                SsaOp::EmitVertex => {
+                    w.inst(OP_EMIT_VERTEX, &[]);
+                    val_map.insert(inst.id, c_zero);
+                }
+                SsaOp::EndPrimitive => {
+                    w.inst(OP_END_PRIMITIVE, &[]);
+                    val_map.insert(inst.id, c_zero);
+                }
+                SsaOp::SetMeshOutputs {
+                    vertices,
+                    primitives,
+                } => {
+                    let m = prim
+                        .mesh
+                        .as_ref()
+                        .expect("SetMeshOutputs outside a mesh shader");
+                    let v = w.id();
+                    w.inst(
+                        OP_EXT_INST,
+                        &[
+                            t_u32,
+                            v,
+                            glsl_ext,
+                            GLSL_UMIN,
+                            val_map[vertices],
+                            m.c_max_vertices,
+                        ],
+                    );
+                    let p = w.id();
+                    w.inst(
+                        OP_EXT_INST,
+                        &[
+                            t_u32,
+                            p,
+                            glsl_ext,
+                            GLSL_UMIN,
+                            val_map[primitives],
+                            m.c_max_primitives,
+                        ],
+                    );
+                    w.inst(OP_SET_MESH_OUTPUTS_EXT, &[v, p]);
+                    val_map.insert(inst.id, c_zero);
+                }
+                SsaOp::TaskCounts { x, y, z } => {
+                    let vars = prim.task_counts.expect("TaskCounts outside a task shader");
+                    for (var, v) in vars.into_iter().zip([x, y, z]) {
+                        w.inst(OP_STORE, &[var, val_map[v]]);
+                    }
+                    val_map.insert(inst.id, c_zero);
+                }
+                SsaOp::Export {
+                    target: ExportTarget::TessFactor(n),
+                    values,
+                } => {
+                    if let Some((var, index)) = prim.tess_factor(*n) {
+                        let f = w.id();
+                        w.inst(OP_BITCAST, &[t_f32, f, val_map[&values[0]]]);
+                        let ptr = w.id();
+                        w.inst(
+                            OP_ACCESS_CHAIN,
+                            &[t_ptr_out_f32, ptr, var, const_u32[&index]],
+                        );
+                        w.inst(OP_STORE, &[ptr, f]);
+                    }
+                    val_map.insert(inst.id, c_zero);
+                }
+                SsaOp::Export {
+                    target: ExportTarget::Primitive,
+                    values,
+                } => {
+                    let m = prim
+                        .mesh
+                        .as_ref()
+                        .expect("a primitive export outside a mesh shader");
+                    let lane = w.id();
+                    w.inst(OP_LOAD, &[t_u32, lane, local_idx_var.unwrap()]);
+                    // NGG connectivity: 9-bit indices at bits 0, 10 and 20;
+                    // bit 31 marks a null primitive (made degenerate here).
+                    let packed = val_map[&values[0]];
+                    let null_bit = w.id();
+                    w.inst(
+                        OP_SHIFT_RIGHT_LOGICAL,
+                        &[t_u32, null_bit, packed, const_u32[&31]],
+                    );
+                    let is_null = w.id();
+                    w.inst(OP_I_EQUAL, &[t_bool, is_null, null_bit, c_one]);
+                    let mut idx = Vec::new();
+                    for k in 0..m.indices_per_primitive {
+                        let shifted = w.id();
+                        w.inst(
+                            OP_SHIFT_RIGHT_LOGICAL,
+                            &[t_u32, shifted, packed, const_u32[&(10 * k)]],
+                        );
+                        let masked = w.id();
+                        w.inst(OP_BITWISE_AND, &[t_u32, masked, shifted, const_u32[&0x1ff]]);
+                        let v = w.id();
+                        w.inst(OP_SELECT, &[t_u32, v, is_null, c_zero, masked]);
+                        idx.push(v);
+                    }
+                    let value = if idx.len() == 1 {
+                        idx[0]
+                    } else {
+                        let v = w.id();
+                        let mut ops = vec![m.t_index, v];
+                        ops.extend(&idx);
+                        w.inst(OP_COMPOSITE_CONSTRUCT, &ops);
+                        v
+                    };
+                    let ptr = w.id();
+                    w.inst(OP_ACCESS_CHAIN, &[m.t_ptr_index, ptr, m.prim_var, lane]);
+                    w.inst(OP_STORE, &[ptr, value]);
+                    val_map.insert(inst.id, c_zero);
                 }
                 SsaOp::Export { target, values } => {
                     let var = out_vars.iter().find(|o| o.0 == *target).unwrap().1;
@@ -1613,6 +1997,22 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                         .collect();
                     if *target == ExportTarget::Depth {
                         w.inst(OP_STORE, &[var, fs[0]]);
+                    } else if stage == Stage::Mesh {
+                        // Lane i writes vertex i.
+                        let v4 = w.id();
+                        w.inst(
+                            OP_COMPOSITE_CONSTRUCT,
+                            &[t_v4f, v4, fs[0], fs[1], fs[2], fs[3]],
+                        );
+                        let lane = w.id();
+                        w.inst(OP_LOAD, &[t_u32, lane, local_idx_var.unwrap()]);
+                        let ptr = w.id();
+                        if *target == ExportTarget::Position {
+                            w.inst(OP_ACCESS_CHAIN, &[t_ptr_out_v4f, ptr, var, lane, c_zero]);
+                        } else {
+                            w.inst(OP_ACCESS_CHAIN, &[t_ptr_out_v4f, ptr, var, lane]);
+                        }
+                        w.inst(OP_STORE, &[ptr, v4]);
                     } else {
                         let v4 = w.id();
                         w.inst(
@@ -1833,6 +2233,7 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                     v,
                     w: wc,
                     comp,
+                    dref,
                     ext,
                 } => {
                     let di = dim_index(*dim);
@@ -1852,7 +2253,14 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                     );
                     let coord = sample_coord(&mut w, &cube_ids, *dim, cu, cv, cw);
                     let texel = w.id();
-                    w.inst(OP_IMAGE_GATHER, &[t_v4f, texel, si, coord, const_u32[comp]]);
+                    match dref {
+                        Some(d) => {
+                            w.inst(OP_IMAGE_DREF_GATHER, &[t_v4f, texel, si, coord, val_map[d]])
+                        }
+                        None => {
+                            w.inst(OP_IMAGE_GATHER, &[t_v4f, texel, si, coord, const_u32[comp]])
+                        }
+                    }
                     let res = w.id();
                     w.inst(OP_BITCAST, &[t_uvec4, res, texel]);
                     val_map.insert(inst.id, res);
@@ -1887,6 +2295,192 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                             &[t_uvec4, res, sx, sy, c_one, c_one],
                         );
                     }
+                    val_map.insert(inst.id, res);
+                }
+                SsaOp::ImageQueryLod {
+                    slot,
+                    dim,
+                    u,
+                    v,
+                    w: wc,
+                } => {
+                    let di = dim_index(*dim);
+                    let si = sampled_image(&mut w, &img_ids, di, *slot, &const_u32);
+                    let coord =
+                        sample_coord(&mut w, &cube_ids, *dim, val_map[u], val_map[v], val_map[wc]);
+                    let lod2 = w.id();
+                    w.inst(OP_IMAGE_QUERY_LOD, &[t_v2f, lod2, si, coord]);
+                    let l0 = w.id();
+                    w.inst(OP_COMPOSITE_EXTRACT, &[t_f32, l0, lod2, 0]);
+                    let l1 = w.id();
+                    w.inst(OP_COMPOSITE_EXTRACT, &[t_f32, l1, lod2, 1]);
+                    let u0 = w.id();
+                    w.inst(OP_BITCAST, &[t_u32, u0, l0]);
+                    let u1 = w.id();
+                    w.inst(OP_BITCAST, &[t_u32, u1, l1]);
+                    let res = w.id();
+                    w.inst(
+                        OP_COMPOSITE_CONSTRUCT,
+                        &[t_uvec4, res, u0, u1, c_zero, c_zero],
+                    );
+                    val_map.insert(inst.id, res);
+                }
+                SsaOp::ImageAtomic {
+                    op,
+                    slot,
+                    dim,
+                    x,
+                    y,
+                    z,
+                    val,
+                    cmp,
+                } => {
+                    let di = dim_index(dim.for_storage());
+                    let pi = w.id();
+                    w.inst(
+                        OP_ACCESS_CHAIN,
+                        &[t_ptr_simg[di], pi, simg_vars[di].unwrap(), const_u32[slot]],
+                    );
+                    let coord = if matches!(dim.for_storage(), ImageDim::D3 | ImageDim::D2Array) {
+                        let c = w.id();
+                        w.inst(
+                            OP_COMPOSITE_CONSTRUCT,
+                            &[t_uvec3, c, val_map[x], val_map[y], val_map[z]],
+                        );
+                        c
+                    } else {
+                        let c = w.id();
+                        w.inst(OP_COMPOSITE_CONSTRUCT, &[t_uv2, c, val_map[x], val_map[y]]);
+                        c
+                    };
+                    let texel_ptr = w.id();
+                    w.inst(
+                        OP_IMAGE_TEXEL_POINTER,
+                        &[t_ptr_img_u32.unwrap(), texel_ptr, pi, coord, c_zero],
+                    );
+                    let res = w.id();
+                    let v_id = val_map[val];
+                    match op {
+                        AtomicOp::Swap => w.inst(
+                            OP_ATOMIC_EXCHANGE,
+                            &[t_u32, res, texel_ptr, c_one, c_zero, v_id],
+                        ),
+                        AtomicOp::CmpSwap => {
+                            let c_id = cmp.map_or(c_zero, |c| val_map[&c]);
+                            w.inst(
+                                OP_ATOMIC_COMPARE_EXCHANGE,
+                                &[t_u32, res, texel_ptr, c_one, c_zero, c_zero, v_id, c_id],
+                            );
+                        }
+                        AtomicOp::Add => w.inst(
+                            OP_ATOMIC_I_ADD,
+                            &[t_u32, res, texel_ptr, c_one, c_zero, v_id],
+                        ),
+                        AtomicOp::Sub => w.inst(
+                            OP_ATOMIC_I_SUB,
+                            &[t_u32, res, texel_ptr, c_one, c_zero, v_id],
+                        ),
+                        AtomicOp::SMin => w.inst(
+                            OP_ATOMIC_S_MIN,
+                            &[t_u32, res, texel_ptr, c_one, c_zero, v_id],
+                        ),
+                        AtomicOp::UMin => w.inst(
+                            OP_ATOMIC_U_MIN,
+                            &[t_u32, res, texel_ptr, c_one, c_zero, v_id],
+                        ),
+                        AtomicOp::SMax => w.inst(
+                            OP_ATOMIC_S_MAX,
+                            &[t_u32, res, texel_ptr, c_one, c_zero, v_id],
+                        ),
+                        AtomicOp::UMax => w.inst(
+                            OP_ATOMIC_U_MAX,
+                            &[t_u32, res, texel_ptr, c_one, c_zero, v_id],
+                        ),
+                        AtomicOp::And => {
+                            w.inst(OP_ATOMIC_AND, &[t_u32, res, texel_ptr, c_one, c_zero, v_id])
+                        }
+                        AtomicOp::Or => {
+                            w.inst(OP_ATOMIC_OR, &[t_u32, res, texel_ptr, c_one, c_zero, v_id])
+                        }
+                        AtomicOp::Xor => {
+                            w.inst(OP_ATOMIC_XOR, &[t_u32, res, texel_ptr, c_one, c_zero, v_id])
+                        }
+                    }
+                    val_map.insert(inst.id, res);
+                }
+                SsaOp::RayQueryClosestHit {
+                    flags,
+                    cull_mask,
+                    ox,
+                    oy,
+                    oz,
+                    t_min,
+                    dx,
+                    dy,
+                    dz,
+                    t_max,
+                    ..
+                } => {
+                    let rq = ray_query_var.expect("ray_query_var");
+                    let tlas = w.id();
+                    w.inst(OP_LOAD, &[t_accel_struct.unwrap(), tlas, tlas_var.unwrap()]);
+                    let origin = w.id();
+                    w.inst(
+                        OP_COMPOSITE_CONSTRUCT,
+                        &[t_v3f, origin, val_map[ox], val_map[oy], val_map[oz]],
+                    );
+                    let dir = w.id();
+                    w.inst(
+                        OP_COMPOSITE_CONSTRUCT,
+                        &[t_v3f, dir, val_map[dx], val_map[dy], val_map[dz]],
+                    );
+                    w.inst(
+                        crate::rayquery::OP_RAY_QUERY_INITIALIZE_KHR,
+                        &[
+                            rq,
+                            tlas,
+                            val_map[flags],
+                            val_map[cull_mask],
+                            origin,
+                            val_map[t_min],
+                            dir,
+                            val_map[t_max],
+                        ],
+                    );
+                    // Inline structured proceed loop: while (OpRayQueryProceedKHR(rq)) {}
+                    let l_head = w.id();
+                    let l_body = w.id();
+                    let l_cont = w.id();
+                    let l_merge = w.id();
+                    w.inst(OP_BRANCH, &[l_head]);
+                    w.inst(OP_LABEL, &[l_head]);
+                    w.inst(OP_LOOP_MERGE, &[l_merge, l_cont, 0]);
+                    let proceed = w.id();
+                    w.inst(
+                        crate::rayquery::OP_RAY_QUERY_PROCEED_KHR,
+                        &[t_bool, proceed, rq],
+                    );
+                    w.inst(OP_BRANCH_CONDITIONAL, &[proceed, l_body, l_merge]);
+                    w.inst(OP_LABEL, &[l_body]);
+                    w.inst(OP_BRANCH, &[l_cont]);
+                    w.inst(OP_LABEL, &[l_cont]);
+                    w.inst(OP_BRANCH, &[l_head]);
+                    w.inst(OP_LABEL, &[l_merge]);
+                    // Query committed intersection type (1 = RayQueryCommittedIntersectionTriangleKHR)
+                    let hit_ty = w.id();
+                    w.inst(
+                        crate::rayquery::OP_RAY_QUERY_GET_INTERSECTION_TYPE_KHR,
+                        &[t_u32, hit_ty, rq, c_one],
+                    );
+                    let has_hit = w.id();
+                    w.inst(OP_I_NOT_EQUAL, &[t_bool, has_hit, hit_ty, c_zero]);
+                    let hit_t = w.id();
+                    w.inst(
+                        crate::rayquery::OP_RAY_QUERY_GET_INTERSECTION_T_KHR,
+                        &[t_f32, hit_t, rq, c_one],
+                    );
+                    let res = w.id();
+                    w.inst(OP_SELECT, &[t_f32, res, has_hit, hit_t, val_map[t_max]]);
                     val_map.insert(inst.id, res);
                 }
                 SsaOp::BdaAtomic { op, addr, val, cmp } => {
@@ -2027,7 +2621,177 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                     );
                     val_map.insert(inst.id, res);
                 }
+                SsaOp::Alu { op, args } => {
+                    let arg = |i: usize| val_map[&args[i]];
+                    let rt = match inst.ty {
+                        Ty::Bool => t_bool,
+                        Ty::U32 => t_u32,
+                        Ty::F32 => t_f32,
+                        Ty::U64 => t_u64,
+                        Ty::U32x4 => t_uvec4,
+                    };
+                    let res = w.id();
+                    let lane64 = |w: &mut Writer| {
+                        let li = w.id();
+                        if let (true, Some(lvar)) = (stage.has_workgroup(), local_idx_var) {
+                            let t = w.id();
+                            w.inst(OP_LOAD, &[t_u32, t, lvar]);
+                            w.inst(OP_BITWISE_AND, &[t_u32, li, t, const_u32[&63]]);
+                        } else {
+                            w.inst(OP_LOAD, &[t_u32, li, sg_local_id_var.unwrap()]);
+                        }
+                        li
+                    };
+                    match op {
+                        AluOp::UMin | AluOp::UMax | AluOp::SMin | AluOp::SMax => {
+                            let g = match op {
+                                AluOp::UMin => GLSL_UMIN,
+                                AluOp::UMax => GLSL_UMAX,
+                                AluOp::SMin => GLSL_SMIN,
+                                _ => GLSL_SMAX,
+                            };
+                            w.inst(OP_EXT_INST, &[rt, res, glsl_ext, g, arg(0), arg(1)]);
+                        }
+                        AluOp::UMulHi | AluOp::SMulHi => {
+                            let conv = if *op == AluOp::UMulHi {
+                                OP_U_CONVERT
+                            } else {
+                                OP_S_CONVERT
+                            };
+                            let a64 = w.id();
+                            w.inst(conv, &[t_u64, a64, arg(0)]);
+                            let b64 = w.id();
+                            w.inst(conv, &[t_u64, b64, arg(1)]);
+                            let p = w.id();
+                            w.inst(OP_I_MUL, &[t_u64, p, a64, b64]);
+                            let hi = w.id();
+                            w.inst(OP_SHIFT_RIGHT_LOGICAL, &[t_u64, hi, p, c_32_u64]);
+                            w.inst(OP_U_CONVERT, &[t_u32, res, hi]);
+                        }
+                        AluOp::BitCount => w.inst(OP_BIT_COUNT, &[rt, res, arg(0)]),
+                        AluOp::BitReverse => w.inst(OP_BIT_REVERSE, &[rt, res, arg(0)]),
+                        AluOp::FindLsb | AluOp::FindUMsb | AluOp::FindSMsb => {
+                            let g = match op {
+                                AluOp::FindLsb => GLSL_FIND_ILSB,
+                                AluOp::FindUMsb => GLSL_FIND_UMSB,
+                                _ => GLSL_FIND_SMSB,
+                            };
+                            w.inst(OP_EXT_INST, &[rt, res, glsl_ext, g, arg(0)]);
+                        }
+                        AluOp::BitFieldInsert => w.inst(
+                            OP_BIT_FIELD_INSERT,
+                            &[rt, res, arg(0), arg(1), arg(2), arg(3)],
+                        ),
+                        AluOp::Not | AluOp::Not64 => w.inst(OP_NOT, &[rt, res, arg(0)]),
+                        AluOp::Shl64 => w.inst(OP_SHIFT_LEFT_LOGICAL, &[rt, res, arg(0), arg(1)]),
+                        AluOp::Lshr64 => {
+                            w.inst(OP_SHIFT_RIGHT_LOGICAL, &[rt, res, arg(0), arg(1)])
+                        }
+                        AluOp::Ashr64 => {
+                            w.inst(OP_SHIFT_RIGHT_ARITHMETIC, &[rt, res, arg(0), arg(1)])
+                        }
+                        AluOp::Or64 => w.inst(OP_BITWISE_OR, &[rt, res, arg(0), arg(1)]),
+                        AluOp::Xor64 => w.inst(OP_BITWISE_XOR, &[rt, res, arg(0), arg(1)]),
+                        AluOp::And64 => w.inst(OP_BITWISE_AND, &[rt, res, arg(0), arg(1)]),
+                        AluOp::Sub64 => w.inst(OP_I_SUB, &[rt, res, arg(0), arg(1)]),
+                        AluOp::Add64 => w.inst(OP_I_ADD, &[rt, res, arg(0), arg(1)]),
+                        AluOp::Mul64 => w.inst(OP_I_MUL, &[rt, res, arg(0), arg(1)]),
+                        AluOp::SExt64 => w.inst(OP_S_CONVERT, &[rt, res, arg(0)]),
+                        AluOp::UConvert64 => w.inst(OP_U_CONVERT, &[rt, res, arg(0)]),
+                        AluOp::ULt64 => w.inst(OP_U_LESS_THAN, &[rt, res, arg(0), arg(1)]),
+                        AluOp::SLt64 => w.inst(OP_S_LESS_THAN, &[rt, res, arg(0), arg(1)]),
+                        AluOp::Eq64 => w.inst(OP_I_EQUAL, &[rt, res, arg(0), arg(1)]),
+                        AluOp::Sin | AluOp::Cos | AluOp::Trunc | AluOp::Ceil | AluOp::Abs => {
+                            let g = match op {
+                                AluOp::Sin => GLSL_SIN,
+                                AluOp::Cos => GLSL_COS,
+                                AluOp::Trunc => GLSL_TRUNC,
+                                AluOp::Ceil => GLSL_CEIL,
+                                _ => GLSL_FABS,
+                            };
+                            w.inst(OP_EXT_INST, &[rt, res, glsl_ext, g, arg(0)]);
+                        }
+                        AluOp::Neg => w.inst(OP_F_NEGATE, &[rt, res, arg(0)]),
+                        AluOp::Ldexp => {
+                            w.inst(OP_EXT_INST, &[rt, res, glsl_ext, GLSL_LDEXP, arg(0), arg(1)])
+                        }
+                        AluOp::FDiv => w.inst(OP_F_DIV, &[rt, res, arg(0), arg(1)]),
+                        AluOp::IsNan => w.inst(OP_IS_NAN, &[rt, res, arg(0)]),
+                        AluOp::IsInf => w.inst(OP_IS_INF, &[rt, res, arg(0)]),
+                        AluOp::LaneId64 => {
+                            let li = lane64(&mut w);
+                            w.inst(OP_BITWISE_OR, &[rt, res, li, c_zero]);
+                        }
+                        AluOp::SubgroupLane => {
+                            w.inst(OP_LOAD, &[t_u32, res, sg_local_id_var.unwrap()]);
+                        }
+                        AluOp::LaneBit => {
+                            let li = lane64(&mut w);
+                            let sh = w.id();
+                            w.inst(OP_SHIFT_RIGHT_LOGICAL, &[t_u64, sh, arg(0), li]);
+                            let lo = w.id();
+                            w.inst(OP_U_CONVERT, &[t_u32, lo, sh]);
+                            let bit = w.id();
+                            w.inst(OP_BITWISE_AND, &[t_u32, bit, lo, c_one]);
+                            w.inst(OP_I_NOT_EQUAL, &[t_bool, res, bit, c_zero]);
+                        }
+                        AluOp::ClockDevice => w.inst(OP_READ_CLOCK_KHR, &[t_u64, res, c_one]),
+                        AluOp::ClockSubgroup => {
+                            w.inst(OP_READ_CLOCK_KHR, &[t_u64, res, c_scope_subgroup])
+                        }
+                    }
+                    val_map.insert(inst.id, res);
+                }
+                SsaOp::LdsAtomic {
+                    op,
+                    byte_addr,
+                    val,
+                    cmp,
+                } => {
+                    let lds = lds_var.unwrap();
+                    let dw_idx = w.id();
+                    w.inst(
+                        OP_SHIFT_RIGHT_LOGICAL,
+                        &[t_u32, dw_idx, val_map[byte_addr], c_two],
+                    );
+                    let ptr = w.id();
+                    w.inst(OP_ACCESS_CHAIN, &[t_ptr_wg_u32, ptr, lds, dw_idx]);
+                    let res = w.id();
+                    if *op == AtomicOp::CmpSwap {
+                        let cmp_id = cmp.map_or(c_zero, |c| val_map[&c]);
+                        w.inst(
+                            OP_ATOMIC_COMPARE_EXCHANGE,
+                            &[
+                                t_u32,
+                                res,
+                                ptr,
+                                c_scope_wg,
+                                c_zero,
+                                c_zero,
+                                val_map[val],
+                                cmp_id,
+                            ],
+                        );
+                    } else {
+                        let spv_op = match op {
+                            AtomicOp::Swap => OP_ATOMIC_EXCHANGE,
+                            AtomicOp::Add => OP_ATOMIC_I_ADD,
+                            AtomicOp::Sub => OP_ATOMIC_I_SUB,
+                            AtomicOp::SMin => OP_ATOMIC_S_MIN,
+                            AtomicOp::UMin => OP_ATOMIC_U_MIN,
+                            AtomicOp::SMax => OP_ATOMIC_S_MAX,
+                            AtomicOp::UMax => OP_ATOMIC_U_MAX,
+                            AtomicOp::And => OP_ATOMIC_AND,
+                            AtomicOp::Or => OP_ATOMIC_OR,
+                            AtomicOp::Xor => OP_ATOMIC_XOR,
+                            AtomicOp::CmpSwap => unreachable!(),
+                        };
+                        w.inst(spv_op, &[t_u32, res, ptr, c_scope_wg, c_zero, val_map[val]]);
+                    }
+                    val_map.insert(inst.id, res);
+                }
                 SsaOp::LdsAtomicAddU32 { byte_addr, val } => {
+
                     let lds = lds_var.unwrap();
                     let dw_idx = w.id();
                     w.inst(
@@ -2232,6 +2996,43 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                         &[t_uvec4, children_vec, children_fp, MEM_ALIGNED, 16],
                     );
 
+                    // Optional BMH child-prior pruning (Box32Meta bytes 120..128: 4 × f16 priors)
+                    let child_priors = bma_prior_spec.map(|_| {
+                        let load_u32 = |w: &mut Writer, off: u64| -> u32 {
+                            let ea = w.id();
+                            w.inst(OP_I_ADD, &[t_u64, ea, base, const_u64[&off]]);
+                            let p = w.id();
+                            w.inst(OP_CONVERT_U_TO_PTR, &[t_bda_u32_ptr, p, ea]);
+                            let fp = w.id();
+                            w.inst(OP_ACCESS_CHAIN, &[t_bda_u32_field_ptr, fp, p, c_zero]);
+                            let u = w.id();
+                            w.inst(OP_LOAD, &[t_u32, u, fp, MEM_ALIGNED, 4]);
+                            u
+                        };
+                        let w0 = load_u32(&mut w, 120);
+                        let w1 = load_u32(&mut w, 124);
+                        let p01 = w.id();
+                        w.inst(
+                            OP_EXT_INST,
+                            &[t_v2f, p01, glsl_ext, GLSL_UNPACK_HALF_2X16, w0],
+                        );
+                        let p23 = w.id();
+                        w.inst(
+                            OP_EXT_INST,
+                            &[t_v2f, p23, glsl_ext, GLSL_UNPACK_HALF_2X16, w1],
+                        );
+                        let mut p = [0u32; 4];
+                        for (i, (vec, comp)) in [(p01, 0), (p01, 1), (p23, 0), (p23, 1)]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            let id = w.id();
+                            w.inst(OP_COMPOSITE_EXTRACT, &[t_f32, id, vec, comp]);
+                            p[i] = id;
+                        }
+                        p
+                    });
+
                     let mut out_ids = [0u32; 4];
                     let mut out_dists = [0u32; 4];
                     for child in 0..4u32 {
@@ -2305,8 +3106,31 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                         }
                         let slab_hit = w.id();
                         w.inst(OP_F_ORD_LESS_THAN_EQUAL, &[t_bool, slab_hit, tmin, tmax]);
-                        let hit = w.id();
+                        let mut hit = w.id();
                         w.inst(OP_LOGICAL_AND, &[t_bool, hit, valid, slab_hit]);
+                        if let (Some(thresh), Some(priors)) = (bma_prior_spec, child_priors) {
+                            let d_pos = w.id();
+                            w.inst(
+                                OP_EXT_INST,
+                                &[t_f32, d_pos, glsl_ext, GLSL_FMAX, tmin, c_fzero],
+                            );
+                            let denom = w.id();
+                            w.inst(OP_F_ADD, &[t_f32, denom, c_fone, d_pos]);
+                            let prob = w.id();
+                            w.inst(OP_F_DIV, &[t_f32, prob, priors[child as usize], denom]);
+                            let disabled = w.id();
+                            w.inst(
+                                OP_F_ORD_LESS_THAN_EQUAL,
+                                &[t_bool, disabled, thresh, c_fzero],
+                            );
+                            let pass = w.id();
+                            w.inst(OP_F_ORD_GREATER_THAN_EQUAL, &[t_bool, pass, prob, thresh]);
+                            let keep = w.id();
+                            w.inst(OP_LOGICAL_OR, &[t_bool, keep, disabled, pass]);
+                            let pruned_hit = w.id();
+                            w.inst(OP_LOGICAL_AND, &[t_bool, pruned_hit, hit, keep]);
+                            hit = pruned_hit;
+                        }
                         let res_id = w.id();
                         w.inst(OP_SELECT, &[t_u32, res_id, hit, cid, c_invalid_node]);
                         let res_dist = w.id();
@@ -2443,10 +3267,31 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                                 OP_SHIFT_RIGHT_LOGICAL,
                                 &[t_u32, lane_idx, addr_bytes, const_u32[&2]],
                             );
-                            w.inst(
-                                OP_GROUP_NON_UNIFORM_SHUFFLE,
-                                &[t_u32, res, c_scope_subgroup, v, lane_idx],
-                            );
+                            if let (Some(wlds), Some(lvar)) = (wave_lds_var, local_idx_var) {
+                                // Wave64-on-Wave32 LDS cross-half bridge
+                                let li = w.id();
+                                w.inst(OP_LOAD, &[t_u32, li, lvar]);
+                                let my_slot = w.id();
+                                w.inst(OP_BITWISE_AND, &[t_u32, my_slot, li, const_u32[&63]]);
+                                let wptr = w.id();
+                                w.inst(OP_ACCESS_CHAIN, &[t_ptr_wg_u32, wptr, wlds, my_slot]);
+                                w.inst(OP_STORE, &[wptr, v]);
+                                w.inst(OP_CONTROL_BARRIER, &[c_scope_wg, c_scope_wg, c_sem_wg]);
+                                let src_slot = w.id();
+                                w.inst(
+                                    OP_BITWISE_AND,
+                                    &[t_u32, src_slot, lane_idx, const_u32[&63]],
+                                );
+                                let rptr = w.id();
+                                w.inst(OP_ACCESS_CHAIN, &[t_ptr_wg_u32, rptr, wlds, src_slot]);
+                                w.inst(OP_LOAD, &[t_u32, res, rptr]);
+                                w.inst(OP_CONTROL_BARRIER, &[c_scope_wg, c_scope_wg, c_sem_wg]);
+                            } else {
+                                w.inst(
+                                    OP_GROUP_NON_UNIFORM_SHUFFLE,
+                                    &[t_u32, res, c_scope_subgroup, v, lane_idx],
+                                );
+                            }
                         }
                         LanePermuteOp::PermLane16 { .. } | LanePermuteOp::PermLaneX16 { .. } => {
                             let cross = matches!(op, LanePermuteOp::PermLaneX16 { .. });
@@ -2476,36 +3321,149 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
                             w.inst(OP_BITWISE_AND, &[t_u32, pick, shifted, const_u32[&15]]);
                             let src_lane = w.id();
                             w.inst(OP_BITWISE_OR, &[t_u32, src_lane, src_row, pick]);
-                            w.inst(
-                                OP_GROUP_NON_UNIFORM_SHUFFLE,
-                                &[t_u32, res, c_scope_subgroup, v, src_lane],
-                            );
+                            if cross && let (Some(wlds), Some(lvar)) = (wave_lds_var, local_idx_var)
+                            {
+                                let li = w.id();
+                                w.inst(OP_LOAD, &[t_u32, li, lvar]);
+                                let my_slot = w.id();
+                                w.inst(OP_BITWISE_AND, &[t_u32, my_slot, li, const_u32[&63]]);
+                                let wptr = w.id();
+                                w.inst(OP_ACCESS_CHAIN, &[t_ptr_wg_u32, wptr, wlds, my_slot]);
+                                w.inst(OP_STORE, &[wptr, v]);
+                                w.inst(OP_CONTROL_BARRIER, &[c_scope_wg, c_scope_wg, c_sem_wg]);
+                                let src_slot = w.id();
+                                w.inst(
+                                    OP_BITWISE_AND,
+                                    &[t_u32, src_slot, src_lane, const_u32[&63]],
+                                );
+                                let rptr = w.id();
+                                w.inst(OP_ACCESS_CHAIN, &[t_ptr_wg_u32, rptr, wlds, src_slot]);
+                                w.inst(OP_LOAD, &[t_u32, res, rptr]);
+                                w.inst(OP_CONTROL_BARRIER, &[c_scope_wg, c_scope_wg, c_sem_wg]);
+                            } else {
+                                w.inst(
+                                    OP_GROUP_NON_UNIFORM_SHUFFLE,
+                                    &[t_u32, res, c_scope_subgroup, v, src_lane],
+                                );
+                            }
                         }
                         LanePermuteOp::DsPermute => {
                             let lane_idx = aux.map_or(c_zero, |a| val_map[&a]);
-                            w.inst(
-                                OP_GROUP_NON_UNIFORM_SHUFFLE,
-                                &[t_u32, res, c_scope_subgroup, v, lane_idx],
-                            );
+                            if let (Some(wlds), Some(lvar)) = (wave_lds_var, local_idx_var) {
+                                let li = w.id();
+                                w.inst(OP_LOAD, &[t_u32, li, lvar]);
+                                let my_slot = w.id();
+                                w.inst(OP_BITWISE_AND, &[t_u32, my_slot, li, const_u32[&63]]);
+                                let wptr = w.id();
+                                w.inst(OP_ACCESS_CHAIN, &[t_ptr_wg_u32, wptr, wlds, my_slot]);
+                                w.inst(OP_STORE, &[wptr, v]);
+                                w.inst(OP_CONTROL_BARRIER, &[c_scope_wg, c_scope_wg, c_sem_wg]);
+                                let src_slot = w.id();
+                                w.inst(
+                                    OP_BITWISE_AND,
+                                    &[t_u32, src_slot, lane_idx, const_u32[&63]],
+                                );
+                                let rptr = w.id();
+                                w.inst(OP_ACCESS_CHAIN, &[t_ptr_wg_u32, rptr, wlds, src_slot]);
+                                w.inst(OP_LOAD, &[t_u32, res, rptr]);
+                                w.inst(OP_CONTROL_BARRIER, &[c_scope_wg, c_scope_wg, c_sem_wg]);
+                            } else {
+                                w.inst(
+                                    OP_GROUP_NON_UNIFORM_SHUFFLE,
+                                    &[t_u32, res, c_scope_subgroup, v, lane_idx],
+                                );
+                            }
                         }
                     }
                     val_map.insert(inst.id, res);
                 }
                 SsaOp::SpillLoad { slot } => {
-                    let sv = spill_var.expect("spill_var must exist for SpillLoad");
-                    let t_ptr_el = t_ptr_func_u32.expect("t_ptr_func_u32");
-                    let ptr = w.id();
-                    w.inst(OP_ACCESS_CHAIN, &[t_ptr_el, ptr, sv, const_u32[slot]]);
                     let res = w.id();
-                    w.inst(OP_LOAD, &[t_u32, res, ptr]);
+                    if let (
+                        Some((slo, shi)),
+                        crate::spill::SpillBacking::BdaScratch { bytes_per_lane },
+                    ) = (scratch_spec_ids, module.spill_backing)
+                    {
+                        let lo64 = w.id();
+                        w.inst(OP_U_CONVERT, &[t_u64, lo64, slo]);
+                        let hi64 = w.id();
+                        w.inst(OP_U_CONVERT, &[t_u64, hi64, shi]);
+                        let hi_sh = w.id();
+                        w.inst(OP_SHIFT_LEFT_LOGICAL, &[t_u64, hi_sh, hi64, c_32_u64]);
+                        let base = w.id();
+                        w.inst(OP_BITWISE_OR, &[t_u64, base, lo64, hi_sh]);
+                        let li = w.id();
+                        w.inst(OP_LOAD, &[t_u32, li, local_idx_var.unwrap()]);
+                        let li64 = w.id();
+                        w.inst(OP_U_CONVERT, &[t_u64, li64, li]);
+                        let lane_off = w.id();
+                        w.inst(
+                            OP_I_MUL,
+                            &[t_u64, lane_off, li64, const_u64[&u64::from(bytes_per_lane)]],
+                        );
+                        let lane_base = w.id();
+                        w.inst(OP_I_ADD, &[t_u64, lane_base, base, lane_off]);
+                        let ea = w.id();
+                        w.inst(
+                            OP_I_ADD,
+                            &[t_u64, ea, lane_base, const_u64[&(u64::from(*slot) * 4)]],
+                        );
+                        let p = w.id();
+                        w.inst(OP_CONVERT_U_TO_PTR, &[t_bda_u32_ptr, p, ea]);
+                        let fp = w.id();
+                        w.inst(OP_ACCESS_CHAIN, &[t_bda_u32_field_ptr, fp, p, c_zero]);
+                        w.inst(OP_LOAD, &[t_u32, res, fp, MEM_ALIGNED, 4]);
+                    } else {
+                        let sv = spill_var.expect("spill_var must exist for SpillLoad");
+                        let t_ptr_el = t_ptr_func_u32.expect("t_ptr_func_u32");
+                        let ptr = w.id();
+                        w.inst(OP_ACCESS_CHAIN, &[t_ptr_el, ptr, sv, const_u32[slot]]);
+                        w.inst(OP_LOAD, &[t_u32, res, ptr]);
+                    }
                     val_map.insert(inst.id, res);
                 }
                 SsaOp::SpillStore { slot, val } => {
-                    let sv = spill_var.expect("spill_var must exist for SpillStore");
-                    let t_ptr_el = t_ptr_func_u32.expect("t_ptr_func_u32");
-                    let ptr = w.id();
-                    w.inst(OP_ACCESS_CHAIN, &[t_ptr_el, ptr, sv, const_u32[slot]]);
-                    w.inst(OP_STORE, &[ptr, val_map[val]]);
+                    if let (
+                        Some((slo, shi)),
+                        crate::spill::SpillBacking::BdaScratch { bytes_per_lane },
+                    ) = (scratch_spec_ids, module.spill_backing)
+                    {
+                        let lo64 = w.id();
+                        w.inst(OP_U_CONVERT, &[t_u64, lo64, slo]);
+                        let hi64 = w.id();
+                        w.inst(OP_U_CONVERT, &[t_u64, hi64, shi]);
+                        let hi_sh = w.id();
+                        w.inst(OP_SHIFT_LEFT_LOGICAL, &[t_u64, hi_sh, hi64, c_32_u64]);
+                        let base = w.id();
+                        w.inst(OP_BITWISE_OR, &[t_u64, base, lo64, hi_sh]);
+                        let li = w.id();
+                        w.inst(OP_LOAD, &[t_u32, li, local_idx_var.unwrap()]);
+                        let li64 = w.id();
+                        w.inst(OP_U_CONVERT, &[t_u64, li64, li]);
+                        let lane_off = w.id();
+                        w.inst(
+                            OP_I_MUL,
+                            &[t_u64, lane_off, li64, const_u64[&u64::from(bytes_per_lane)]],
+                        );
+                        let lane_base = w.id();
+                        w.inst(OP_I_ADD, &[t_u64, lane_base, base, lane_off]);
+                        let ea = w.id();
+                        w.inst(
+                            OP_I_ADD,
+                            &[t_u64, ea, lane_base, const_u64[&(u64::from(*slot) * 4)]],
+                        );
+                        let p = w.id();
+                        w.inst(OP_CONVERT_U_TO_PTR, &[t_bda_u32_ptr, p, ea]);
+                        let fp = w.id();
+                        w.inst(OP_ACCESS_CHAIN, &[t_bda_u32_field_ptr, fp, p, c_zero]);
+                        w.inst(OP_STORE, &[fp, val_map[val], MEM_ALIGNED, 4]);
+                    } else {
+                        let sv = spill_var.expect("spill_var must exist for SpillStore");
+                        let t_ptr_el = t_ptr_func_u32.expect("t_ptr_func_u32");
+                        let ptr = w.id();
+                        w.inst(OP_ACCESS_CHAIN, &[t_ptr_el, ptr, sv, const_u32[slot]]);
+                        w.inst(OP_STORE, &[ptr, val_map[val]]);
+                    }
                     val_map.insert(inst.id, c_zero);
                 }
             }
@@ -2513,7 +3471,18 @@ pub fn emit_spirv(module: &SsaModule) -> Vec<u32> {
 
         // Emit block terminator
         match &block.term {
-            Terminator::Return => w.inst(OP_RETURN, &[]),
+            Terminator::Return => match prim.task_counts {
+                // A task shader ends by launching its mesh groups.
+                Some(vars) => {
+                    let counts = vars.map(|var| {
+                        let v = w.id();
+                        w.inst(OP_LOAD, &[t_u32, v, var]);
+                        v
+                    });
+                    w.inst(OP_EMIT_MESH_TASKS_EXT, &counts);
+                }
+                None => w.inst(OP_RETURN, &[]),
+            },
             Terminator::Branch(target) => w.inst(OP_BRANCH, &[block_labels[*target]]),
             Terminator::BranchCond {
                 cond,
@@ -3126,5 +4095,331 @@ fn encode_str(dst: &mut Vec<u32>, s: &str) {
             }
         }
         dst.push(w);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Geometry / tessellation / task / mesh stage interfaces
+// ---------------------------------------------------------------------------
+
+const OP_EMIT_VERTEX: u16 = 218;
+const OP_END_PRIMITIVE: u16 = 219;
+const OP_EMIT_MESH_TASKS_EXT: u16 = 5294;
+const OP_SET_MESH_OUTPUTS_EXT: u16 = 5295;
+const CAP_GEOMETRY: u32 = 2;
+const CAP_TESSELLATION: u32 = 3;
+const CAP_MESH_SHADING_EXT: u32 = 5283;
+const SC_PRIVATE: u32 = 6;
+const DEC_PATCH: u32 = 15;
+const BUILTIN_PRIMITIVE_ID: u32 = 7;
+const BUILTIN_INVOCATION_ID: u32 = 8;
+const BUILTIN_TESS_LEVEL_OUTER: u32 = 11;
+const BUILTIN_TESS_LEVEL_INNER: u32 = 12;
+const BUILTIN_TESS_COORD: u32 = 13;
+const GLSL_UMIN: u32 = 38;
+/// `gl_MaxPatchVertices`: the length of a control shader's input array.
+const MAX_PATCH_VERTICES: u32 = 32;
+
+/// Types the stage interfaces are built from.
+struct PrimTypes {
+    t_u32: u32,
+    t_i32: u32,
+    t_f32: u32,
+    t_v3f: u32,
+    t_v4f: u32,
+    t_uv2: u32,
+    t_uvec3: u32,
+    t_ptr_in_i32: u32,
+    t_ptr_in_v4f: u32,
+    t_ptr_out_v4f: u32,
+}
+
+struct TcsIds {
+    in_struct: u32,
+    out_struct: u32,
+    gl_in: u32,
+    gl_out: u32,
+    outer: u32,
+    inner: u32,
+    layout: TessControlLayout,
+}
+
+struct MeshIds {
+    vtx_struct: u32,
+    prim_var: u32,
+    index_builtin: u32,
+    indices_per_primitive: u32,
+    max_vertices: u32,
+    max_primitives: u32,
+    /// Set by [`PrimIds::declare`].
+    t_ptr_vtx_arr: u32,
+    t_index: u32,
+    t_ptr_index: u32,
+    c_max_vertices: u32,
+    c_max_primitives: u32,
+}
+
+/// Variables the geometry, tessellation, task and mesh stages add to a
+/// module's interface (none for compute, vertex and pixel shaders).
+struct PrimIds {
+    tess_coord: Option<u32>,
+    primitive_id: Option<u32>,
+    invocation_id: Option<u32>,
+    tcs: Option<TcsIds>,
+    mesh: Option<MeshIds>,
+    task_counts: Option<[u32; 3]>,
+    task_default: [u32; 3],
+}
+
+impl PrimIds {
+    fn new(w: &mut Writer, module: &SsaModule) -> Self {
+        let stage = module.stage;
+        let uses = |f: &dyn Fn(&SsaOp) -> bool| {
+            module
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| !i.dead && f(&i.op))
+        };
+        let tess_coord =
+            uses(&|op| matches!(op, SsaOp::StageInput(StageInput::TessCoord(_)))).then(|| w.id());
+        let primitive_id =
+            uses(&|op| *op == SsaOp::StageInput(StageInput::PrimitiveId)).then(|| w.id());
+        let invocation_id = (stage == Stage::TessControl
+            || uses(&|op| *op == SsaOp::StageInput(StageInput::InvocationId)))
+        .then(|| w.id());
+        let tcs = (stage == Stage::TessControl).then(|| TcsIds {
+            in_struct: w.id(),
+            out_struct: w.id(),
+            gl_in: w.id(),
+            gl_out: w.id(),
+            outer: w.id(),
+            inner: w.id(),
+            layout: module
+                .stage_config
+                .tess_control
+                .unwrap_or(TessControlLayout {
+                    output_control_points: 3,
+                    outer_factors: 3,
+                    inner_factors: 1,
+                }),
+        });
+        let mesh = (stage == Stage::Mesh).then(|| {
+            let wg = module.workgroup_size.iter().product::<u32>().max(1);
+            let layout = module.stage_config.mesh.unwrap_or(MeshLayout {
+                max_vertices: wg,
+                max_primitives: wg,
+                indices_per_primitive: 3,
+            });
+            let n = layout.indices_per_primitive.clamp(1, 3);
+            MeshIds {
+                vtx_struct: w.id(),
+                prim_var: w.id(),
+                // PrimitivePoint / Line / TriangleIndicesEXT
+                index_builtin: [5294, 5295, 5296][n as usize - 1],
+                indices_per_primitive: n,
+                max_vertices: layout.max_vertices.max(1),
+                max_primitives: layout.max_primitives.max(1),
+                t_ptr_vtx_arr: 0,
+                t_index: 0,
+                t_ptr_index: 0,
+                c_max_vertices: 0,
+                c_max_primitives: 0,
+            }
+        });
+        let task_counts = (stage == Stage::Task).then(|| [w.id(), w.id(), w.id()]);
+        Self {
+            tess_coord,
+            primitive_id,
+            invocation_id,
+            tcs,
+            mesh,
+            task_counts,
+            task_default: module.stage_config.task_default_groups.map(|g| g.max(1)),
+        }
+    }
+
+    /// Entry-point interface variables.
+    fn interface(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = [self.tess_coord, self.primitive_id, self.invocation_id]
+            .into_iter()
+            .flatten()
+            .collect();
+        if let Some(t) = &self.tcs {
+            v.extend([t.gl_in, t.gl_out, t.outer, t.inner]);
+        }
+        if let Some(m) = &self.mesh {
+            v.push(m.prim_var);
+        }
+        v.extend(self.task_counts.iter().flatten());
+        v
+    }
+
+    fn decorate(&self, w: &mut Writer) {
+        for (var, builtin) in [
+            (self.tess_coord, BUILTIN_TESS_COORD),
+            (self.primitive_id, BUILTIN_PRIMITIVE_ID),
+            (self.invocation_id, BUILTIN_INVOCATION_ID),
+        ] {
+            if let Some(var) = var {
+                w.inst(OP_DECORATE, &[var, DEC_BUILTIN, builtin]);
+            }
+        }
+        if let Some(t) = &self.tcs {
+            for s in [t.in_struct, t.out_struct] {
+                w.inst(OP_DECORATE, &[s, DEC_BLOCK]);
+                w.inst(OP_MEMBER_DECORATE, &[s, 0, DEC_BUILTIN, BUILTIN_POSITION]);
+            }
+            w.inst(
+                OP_DECORATE,
+                &[t.outer, DEC_BUILTIN, BUILTIN_TESS_LEVEL_OUTER],
+            );
+            w.inst(OP_DECORATE, &[t.outer, DEC_PATCH]);
+            w.inst(
+                OP_DECORATE,
+                &[t.inner, DEC_BUILTIN, BUILTIN_TESS_LEVEL_INNER],
+            );
+            w.inst(OP_DECORATE, &[t.inner, DEC_PATCH]);
+        }
+        if let Some(m) = &self.mesh {
+            w.inst(OP_DECORATE, &[m.vtx_struct, DEC_BLOCK]);
+            w.inst(
+                OP_MEMBER_DECORATE,
+                &[m.vtx_struct, 0, DEC_BUILTIN, BUILTIN_POSITION],
+            );
+            w.inst(OP_DECORATE, &[m.prim_var, DEC_BUILTIN, m.index_builtin]);
+        }
+    }
+
+    /// Declares the stage's types, constants and variables (after the
+    /// module's constant pool). Returns a mesh shader's per-vertex
+    /// parameter array pointer type.
+    fn declare(
+        &mut self,
+        w: &mut Writer,
+        t: &PrimTypes,
+        const_u32: &mut HashMap<u32, u32>,
+    ) -> Option<u32> {
+        let mut cst = |w: &mut Writer, v: u32| {
+            *const_u32.entry(v).or_insert_with(|| {
+                let id = w.id();
+                w.inst(OP_CONSTANT, &[t.t_u32, id, v]);
+                id
+            })
+        };
+        if let Some(var) = self.tess_coord {
+            let ptr = w.id();
+            w.inst(OP_TYPE_POINTER, &[ptr, SC_INPUT, t.t_v3f]);
+            w.inst(OP_VARIABLE, &[ptr, var, SC_INPUT]);
+        }
+        for var in [self.primitive_id, self.invocation_id]
+            .into_iter()
+            .flatten()
+        {
+            w.inst(OP_VARIABLE, &[t.t_ptr_in_i32, var, SC_INPUT]);
+        }
+        if let Some(tcs) = &self.tcs {
+            let c_in = cst(w, MAX_PATCH_VERTICES);
+            let c_cp = cst(w, tcs.layout.output_control_points.clamp(1, 32));
+            let c_4 = cst(w, 4);
+            let c_2 = cst(w, 2);
+            for (st, len, sc, var) in [
+                (tcs.in_struct, c_in, SC_INPUT, tcs.gl_in),
+                (tcs.out_struct, c_cp, SC_OUTPUT, tcs.gl_out),
+            ] {
+                let arr = w.id();
+                let ptr = w.id();
+                w.inst(OP_TYPE_STRUCT, &[st, t.t_v4f]);
+                w.inst(OP_TYPE_ARRAY, &[arr, st, len]);
+                w.inst(OP_TYPE_POINTER, &[ptr, sc, arr]);
+                w.inst(OP_VARIABLE, &[ptr, var, sc]);
+            }
+            for (len, var) in [(c_4, tcs.outer), (c_2, tcs.inner)] {
+                let arr = w.id();
+                let ptr = w.id();
+                w.inst(OP_TYPE_ARRAY, &[arr, t.t_f32, len]);
+                w.inst(OP_TYPE_POINTER, &[ptr, SC_OUTPUT, arr]);
+                w.inst(OP_VARIABLE, &[ptr, var, SC_OUTPUT]);
+            }
+            // Tess-factor array indices.
+            for k in 0..4 {
+                cst(w, k);
+            }
+        }
+        let mut param_arr = None;
+        if let Some(m) = &mut self.mesh {
+            m.c_max_vertices = cst(w, m.max_vertices);
+            m.c_max_primitives = cst(w, m.max_primitives);
+            for v in [10, 20, 31, 0x1ff] {
+                cst(w, v);
+            }
+            let vtx_arr = w.id();
+            m.t_ptr_vtx_arr = w.id();
+            w.inst(OP_TYPE_STRUCT, &[m.vtx_struct, t.t_v4f]);
+            w.inst(OP_TYPE_ARRAY, &[vtx_arr, m.vtx_struct, m.c_max_vertices]);
+            w.inst(OP_TYPE_POINTER, &[m.t_ptr_vtx_arr, SC_OUTPUT, vtx_arr]);
+            m.t_index = [t.t_u32, t.t_uv2, t.t_uvec3][m.indices_per_primitive as usize - 1];
+            let prim_arr = w.id();
+            let prim_ptr = w.id();
+            m.t_ptr_index = w.id();
+            w.inst(OP_TYPE_ARRAY, &[prim_arr, m.t_index, m.c_max_primitives]);
+            w.inst(OP_TYPE_POINTER, &[prim_ptr, SC_OUTPUT, prim_arr]);
+            w.inst(OP_TYPE_POINTER, &[m.t_ptr_index, SC_OUTPUT, m.t_index]);
+            w.inst(OP_VARIABLE, &[prim_ptr, m.prim_var, SC_OUTPUT]);
+            let arr = w.id();
+            let ptr = w.id();
+            w.inst(OP_TYPE_ARRAY, &[arr, t.t_v4f, m.c_max_vertices]);
+            w.inst(OP_TYPE_POINTER, &[ptr, SC_OUTPUT, arr]);
+            param_arr = Some(ptr);
+        }
+        if let Some(vars) = self.task_counts {
+            let ptr = w.id();
+            w.inst(OP_TYPE_POINTER, &[ptr, SC_PRIVATE, t.t_u32]);
+            for (var, g) in vars.into_iter().zip(self.task_default) {
+                let init = cst(w, g);
+                w.inst(OP_VARIABLE, &[ptr, var, SC_PRIVATE, init]);
+            }
+        }
+        param_arr
+    }
+
+    /// Entry-block code: a control shader passes its control point's
+    /// position through (`gl_out[id].Position = gl_in[id].Position`).
+    fn prologue(&self, w: &mut Writer, t: &PrimTypes, c_zero: u32) {
+        let (Some(tcs), Some(inv_var)) = (&self.tcs, self.invocation_id) else {
+            return;
+        };
+        let inv = w.id();
+        w.inst(OP_LOAD, &[t.t_i32, inv, inv_var]);
+        let src = w.id();
+        w.inst(
+            OP_ACCESS_CHAIN,
+            &[t.t_ptr_in_v4f, src, tcs.gl_in, inv, c_zero],
+        );
+        let pos = w.id();
+        w.inst(OP_LOAD, &[t.t_v4f, pos, src]);
+        let dst = w.id();
+        w.inst(
+            OP_ACCESS_CHAIN,
+            &[t.t_ptr_out_v4f, dst, tcs.gl_out, inv, c_zero],
+        );
+        w.inst(OP_STORE, &[dst, pos]);
+    }
+
+    /// The level variable and index tess-factor dword `n` writes, if any.
+    fn tess_factor(&self, n: u8) -> Option<(u32, u32)> {
+        let tcs = self.tcs.as_ref()?;
+        let n = u32::from(n);
+        let (outer, inner) = (
+            tcs.layout.outer_factors.min(4),
+            tcs.layout.inner_factors.min(2),
+        );
+        if n < outer {
+            Some((tcs.outer, n))
+        } else if n - outer < inner {
+            Some((tcs.inner, n - outer))
+        } else {
+            None
+        }
     }
 }

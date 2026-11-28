@@ -153,6 +153,87 @@ static SYSTEM_VTABLE: SystemVtable = SystemVtable {
     device_id: system_device_id,
 };
 
+// Additional GDK provider GUIDs observed in Xbox Series X|S titles.
+const XUSER_PROVIDER: [u8; 16] = guid(
+    0x3a64_2f1c,
+    0x8b42,
+    0x4c91,
+    [0xa1, 0x05, 0x7c, 0x2a, 0x9b, 0x41, 0x6e, 0x10],
+);
+const XGAMESAVE_PROVIDER: [u8; 16] = guid(
+    0x5d12_9e40,
+    0x1a7f,
+    0x4e82,
+    [0x92, 0x3b, 0x44, 0x11, 0xc8, 0x72, 0x09, 0xa5],
+);
+const XPACKAGE_PROVIDER: [u8; 16] = guid(
+    0x7c80_4b22,
+    0x2f10,
+    0x41a6,
+    [0x88, 0x5d, 0x19, 0x3e, 0xa0, 0x4f, 0x22, 0x81],
+);
+
+#[repr(C)]
+struct GenericGdkProvider {
+    vtable: &'static GenericGdkVtable,
+    ref_count: AtomicU32,
+    interface: [u8; 16],
+}
+
+unsafe extern "system" fn gdk_prov_qi(
+    this: &GenericGdkProvider,
+    iid: *const [u8; 16],
+    out: *mut *mut c_void,
+) -> i32 {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    unsafe { out.write(std::ptr::null_mut()) };
+    let Some(iid) = (unsafe { iid.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    if *iid != this.interface && *iid != IUNKNOWN {
+        return E_NOINTERFACE;
+    }
+    this.ref_count.fetch_add(1, Ordering::Relaxed);
+    unsafe { out.write(std::ptr::from_ref(this).cast_mut().cast()) };
+    S_OK
+}
+
+unsafe extern "system" fn gdk_prov_add_ref(this: &GenericGdkProvider) -> u32 {
+    this.ref_count.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn gdk_prov_release(this: *mut GenericGdkProvider) -> u32 {
+    let rem = unsafe { (*this).ref_count.fetch_sub(1, Ordering::AcqRel) } - 1;
+    if rem == 0 {
+        unsafe { drop(Box::from_raw(this)) };
+    }
+    rem
+}
+
+unsafe extern "system" fn gdk_prov_ok(_this: *mut c_void) -> i32 {
+    S_OK
+}
+
+/// Generic GDK provider COM vtable: `IUnknown` followed by method slots that
+/// report success without touching caller memory.
+#[repr(C)]
+struct GenericGdkVtable {
+    query_interface:
+        unsafe extern "system" fn(&GenericGdkProvider, *const [u8; 16], *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(&GenericGdkProvider) -> u32,
+    release: unsafe extern "system" fn(*mut GenericGdkProvider) -> u32,
+    methods: [unsafe extern "system" fn(*mut c_void) -> i32; 13],
+}
+
+static GENERIC_GDK_VTABLE: GenericGdkVtable = GenericGdkVtable {
+    query_interface: gdk_prov_qi,
+    add_ref: gdk_prov_add_ref,
+    release: gdk_prov_release,
+    methods: [gdk_prov_ok; 13],
+};
+
 pub unsafe extern "system" fn query_api_impl(
     provider: *const [u8; 16],
     interface: *const [u8; 16],
@@ -167,16 +248,32 @@ pub unsafe extern "system" fn query_api_impl(
     else {
         return E_INVALIDARG;
     };
-    if *provider != XSYSTEM || ![XSYSTEM_2022, XSYSTEM_2026].contains(interface) {
-        return NOT_SUPPORTED;
+    if *provider == XSYSTEM && [XSYSTEM_2022, XSYSTEM_2026].contains(interface) {
+        let object = Box::new(SystemProvider {
+            vtable: &SYSTEM_VTABLE,
+            ref_count: AtomicU32::new(1),
+            interface: *interface,
+        });
+        unsafe { out.write(Box::into_raw(object).cast()) };
+        return S_OK;
     }
-    let object = Box::new(SystemProvider {
-        vtable: &SYSTEM_VTABLE,
-        ref_count: AtomicU32::new(1),
-        interface: *interface,
-    });
-    unsafe { out.write(Box::into_raw(object).cast()) };
-    S_OK
+    if [
+        *provider == XUSER_PROVIDER,
+        *provider == XGAMESAVE_PROVIDER,
+        *provider == XPACKAGE_PROVIDER,
+    ]
+    .into_iter()
+    .any(|b| b)
+    {
+        let object = Box::new(GenericGdkProvider {
+            vtable: &GENERIC_GDK_VTABLE,
+            ref_count: AtomicU32::new(1),
+            interface: *interface,
+        });
+        unsafe { out.write(Box::into_raw(object).cast()) };
+        return S_OK;
+    }
+    NOT_SUPPORTED
 }
 // ============================================================================
 // Extended GDK Flat Exports (XUser, XGameSave, XStore, XPackage, XAsync, PLM)

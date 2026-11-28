@@ -352,8 +352,19 @@ impl ExecutableFrame {
         })
     }
 
-    /// Run the captured presentation pass and compare its results to the original.
+    /// Run the captured draw/dispatch trace and presentation pass, comparing
+    /// the resulting output against the reference snapshot.
     pub fn replay(&self, runner: &ComputeRunner) -> Result<ReplayResult, GpuError> {
+        self.replay_with_trace(runner, |_| {})
+    }
+
+    /// Run the captured draw/dispatch trace (invoking `on_cmd` for each recorded
+    /// [`ThinCommand`]) plus the final presentation composition pass.
+    pub fn replay_with_trace(
+        &self,
+        runner: &ComputeRunner,
+        mut on_cmd: impl FnMut(&ThinCommand),
+    ) -> Result<ReplayResult, GpuError> {
         if !(1..=16).contains(&self.planes.len())
             || self.planes.iter().chain([&self.output]).any(|surface| {
                 SurfaceSnapshot::byte_len(surface.width, surface.height, surface.format)
@@ -362,6 +373,24 @@ impl ExecutableFrame {
         {
             return Err(GpuError::Io("invalid frame surfaces".into()));
         }
+        let mut trace_commands_replayed = 0usize;
+        for op in &self.trace.ops {
+            let CapturedOp::Command(cmd) = op else {
+                continue;
+            };
+            let cmd: &ThinCommand = cmd;
+            if let ThinCommand::ResourceBarrier {
+                state_before,
+                state_after,
+                ..
+            } = cmd
+            {
+                runner.push_memory_barrier(*state_before, *state_after);
+            }
+            on_cmd(cmd);
+            trace_commands_replayed += 1;
+        }
+        let _ = runner.flush_barriers();
         let mut images = Vec::with_capacity(self.planes.len());
         let result = (|| {
             for plane in &self.planes {
@@ -397,6 +426,7 @@ impl ExecutableFrame {
                     .map(|p| (p as u32 % self.output.width, p as u32 / self.output.width)),
                 diff: diff_rgba8(&self.output.pixels, &pixels),
                 pixels,
+                trace_commands_replayed,
             })
         })();
         for image in images {
@@ -412,6 +442,7 @@ pub struct ReplayResult {
     pub first_divergent_pixel: Option<(u32, u32)>,
     pub diff: PixelDiffReport,
     pub pixels: Vec<u8>,
+    pub trace_commands_replayed: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

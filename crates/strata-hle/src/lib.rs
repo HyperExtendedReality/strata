@@ -12,6 +12,7 @@ mod acp_channel;
 pub mod audio;
 pub mod bvh_builder;
 pub mod config;
+pub mod console_list;
 pub mod crash;
 pub mod d3d12_abi;
 pub mod d3d12_rt;

@@ -608,11 +608,43 @@ fn decode_table_driven(
                 }
             }
             6 => {
+                // BC6H 128-bit HDR block reconstruction from dictionary entry +
+                // residual endpoints & index payload (2-bit/5-bit mode prefix,
+                // delta-reconstructed RGB10/11 endpoints, and packed texel indices).
                 let d = &tables.bc6[ep_ref.saturating_sub(1).min(DICTIONARY - 1)];
-                out[0] = d.mode ^ rec[2];
-                for i in 1..16 {
-                    out[i] = rec[2 + i].wrapping_add((d.e[(i / 3) % 4][i % 3] & 0xFF) as u8);
+                let mode = (d.mode ^ rec[2]) & 0x1F;
+                let mut bits = [0u64; 2];
+                // Pack 5-bit BC6H mode header + 4 delta-reconstructed 10-bit RGB endpoints.
+                let mut bit_pos = 0u32;
+                let mut push_bits = |val: u64, count: u32| {
+                    for b in 0..count {
+                        let bit = (val >> b) & 1;
+                        let idx = (bit_pos / 64) as usize;
+                        if idx < 2 {
+                            bits[idx] |= bit << (bit_pos % 64);
+                        }
+                        bit_pos += 1;
+                    }
+                };
+                push_bits(u64::from(mode), 5);
+                // Reconstruct 3 base channels (10 bits each) + 3 delta channels (5 bits each)
+                for c in 0..3 {
+                    let base_ep = (d.e[0][c].wrapping_add(u16::from(rec[3 + c]))) & 0x03FF;
+                    push_bits(u64::from(base_ep), 10);
                 }
+                for c in 0..3 {
+                    let delta_ep = (d.e[1][c].wrapping_add(u16::from(rec[6 + c]))) & 0x001F;
+                    push_bits(u64::from(delta_ep), 5);
+                }
+                // Pack remaining 78 bits of partition + texel indices from residual bytes.
+                for i in 0..10 {
+                    let byte = rec.get(9 + i).copied().unwrap_or(0) ^ cur.ix[i % 10];
+                    cur.ix[i % 10] = byte;
+                    let take = if i == 9 { 6 } else { 8 };
+                    push_bits(u64::from(byte), take);
+                }
+                out[0..8].copy_from_slice(&bits[0].to_le_bytes());
+                out[8..16].copy_from_slice(&bits[1].to_le_bytes());
             }
             _ => {
                 let ctrl =

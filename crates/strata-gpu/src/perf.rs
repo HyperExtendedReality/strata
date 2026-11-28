@@ -40,9 +40,16 @@ macro_rules! frame_counters {
 }
 
 frame_counters!(
-    preparation_ns, fence_wait_ns, graphics_gpu_ns, upload_bytes, readback_bytes,
-    pipeline_creation_ns, pipeline_errors, binding_errors,
-    predicated_commands, present_errors,
+    preparation_ns,
+    fence_wait_ns,
+    graphics_gpu_ns,
+    upload_bytes,
+    readback_bytes,
+    pipeline_creation_ns,
+    pipeline_errors,
+    binding_errors,
+    predicated_commands,
+    present_errors,
 );
 
 pub fn enable() {

@@ -524,7 +524,10 @@ pub fn emit_mesh_spirv(
     w
 }
 
-/// Translates straight-line, position-only geometry shaders with static VGPRs.
+/// Translates geometry shaders: uses the exact static-evaluation fast path for
+/// straight-line constant programs, and falls back to full dynamic SSA lowering
+/// ([`crate::ssa::build_ssa_with_options`] + [`crate::opt::optimize`]) when the
+/// program contains dynamic loads, push constants, or structured control flow.
 pub fn translate_geometry_rdna2(
     words: &[u32],
     desc: &GeometryShaderDesc,
@@ -532,11 +535,13 @@ pub fn translate_geometry_rdna2(
     use crate::rdna2::Inst;
     use crate::static_stage::{Registers, full_position, unsupported};
 
+    let program = crate::rdna2::decode_program(words)?;
     let mut registers = Registers::new();
     let mut position = [None; 4];
     let mut emitted = 0;
     let mut actions = Vec::new();
-    for di in crate::rdna2::decode_program(words)? {
+    let mut needs_dynamic_ssa = false;
+    for di in &program {
         let fail = || unsupported(words, di.pc);
         match di.inst {
             Inst::SEndpgm => break,
@@ -559,9 +564,12 @@ pub fn translate_geometry_rdna2(
                     if emitted > desc.max_vertices {
                         return Err(fail());
                     }
-                    actions.push(GsAction::EmitVertex {
-                        pos: full_position(position).ok_or_else(fail)?,
-                    });
+                    if let Some(pos) = full_position(position) {
+                        actions.push(GsAction::EmitVertex { pos });
+                    } else {
+                        needs_dynamic_ssa = true;
+                        break;
+                    }
                     position = [None; 4];
                 }
                 if op & 1 != 0 {
@@ -569,10 +577,59 @@ pub fn translate_geometry_rdna2(
                 }
             }
             ref inst if registers.execute(inst) => {}
-            _ => return Err(fail()),
+            _ => {
+                needs_dynamic_ssa = true;
+                break;
+            }
         }
     }
+    if needs_dynamic_ssa {
+        return translate_geometry_dynamic_ssa(&program, desc, words);
+    }
     Ok(emit_geometry_spirv(desc, &actions))
+}
+
+/// Dynamic SSA lowering for geometry shaders containing memory loads,
+/// push-constant inputs, or structured control flow: the optimized SSA
+/// body is emitted as a `Geometry` module, with each `s_sendmsg` GS emit
+/// / cut becoming `OpEmitVertex` / `OpEndPrimitive` after the exports
+/// before it.
+fn translate_geometry_dynamic_ssa(
+    program: &[crate::rdna2::DecodedInst],
+    desc: &GeometryShaderDesc,
+    words: &[u32],
+) -> Result<Vec<u32>, crate::rdna2::DecodeError> {
+    let opts = crate::ssa::BuildOptions {
+        stage: crate::ssa::Stage::Geometry,
+        ..Default::default()
+    };
+    let wave = crate::wave::analyze_wave_liveness(program);
+    let mut module = crate::ssa::build_ssa_with(program, &wave, [1, 1, 1], &opts)
+        .map_err(|_| crate::static_stage::unsupported(words, 0))?;
+    crate::opt::optimize(&mut module);
+    let (in_mode, out_mode) = geometry_modes(desc);
+    module.stage_config.modes = vec![
+        vec![in_mode],
+        vec![0 /* Invocations */, desc.invocations.max(1)],
+        vec![out_mode],
+        vec![26 /* OutputVertices */, desc.max_vertices.max(1)],
+    ];
+    Ok(crate::spirv::emit_spirv(&module))
+}
+
+/// `OpExecutionMode`s for a geometry shader's input and output primitives.
+fn geometry_modes(desc: &GeometryShaderDesc) -> (u32, u32) {
+    let in_mode = match desc.input {
+        GsInputPrimitive::Points => 19,    // InputPoints
+        GsInputPrimitive::Lines => 20,     // InputLines
+        GsInputPrimitive::Triangles => 22, // Triangles
+    };
+    let out_mode = match desc.output {
+        GsOutputPrimitive::Points => 27,        // OutputPoints
+        GsOutputPrimitive::LineStrip => 28,     // OutputLineStrip
+        GsOutputPrimitive::TriangleStrip => 29, // OutputTriangleStrip
+    };
+    (in_mode, out_mode)
 }
 
 /// Amplification / Task Shader configuration (`VK_EXT_mesh_shader` `TaskEXT`).
@@ -677,15 +734,51 @@ pub fn emit_task_spirv(desc: &TaskShaderDesc) -> Vec<u32> {
 }
 
 /// Translate an RDNA2 Amplification Shader into a `spirv-val`-clean `TaskEXT` module.
+/// Runs SSA lowering & optimization to validate dynamic control flow and extracts
+/// static `DispatchMesh(gx, gy, gz)` group counts from `v0..v2` when present.
 pub fn translate_task_rdna2(
     words: &[u32],
     desc: &TaskShaderDesc,
 ) -> Result<Vec<u32>, crate::rdna2::DecodeError> {
-    let _program = crate::rdna2::decode_program(words)?;
-    Ok(emit_task_spirv(desc))
+    let program = crate::rdna2::decode_program(words)?;
+    let mut eff = *desc;
+    let mut regs = crate::static_stage::Registers::new();
+    let mut all_static = true;
+    for di in &program {
+        match &di.inst {
+            crate::rdna2::Inst::SEndpgm => break,
+            inst if regs.execute(inst) => {}
+            _ => {
+                all_static = false;
+                break;
+            }
+        }
+    }
+    if all_static {
+        if let (Some(gx), Some(gy), Some(gz)) = (regs.vgpr(0), regs.vgpr(1), regs.vgpr(2)) {
+            eff.dispatch_mesh_groups = [gx.max(1), gy.max(1), gz.max(1)];
+        }
+        return Ok(emit_task_spirv(&eff));
+    }
+    // Dynamic: the optimized body runs as a `TaskEXT` module that ends with
+    // `OpEmitMeshTasksEXT(v0, v1, v2)` as `s_endpgm` leaves them (the
+    // static path's convention); a program that never reaches `s_endpgm`
+    // launches the descriptor's counts.
+    let opts = crate::ssa::BuildOptions {
+        stage: crate::ssa::Stage::Task,
+        ..Default::default()
+    };
+    let wave = crate::wave::analyze_wave_liveness(&program);
+    let mut module = crate::ssa::build_ssa_with(&program, &wave, desc.workgroup_size, &opts)
+        .map_err(|_| crate::static_stage::unsupported(words, 0))?;
+    crate::opt::optimize(&mut module);
+    module.stage_config.task_default_groups = desc.dispatch_mesh_groups;
+    Ok(crate::spirv::emit_spirv(&module))
 }
 
-/// Translates straight-line NGG position exports and sequential primitives.
+/// Translates NGG / mesh shaders: uses the exact static-evaluation fast path for
+/// straight-line constant programs, and falls back to dynamic SSA lowering when
+/// dynamic loads or structured control flow are present.
 pub fn translate_mesh_rdna2(
     words: &[u32],
     desc: &MeshShaderDesc,
@@ -693,9 +786,11 @@ pub fn translate_mesh_rdna2(
     use crate::rdna2::Inst;
     use crate::static_stage::{Registers, full_position, unsupported};
 
+    let program = crate::rdna2::decode_program(words)?;
     let mut registers = Registers::new();
     let mut vertices = Vec::new();
-    for di in crate::rdna2::decode_program(words)? {
+    let mut needs_dynamic_ssa = false;
+    for di in &program {
         match di.inst {
             Inst::SEndpgm => break,
             Inst::Exp {
@@ -707,10 +802,18 @@ pub fn translate_mesh_rdna2(
             } => {
                 let mut position = [None; 4];
                 registers.position(en, vsrc, &mut position);
-                vertices.push(full_position(position).ok_or_else(|| unsupported(words, di.pc))?);
+                if let Some(pos) = full_position(position) {
+                    vertices.push(pos);
+                } else {
+                    needs_dynamic_ssa = true;
+                    break;
+                }
             }
             ref inst if registers.execute(inst) => {}
-            _ => return Err(unsupported(words, di.pc)),
+            _ => {
+                needs_dynamic_ssa = true;
+                break;
+            }
         }
     }
     let indices_per_primitive = match desc.output_topology {
@@ -718,6 +821,37 @@ pub fn translate_mesh_rdna2(
         GsOutputPrimitive::LineStrip => 2,
         GsOutputPrimitive::TriangleStrip => 3,
     };
+    if needs_dynamic_ssa {
+        // NGG: `s_sendmsg` GS_ALLOC_REQ sets the output counts from M0,
+        // lane i's `exp pos0` / `param` writes vertex i and its `exp prim`
+        // primitive i.
+        let opts = crate::ssa::BuildOptions {
+            stage: crate::ssa::Stage::Mesh,
+            ..Default::default()
+        };
+        let wave = crate::wave::analyze_wave_liveness(&program);
+        let mut module = crate::ssa::build_ssa_with(&program, &wave, desc.workgroup_size, &opts)
+            .map_err(|_| unsupported(words, 0))?;
+        crate::opt::optimize(&mut module);
+        let max_vertices = desc.max_vertices.max(1);
+        let max_primitives = desc.max_primitives.max(1);
+        let prim_mode = match desc.output_topology {
+            GsOutputPrimitive::Points => 27,          // OutputPoints
+            GsOutputPrimitive::LineStrip => 5269,     // OutputLinesEXT
+            GsOutputPrimitive::TriangleStrip => 5298, // OutputTrianglesEXT
+        };
+        module.stage_config.mesh = Some(crate::ssa::MeshLayout {
+            max_vertices,
+            max_primitives,
+            indices_per_primitive: indices_per_primitive as u32,
+        });
+        module.stage_config.modes = vec![
+            vec![26 /* OutputVertices */, max_vertices],
+            vec![5270 /* OutputPrimitivesEXT */, max_primitives],
+            vec![prim_mode],
+        ];
+        return Ok(crate::spirv::emit_spirv(&module));
+    }
     if vertices.len() > desc.max_vertices as usize
         || !vertices.len().is_multiple_of(indices_per_primitive)
         || vertices.len() / indices_per_primitive > desc.max_primitives as usize

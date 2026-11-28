@@ -214,7 +214,8 @@ impl ComputeRunner {
         formats: &[vk::Format],
         state: &GraphicsPsoState,
     ) -> Result<(), GpuError> {
-        self.gfx_pipeline_for_stages(stages, formats, state).map(|_| ())
+        self.gfx_pipeline_for_stages(stages, formats, state)
+            .map(|_| ())
     }
 
     pub(crate) fn gfx_pipeline_for_stages(
@@ -257,11 +258,21 @@ impl ComputeRunner {
             }
         };
         let key: GfxKey = (h0, h1, fmt_key);
-        if let Some(&(_, p)) = self.gfx_pipelines.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        if let Some(&(_, p)) = self
+            .gfx_pipelines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
             return Ok(p);
         }
         let _cache = self.pipeline_cache_lock.lock().unwrap();
-        if let Some(&(_, p)) = self.gfx_pipelines.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        if let Some(&(_, p)) = self
+            .gfx_pipelines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
             return Ok(p);
         }
         match stages_in {
@@ -487,7 +498,10 @@ impl ComputeRunner {
                 start.elapsed(),
                 || crate::pipeline_usage::Recipe::graphics(stages_in, formats, state),
             );
-            self.gfx_pipelines.lock().unwrap_or_else(|e| e.into_inner()).insert(key, (modules, pipeline));
+            self.gfx_pipelines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, (modules, pipeline));
             Ok(pipeline)
         }
     }

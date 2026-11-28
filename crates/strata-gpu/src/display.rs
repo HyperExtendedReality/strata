@@ -135,6 +135,225 @@ fn compose(
     Ok(())
 }
 
+/// Optional compute passes applied to a frame before it is shown
+/// ([`apply_post_passes`]). They write the frame in place, so callers pass
+/// an image they own (a composed output), never a borrowed title surface.
+#[derive(Debug, Clone, Default)]
+pub struct PostPasses {
+    /// Performance HUD (`overlay_hud.slang`) over 8-bit RGBA/BGRA frames.
+    pub hud: Option<HudOverlay>,
+    /// `ambient_clamp.slang` over RGBA32F frames.
+    pub ambient: Option<AmbientClamp>,
+}
+
+/// What the HUD shows.
+#[derive(Debug, Clone, Default)]
+pub struct HudOverlay {
+    /// Recent frame times, oldest first (the last 120 are drawn).
+    pub frametimes_ms: Vec<f32>,
+    pub vram_ratio: f32,
+    pub ram_ratio: f32,
+}
+
+/// RT-off ambient floor / luminance clamp with NaN scrubbing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AmbientClamp {
+    pub floor: f32,
+    pub max_luminance: f32,
+    pub scrub_nans: bool,
+}
+
+impl AmbientClamp {
+    /// `STRATA_AMBIENT_CLAMP=<floor>,<max luminance>` (NaNs scrubbed).
+    pub fn from_env() -> Option<Self> {
+        let v = std::env::var("STRATA_AMBIENT_CLAMP").ok()?;
+        let (floor, max) = v.split_once(',')?;
+        Some(Self {
+            floor: floor.trim().parse().ok()?,
+            max_luminance: max.trim().parse().ok()?,
+            scrub_nans: true,
+        })
+    }
+}
+
+impl PostPasses {
+    /// Whether any pass runs on a frame of `format`.
+    pub fn applies_to(&self, format: vk::Format) -> bool {
+        (self.hud.is_some() && hud_format(format))
+            || (self.ambient.is_some() && ambient_format(format))
+    }
+}
+
+fn hud_format(format: vk::Format) -> bool {
+    matches!(
+        format,
+        vk::Format::R8G8B8A8_UNORM
+            | vk::Format::R8G8B8A8_SRGB
+            | vk::Format::B8G8R8A8_UNORM
+            | vk::Format::B8G8R8A8_SRGB
+    )
+}
+
+fn ambient_format(format: vk::Format) -> bool {
+    format == vk::Format::R32G32B32A32_SFLOAT
+}
+
+/// The HUD box: top-left corner, at most 360×96.
+pub fn hud_rect(width: u32, height: u32) -> Option<[u32; 4]> {
+    let (w, h) = (
+        width.saturating_sub(32).min(360),
+        height.saturating_sub(32).min(96),
+    );
+    (w >= 32 && h >= 24).then_some([16, 16, w, h])
+}
+
+/// Runs the enabled [`PostPasses`] on `frame` (layout `GENERAL` before and
+/// after). Each pass copies only its region into a BDA buffer, runs its
+/// shader there and copies it back, in one submission.
+pub fn apply_post_passes(
+    runner: &ComputeRunner,
+    frame: &GpuImage,
+    post: &PostPasses,
+) -> Result<(), GpuError> {
+    if let Some(a) = &post.ambient
+        && ambient_format(frame.format)
+    {
+        let rect = [0, 0, frame.width, frame.height];
+        region_pass(
+            runner,
+            frame,
+            rect,
+            16,
+            strata_runtime_shaders::AMBIENT_CLAMP_SPV,
+            |bda| {
+                crate::passes::ambient_clamp_push(
+                    bda,
+                    frame.width,
+                    frame.height,
+                    a.floor,
+                    a.max_luminance,
+                    a.scrub_nans,
+                )
+            },
+        )?;
+    }
+    if let Some(hud) = &post.hud
+        && hud_format(frame.format)
+        && let Some(rect) = hud_rect(frame.width, frame.height)
+    {
+        let mut samples = [0f32; 120];
+        let tail = &hud.frametimes_ms[hud.frametimes_ms.len().saturating_sub(120)..];
+        samples[..tail.len()].copy_from_slice(tail);
+        let bytes: Vec<u8> = samples.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let mut times = runner.alloc_bda_buffer(bytes.len() as u64)?;
+        // SAFETY: the buffer holds `bytes.len()` bytes.
+        unsafe { times.as_mut_slice::<u8>(bytes.len()) }.copy_from_slice(&bytes);
+        let times_bda = times.bda;
+        let r = region_pass(
+            runner,
+            frame,
+            rect,
+            4,
+            strata_runtime_shaders::OVERLAY_HUD_SPV,
+            |bda| {
+                // The region buffer is the box itself: a `w`×`h` framebuffer.
+                crate::passes::overlay_hud_push(
+                    bda,
+                    times_bda,
+                    rect[2],
+                    rect[3],
+                    [0, 0, rect[2], rect[3]],
+                    hud.vram_ratio,
+                    hud.ram_ratio,
+                    0.6,
+                    tail.len() as u32,
+                )
+            },
+        );
+        runner.free_bda_buffer(times);
+        r?;
+    }
+    Ok(())
+}
+
+/// Copies `rect` of `img` into a tight BDA buffer, dispatches `spv` over it
+/// (8×8 groups; `push` gets the buffer address) and copies it back.
+fn region_pass(
+    runner: &ComputeRunner,
+    img: &GpuImage,
+    rect: [u32; 4],
+    bpp: u64,
+    spv: &[u8],
+    push: impl FnOnce(u64) -> Vec<u8>,
+) -> Result<(), GpuError> {
+    let [x, y, w, h] = rect;
+    let pipeline = runner.pipeline_for(&crate::passes::spirv_words(spv), None)?;
+    let buf = runner.alloc_vram_bda_buffer(u64::from(w) * u64::from(h) * bpp, &[])?;
+    let pc = push(buf.bda);
+    let layout = runner.pipe_layout;
+    let region = [vk::BufferImageCopy::default()
+        .image_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .layer_count(1),
+        )
+        .image_offset(vk::Offset3D {
+            x: x as i32,
+            y: y as i32,
+            z: 0,
+        })
+        .image_extent(vk::Extent3D {
+            width: w,
+            height: h,
+            depth: 1,
+        })];
+    let buffer = buf.buffer;
+    let result = runner.one_shot(|dev, cmd| unsafe {
+        let mem = |src_stage, src_access, dst_stage, dst_access| {
+            [vk::MemoryBarrier2::default()
+                .src_stage_mask(src_stage)
+                .src_access_mask(src_access)
+                .dst_stage_mask(dst_stage)
+                .dst_access_mask(dst_access)]
+        };
+        barrier_image(
+            dev,
+            cmd,
+            img,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::GENERAL,
+        );
+        dev.cmd_copy_image_to_buffer(cmd, img.image, vk::ImageLayout::GENERAL, buffer, &region);
+        let b = mem(
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+        );
+        dev.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&b));
+        dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+        dev.cmd_push_constants(cmd, layout, crate::layout::PUSH_STAGES, 0, &pc);
+        dev.cmd_dispatch(cmd, w.div_ceil(8), h.div_ceil(8), 1);
+        let b = mem(
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_WRITE,
+            vk::PipelineStageFlags2::COPY,
+            vk::AccessFlags2::TRANSFER_READ,
+        );
+        dev.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&b));
+        dev.cmd_copy_buffer_to_image(cmd, buffer, img.image, vk::ImageLayout::GENERAL, &region);
+        barrier_image(
+            dev,
+            cmd,
+            img,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::GENERAL,
+        );
+    });
+    runner.free_bda_buffer(buf);
+    result
+}
+
 /// The colour space a frame is shown in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayMode {
@@ -603,5 +822,74 @@ impl Display {
             self.surface_loader.destroy_surface(self.surface, None);
         }
         let _ = self.handle;
+    }
+}
+
+#[cfg(test)]
+mod post_pass_tests {
+    use super::*;
+
+    #[test]
+    fn hud_and_ambient_clamp_touch_only_their_regions() {
+        let Ok(runner) = ComputeRunner::new() else {
+            return;
+        };
+        let (w, h) = (128u32, 128u32);
+        let img = runner
+            .create_image_2d(vk::Format::R8G8B8A8_UNORM, w, h, false, Default::default())
+            .unwrap();
+        let src = vec![0x40u8; (w * h * 4) as usize];
+        runner.upload_image(&img, &src).unwrap();
+        let post = PostPasses {
+            hud: Some(HudOverlay {
+                frametimes_ms: vec![16.6; 200],
+                vram_ratio: 0.5,
+                ram_ratio: 0.25,
+            }),
+            ambient: None,
+        };
+        apply_post_passes(&runner, &img, &post).unwrap();
+        let out = runner.read_image(&img, src.len()).unwrap();
+        let [bx, by, bw, bh] = hud_rect(w, h).unwrap();
+        let px = |x: u32, y: u32| &out[((y * w + x) * 4) as usize..][..4];
+        assert_eq!(px(w - 1, h - 1), [0x40; 4], "outside the box is untouched");
+        assert_ne!(px(bx, by), [0x40; 4], "the HUD border is drawn");
+        assert_ne!(px(bx + bw / 2, by + bh / 2), [0x40; 4]);
+        runner.destroy_image(img);
+
+        let img = runner
+            .create_image_2d(
+                vk::Format::R32G32B32A32_SFLOAT,
+                8,
+                8,
+                false,
+                Default::default(),
+            )
+            .unwrap();
+        let mut texels = vec![[0.5f32, 0.01, 9.0, 1.0]; 64];
+        texels[3] = [f32::NAN, 0.2, 0.2, f32::INFINITY];
+        let bytes: Vec<u8> = texels
+            .iter()
+            .flatten()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        runner.upload_image(&img, &bytes).unwrap();
+        let post = PostPasses {
+            hud: None,
+            ambient: Some(AmbientClamp {
+                floor: 0.05,
+                max_luminance: 4.0,
+                scrub_nans: true,
+            }),
+        };
+        apply_post_passes(&runner, &img, &post).unwrap();
+        let out = runner.read_image(&img, bytes.len()).unwrap();
+        let f: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(&f[0..4], &[0.5, 0.05, 4.0, 1.0]);
+        assert_eq!(&f[12..16], &[0.05, 0.2, 0.2, 1.0]);
+        runner.destroy_image(img);
     }
 }

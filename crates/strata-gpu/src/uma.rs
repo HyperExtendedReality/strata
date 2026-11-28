@@ -324,8 +324,14 @@ impl UmaManager {
             }
             let start = Instant::now();
             let moved = if let Some(baseline) = &shadow.baseline {
-                diff_mirror(runner, alloc, shadow, baseline,
-                    ranges.iter().map(|&(off, len)| (off as u64, len as u64)), true)
+                diff_mirror(
+                    runner,
+                    alloc,
+                    shadow,
+                    baseline,
+                    ranges.iter().map(|&(off, len)| (off as u64, len as u64)),
+                    true,
+                )
             } else {
                 let regions: Vec<_> = ranges
                     .iter()
@@ -637,42 +643,48 @@ fn diff_mirror(
             unsafe {
                 counter.as_mut_slice::<u32>(batch.len()).fill(0);
             }
-            runner.dispatch_bda_batch(shader, batch.iter().map(|(push, words)| {
-                (push.as_slice(), [words.div_ceil(64), 1, 1])
-            }))?;
-            changed += unsafe { counter.as_slice::<u32>(batch.len()) }.iter().map(|&n| u64::from(n)).sum::<u64>();
+            runner.dispatch_bda_batch(
+                shader,
+                batch
+                    .iter()
+                    .map(|(push, words)| (push.as_slice(), [words.div_ceil(64), 1, 1])),
+            )?;
+            changed += unsafe { counter.as_slice::<u32>(batch.len()) }
+                .iter()
+                .map(|&n| u64::from(n))
+                .sum::<u64>();
             batch.clear();
             Ok(())
         };
         for (offset, len) in ranges {
             let mut done = 0;
             while done < len {
-            let start = offset + done;
-            let begin = start & !3;
-            let first = (start - begin) as u32;
-            let count = (len - done).min(MAX_BYTES - u64::from(first)) as u32;
-            let words = (count + first).div_ceil(4);
-            let mut push = [0u8; 48];
-            for (dst, value) in push[..32].chunks_exact_mut(8).zip([
-                allocation.buffer.bda + begin,
-                shadow.host.bda + begin,
-                baseline.bda + begin,
-                counter_address + (batch.len() * 4) as u64,
-            ]) {
-                dst.copy_from_slice(&value.to_le_bytes());
-            }
-            for (dst, value) in
-                push[32..]
-                    .chunks_exact_mut(4)
-                    .zip([words, first, count, u32::from(upload)])
-            {
-                dst.copy_from_slice(&value.to_le_bytes());
-            }
-            batch.push((push, words));
-            if batch.len() == MAX_DISPATCHES {
-                run(&mut batch)?;
-            }
-            done += u64::from(count);
+                let start = offset + done;
+                let begin = start & !3;
+                let first = (start - begin) as u32;
+                let count = (len - done).min(MAX_BYTES - u64::from(first)) as u32;
+                let words = (count + first).div_ceil(4);
+                let mut push = [0u8; 48];
+                for (dst, value) in push[..32].chunks_exact_mut(8).zip([
+                    allocation.buffer.bda + begin,
+                    shadow.host.bda + begin,
+                    baseline.bda + begin,
+                    counter_address + (batch.len() * 4) as u64,
+                ]) {
+                    dst.copy_from_slice(&value.to_le_bytes());
+                }
+                for (dst, value) in
+                    push[32..]
+                        .chunks_exact_mut(4)
+                        .zip([words, first, count, u32::from(upload)])
+                {
+                    dst.copy_from_slice(&value.to_le_bytes());
+                }
+                batch.push((push, words));
+                if batch.len() == MAX_DISPATCHES {
+                    run(&mut batch)?;
+                }
+                done += u64::from(count);
             }
         }
         run(&mut batch)?;

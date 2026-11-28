@@ -3,6 +3,11 @@
 
 use std::collections::HashMap;
 
+/// SPIR-V `SpecId`s for the 64-bit BDA scratch base address when a shader spills
+/// to [`SpillBacking::BdaScratch`].
+pub const SPEC_ID_SCRATCH_LO: u32 = 0x5345;
+pub const SPEC_ID_SCRATCH_HI: u32 = 0x5346;
+
 /// Backing strategy for a spilled shader scratch frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpillBacking {

@@ -113,6 +113,11 @@ impl ResidencyManager {
         }
     }
 
+    /// Whether `id` was ever registered.
+    pub fn is_known(&self, id: u64) -> bool {
+        self.objects.contains_key(&id)
+    }
+
     pub fn is_resident(&self, id: u64) -> bool {
         self.objects.get(&id).is_some_and(|o| o.residency_count > 0)
     }
@@ -161,8 +166,10 @@ pub fn available_commit_bytes() -> Option<u64> {
         let size = std::mem::size_of::<PerformanceInformation>() as u32;
         if unsafe { K32GetPerformanceInfo(info.as_mut_ptr(), size) } != 0 {
             let info = unsafe { info.assume_init() };
-            return Some((info.commit_limit.saturating_sub(info.commit_total) as u64)
-                .saturating_mul(info.page_size as u64));
+            return Some(
+                (info.commit_limit.saturating_sub(info.commit_total) as u64)
+                    .saturating_mul(info.page_size as u64),
+            );
         }
     }
     None

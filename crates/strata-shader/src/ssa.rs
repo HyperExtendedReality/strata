@@ -294,6 +294,23 @@ pub enum SsaOp {
         lane: u8,
     },
 
+    // Primitive-emitting stages.
+    /// Geometry: `OpEmitVertex` (an `s_sendmsg` GS emit).
+    EmitVertex,
+    /// Geometry: `OpEndPrimitive` (an `s_sendmsg` GS cut).
+    EndPrimitive,
+    /// Mesh: `OpSetMeshOutputsEXT` (an `s_sendmsg` GS_ALLOC_REQ; counts from M0).
+    SetMeshOutputs {
+        vertices: ValueId,
+        primitives: ValueId,
+    },
+    /// Task: the `DispatchMesh` group counts `OpEmitMeshTasksEXT` ends with.
+    TaskCounts {
+        x: ValueId,
+        y: ValueId,
+        z: ValueId,
+    },
+
     // Workgroup Shared Memory (LDS) & Synchronization
     WorkgroupBarrier,
     LdsLoadU32 {
@@ -307,6 +324,19 @@ pub enum SsaOp {
     LdsAtomicAddU32 {
         byte_addr: ValueId,
         val: ValueId,
+    },
+    /// Workgroup-scope LDS atomic on dword `byte_addr >> 2`, returning the
+    /// old value (`ds_*_rtn_*`). `cmp` is the compare value of `CmpSwap`.
+    LdsAtomic {
+        op: AtomicOp,
+        byte_addr: ValueId,
+        val: ValueId,
+        cmp: Option<ValueId>,
+    },
+    /// A generic ALU primitive (see [`crate::alu::AluOp`]).
+    Alu {
+        op: crate::alu::AluOp,
+        args: Vec<ValueId>,
     },
     /// Per-invocation scratch spill load (`scratch_load_*` -> `Function` array slot).
     SpillLoad {
@@ -380,6 +410,8 @@ pub enum SsaOp {
         v: ValueId,
         w: ValueId,
         comp: u32,
+        /// Depth-comparison reference (`image_gather4_c*`).
+        dref: Option<ValueId>,
         ext: SampleExt,
     },
     /// Texture dimensions query (`image_get_resinfo`); returns `Ty::U32x4`.
@@ -387,6 +419,40 @@ pub enum SsaOp {
         slot: u32,
         dim: ImageDim,
         lod: ValueId,
+    },
+    /// Mip LOD query (`image_get_lod`); returns `Ty::U32x4` (`[clamped, unclamped, 0, 0]`).
+    ImageQueryLod {
+        slot: u32,
+        dim: ImageDim,
+        u: ValueId,
+        v: ValueId,
+        w: ValueId,
+    },
+    /// Atomic RMW on a storage image texel (`image_atomic_*`); returns old `Ty::U32`.
+    ImageAtomic {
+        op: AtomicOp,
+        slot: u32,
+        dim: ImageDim,
+        x: ValueId,
+        y: ValueId,
+        z: ValueId,
+        val: ValueId,
+        cmp: Option<ValueId>,
+    },
+    /// Hardware `SPV_KHR_ray_query` closest-hit trace (`OpRayQueryInitializeKHR` +
+    /// `OpRayQueryProceedKHR`); returns committed hit distance `Ty::F32` (or `t_max`).
+    RayQueryClosestHit {
+        tlas_binding: u32,
+        flags: ValueId,
+        cull_mask: ValueId,
+        ox: ValueId,
+        oy: ValueId,
+        oz: ValueId,
+        t_min: ValueId,
+        dx: ValueId,
+        dy: ValueId,
+        dz: ValueId,
+        t_max: ValueId,
     },
     /// `textures[slot]` texel `(x, y, z)` at level `lod` (0 when `None`), as
     /// bits (`Ty::U32x4`); `z` is the 3D slice or array layer.
@@ -472,9 +538,52 @@ pub struct SsaModule {
     pub require_full_quads: bool,
     /// Number of 32-bit dwords in the per-invocation `Function` spill frame (`0` if unused).
     pub spill_dwords: u32,
+    /// Backing strategy chosen by [`crate::spill::SpillFrame::choose_backing`].
+    pub spill_backing: crate::spill::SpillBacking,
     /// Instrument box tests for BMA traversal shortcuts ([`crate::bma`]);
     /// also on whenever `STRATA_BVH_BMA` is set.
     pub bma: bool,
+    /// Optional BMH child-prior pruning threshold (`0.0` disables; `STRATA_BVH_BMA_PRIOR`).
+    pub bma_prior_threshold: f32,
+    /// Number of liftable inline BVH traversal loops detected by [`crate::rayquery::find_ray_loops`].
+    pub ray_query_loops: usize,
+    /// `STRATA_RAY_QUERY=1`: each traversal loop's header block and why it
+    /// was (not) lifted ([`crate::rayquery::lift_ray_loops`]).
+    pub ray_query_verdicts: Vec<(usize, crate::rayquery::RayLoopVerdict)>,
+    /// Interface and execution modes of the geometry, tessellation, task
+    /// and mesh stages (set by their translators before emission).
+    pub stage_config: StageConfig,
+}
+
+/// What [`crate::spirv::emit_spirv`] needs beyond the body for the
+/// primitive-processing stages.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StageConfig {
+    /// Extra `OpExecutionMode` operands (after the entry point id), e.g.
+    /// `[Triangles]`, `[OutputVertices, n]`.
+    pub modes: Vec<Vec<u32>>,
+    /// Mesh: output array lengths (vertices, primitives) and indices per
+    /// primitive (1 = points, 2 = lines, 3 = triangles).
+    pub mesh: Option<MeshLayout>,
+    /// Task: the counts emitted when the program never sets them.
+    pub task_default_groups: [u32; 3],
+    /// Tessellation control: output control points, and how many of the
+    /// factor block's dwords are outer levels (the rest are inner).
+    pub tess_control: Option<TessControlLayout>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshLayout {
+    pub max_vertices: u32,
+    pub max_primitives: u32,
+    pub indices_per_primitive: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TessControlLayout {
+    pub output_control_points: u32,
+    pub outer_factors: u32,
+    pub inner_factors: u32,
 }
 
 /// Values graphics stages receive.
@@ -491,6 +600,14 @@ pub enum StageInput {
     /// Pixel shaders: component `chan` of parameter `loc` (`Location loc`),
     /// interpolated unless `flat`.
     Attr { loc: u8, chan: u8, flat: bool },
+    /// Tessellation evaluation: component `chan` of `BuiltIn::TessCoord`
+    /// (RDNA2 domain shaders receive u in `v0`, v in `v1`).
+    TessCoord(u8),
+    /// `BuiltIn::PrimitiveId` (the patch id: a domain shader's `v3`, a
+    /// merged LS+HS wave's `v0`).
+    PrimitiveId,
+    /// Tessellation control: `BuiltIn::InvocationId` (the control point).
+    InvocationId,
 }
 
 /// Where an `exp` writes.
@@ -504,6 +621,11 @@ pub enum ExportTarget {
     Position,
     /// `param0..31`: vertex output `Location n`.
     Param(u8),
+    /// Mesh: `prim` (target 20), the NGG primitive connectivity dword.
+    Primitive,
+    /// Tessellation control: dword `n` of the patch's tess-factor block
+    /// (outer levels first, then inner).
+    TessFactor(u8),
 }
 
 /// Options for building a module beyond its stage.
@@ -521,6 +643,9 @@ pub struct BuildOptions {
     /// mapping `pos_x`/`pos_y`/`pos_z`/`pos_w` and `front_face` VGPRs to
     /// `BuiltIn::FragCoord` / `BuiltIn::FrontFacing`.
     pub ps_input_vgprs: Option<crate::geometry::PsInputVgprs>,
+    /// Tessellation control: the buffer descriptor (first SGPR) whose
+    /// unindexed, zero-`soffset` stores write the tess-factor block.
+    pub tess_factor_srsrc: Option<u8>,
 }
 
 /// The pipeline stage a module is built for.
@@ -530,6 +655,23 @@ pub enum Stage {
     Compute,
     Vertex,
     Pixel,
+    /// `Geometry`: `exp pos`/`param` then an `s_sendmsg` GS emit makes a vertex.
+    Geometry,
+    /// `TessellationControl` (merged LS+HS).
+    TessControl,
+    /// `TessellationEvaluation` (domain shader).
+    TessEval,
+    /// `TaskEXT`: `v0..v2` at `s_endpgm` are the `DispatchMesh` counts.
+    Task,
+    /// `MeshEXT` (NGG): lane i exports vertex i and primitive i.
+    Mesh,
+}
+
+impl Stage {
+    /// Stages with a workgroup (`LocalSize`, `GlobalInvocationId`, LDS).
+    pub fn has_workgroup(self) -> bool {
+        matches!(self, Self::Compute | Self::Task | Self::Mesh)
+    }
 }
 
 impl SsaModule {
@@ -550,7 +692,12 @@ impl SsaModule {
             inputs: BTreeMap::new(),
             require_full_quads: false,
             spill_dwords: 0,
+            spill_backing: crate::spill::SpillBacking::FunctionArray { dwords: 0 },
             bma: false,
+            bma_prior_threshold: crate::bma::prior_threshold_from_env(),
+            ray_query_loops: 0,
+            ray_query_verdicts: Vec::new(),
+            stage_config: StageConfig::default(),
         }
     }
 
@@ -567,7 +714,10 @@ impl SsaModule {
     pub fn emit(&mut self, block: usize, ty: Ty, op: SsaOp) -> ValueId {
         if matches!(
             op,
-            SsaOp::LdsLoadU32 { .. } | SsaOp::LdsStoreU32 { .. } | SsaOp::LdsAtomicAddU32 { .. }
+            SsaOp::LdsLoadU32 { .. }
+            | SsaOp::LdsStoreU32 { .. }
+            | SsaOp::LdsAtomicAddU32 { .. }
+            | SsaOp::LdsAtomic { .. }
         ) {
             self.uses_lds = true;
         }
@@ -1179,6 +1329,61 @@ impl Builder {
 }
 
 impl Builder {
+    /// `s_sendmsg` in the primitive stages: GS emit / cut (stream 0 only)
+    /// and GS_ALLOC_REQ's output counts. Other messages have no effect.
+    fn lower_sendmsg(&mut self, msg: u16, pc: usize) -> Result<(), LowerError> {
+        let id = msg & 0xf;
+        match (self.m.stage, id) {
+            (Stage::Geometry, 2 | 3) => {
+                let op = (msg >> 4) & 3;
+                if (msg >> 8) & 3 != 0 {
+                    return Err(LowerError::Unsupported {
+                        pc,
+                        desc: "a GS emit to a vertex stream other than 0",
+                    });
+                }
+                if id == 2 && op == 0 {
+                    return Err(LowerError::Unsupported {
+                        pc,
+                        desc: "a GS message with no operation",
+                    });
+                }
+                let blk = self.cur_block;
+                if op & 2 != 0 {
+                    self.m.emit(blk, Ty::U32, SsaOp::EmitVertex);
+                }
+                if op & 1 != 0 {
+                    self.m.emit(blk, Ty::U32, SsaOp::EndPrimitive);
+                }
+            }
+            // GS_ALLOC_REQ: M0 = vertex count | primitive count << 12.
+            (Stage::Mesh, 9) => {
+                let Some(&m0) = self.sgpr.get(&124) else {
+                    return Err(LowerError::Unsupported {
+                        pc,
+                        desc: "GS_ALLOC_REQ with an unknown M0",
+                    });
+                };
+                let mask = self.konst(0xfff);
+                let twelve = self.konst(12);
+                let blk = self.cur_block;
+                let vertices = self.m.emit(blk, Ty::U32, SsaOp::AndU32(m0, mask));
+                let hi = self.m.emit(blk, Ty::U32, SsaOp::LshrU32(m0, twelve));
+                let primitives = self.m.emit(blk, Ty::U32, SsaOp::AndU32(hi, mask));
+                self.m.emit(
+                    blk,
+                    Ty::U32,
+                    SsaOp::SetMeshOutputs {
+                        vertices,
+                        primitives,
+                    },
+                );
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn konst(&mut self, v: u32) -> ValueId {
         let blk = self.cur_block;
         self.m.emit(blk, Ty::U32, SsaOp::ConstU32(v))
@@ -2013,7 +2218,7 @@ pub fn build_ssa_with(
         let (mut module, missing) =
             build_ssa_once(program, wave, workgroup_size, opts, &loops, &extra)?;
         module.require_full_quads = opts.require_full_quads && stage == Stage::Pixel;
-        if stage != Stage::Compute
+        if !stage.has_workgroup()
             && (module.uses_lds
                 || module.uses_wave64_ballot
                 || module
@@ -2082,11 +2287,19 @@ fn build_ssa_once(
     // v0 = vertex id, v3 = instance id; pixel shaders' barycentric VGPRs
     // are not modelled (v_interp reads interpolated inputs instead).
     let initial: Vec<(u8, SsaOp)> = match stage {
-        Stage::Compute => vec![(0, SsaOp::ThreadIdX)],
+        Stage::Compute | Stage::Task | Stage::Mesh => vec![(0, SsaOp::ThreadIdX)],
         Stage::Vertex => vec![
             (0, SsaOp::StageInput(StageInput::VertexIndex)),
             (3, SsaOp::StageInput(StageInput::InstanceIndex)),
         ],
+        Stage::TessEval => vec![
+            (0, SsaOp::StageInput(StageInput::TessCoord(0))),
+            (1, SsaOp::StageInput(StageInput::TessCoord(1))),
+            (3, SsaOp::StageInput(StageInput::PrimitiveId)),
+        ],
+        Stage::TessControl => vec![(0, SsaOp::StageInput(StageInput::PrimitiveId))],
+        // Legacy GS ring offsets are not modelled: inputs come from memory.
+        Stage::Geometry => Vec::new(),
         Stage::Pixel => {
             let mut v = Vec::new();
             if let Some(ps) = opts.ps_input_vgprs {
@@ -2326,6 +2539,11 @@ fn build_ssa_once(
     }
 
     b.m.spill_dwords = b.spill_frame.total_dwords();
+    b.m.spill_backing = b.spill_frame.choose_backing();
+    b.m.ray_query_loops = crate::rayquery::find_ray_loops(program)
+        .iter()
+        .filter(|l| l.liftable)
+        .count();
     Ok((b.m, b.missing))
 }
 
@@ -2343,11 +2561,19 @@ impl Builder {
         m.texture_slots = opts.texture_slot_base;
         m.storage_slots = opts.storage_slot_base;
         let initial: Vec<(u8, SsaOp)> = match stage {
-            Stage::Compute => vec![(0, SsaOp::ThreadIdX)],
+            Stage::Compute | Stage::Task | Stage::Mesh => vec![(0, SsaOp::ThreadIdX)],
             Stage::Vertex => vec![
                 (0, SsaOp::StageInput(StageInput::VertexIndex)),
                 (3, SsaOp::StageInput(StageInput::InstanceIndex)),
             ],
+            Stage::TessEval => vec![
+                (0, SsaOp::StageInput(StageInput::TessCoord(0))),
+                (1, SsaOp::StageInput(StageInput::TessCoord(1))),
+                (3, SsaOp::StageInput(StageInput::PrimitiveId)),
+            ],
+            Stage::TessControl => vec![(0, SsaOp::StageInput(StageInput::PrimitiveId))],
+            // Legacy GS ring offsets are not modelled: inputs come from memory.
+            Stage::Geometry => Vec::new(),
             Stage::Pixel => {
                 let mut v = Vec::new();
                 if let Some(ps) = opts.ps_input_vgprs {
@@ -2405,12 +2631,56 @@ impl Builder {
         &mut self,
         di: &DecodedInst,
         wave: &WaveAnalysis,
-        _opts: &BuildOptions,
+        opts: &BuildOptions,
     ) -> Result<(), LowerError> {
         let b = self;
         let blk = b.cur_block;
         match &di.inst {
-            Inst::SNop | Inst::SWaitcnt | Inst::SEndpgm => {}
+            // Hull shaders write their tess-factor block through one
+            // descriptor at fixed offsets: those dwords are the patch levels.
+            Inst::BufferStore {
+                vdata,
+                count,
+                srsrc,
+                soffset: Operand::InlineInt(0),
+                offset,
+                offen: false,
+                idxen: false,
+                typed_format: None,
+                ..
+            } if b.m.stage == Stage::TessControl
+                && opts.tess_factor_srsrc == Some(*srsrc)
+                && offset.is_multiple_of(4) =>
+            {
+                for k in 0..*count {
+                    let index = u32::from(*offset / 4) + u32::from(k);
+                    let Ok(index) = u8::try_from(index) else {
+                        return Err(LowerError::Unsupported {
+                            pc: di.pc,
+                            desc: "a tess factor past the factor block",
+                        });
+                    };
+                    let v = b.read_vgpr(vdata.wrapping_add(k));
+                    let zero = b.konst(0);
+                    let blk = b.cur_block;
+                    b.m.emit(
+                        blk,
+                        Ty::U32,
+                        SsaOp::Export {
+                            target: ExportTarget::TessFactor(index),
+                            values: [v, zero, zero, zero],
+                        },
+                    );
+                }
+            }
+            Inst::SNop | Inst::SWaitcnt => {}
+            Inst::SEndpgm => {
+                if b.m.stage == Stage::Task {
+                    let [x, y, z] = [0, 1, 2].map(|r| b.read_vgpr(r));
+                    let blk = b.cur_block;
+                    b.m.emit(blk, Ty::U32, SsaOp::TaskCounts { x, y, z });
+                }
+            }
             Inst::SBarrier => {
                 b.m.emit(blk, Ty::U32, SsaOp::WorkgroupBarrier);
             }
@@ -3330,7 +3600,7 @@ impl Builder {
                     ext.offset = Some(b.read_vgpr(cur));
                     cur += 1;
                 }
-                let any_bias = matches!(mode, SampleMode::Bias | SampleMode::CompareBias);
+                let any_bias = mode.has_bias();
                 let bias_val = if any_bias {
                     let v = b.read_vgpr(cur);
                     cur += 1;
@@ -3370,12 +3640,11 @@ impl Builder {
                     ext.grad = Some((dx, dy));
                 }
                 let (u, v, w, coord_regs) = b.float_coords(cur, *dim);
-                let lod = match mode {
-                    SampleMode::Lod | SampleMode::CompareLod => {
-                        let l = b.read_vgpr(cur + coord_regs);
-                        Some(b.as_f32(l))
-                    }
-                    _ => None,
+                let lod = if mode.has_lod() && !mode.is_gather() {
+                    let l = b.read_vgpr(cur + coord_regs);
+                    Some(b.as_f32(l))
+                } else {
+                    None
                 };
                 if *clamp {
                     let c = b.read_vgpr(cur + coord_regs);
@@ -3390,25 +3659,7 @@ impl Builder {
                         | SampleMode::Gather
                 ) && b.m.stage == Stage::Pixel;
                 let blk = b.cur_block;
-                if let Some(dref_val) = dref {
-                    let res_f = b.m.emit(
-                        blk,
-                        Ty::F32,
-                        SsaOp::ImageSampleDref {
-                            slot,
-                            dim: class,
-                            u,
-                            v,
-                            w,
-                            dref: dref_val,
-                            lod,
-                            implicit,
-                            ext,
-                        },
-                    );
-                    let res_u = b.as_u32(res_f);
-                    b.write_vgpr(*dst, res_u);
-                } else if matches!(mode, SampleMode::Gather | SampleMode::GatherLodZero) {
+                if mode.is_gather() {
                     let comp = match *dmask {
                         0x2 => 1,
                         0x4 => 2,
@@ -3431,10 +3682,29 @@ impl Builder {
                             v,
                             w,
                             comp,
+                            dref,
                             ext,
                         },
                     );
                     b.write_dmask(*dst, 0xf, texel);
+                } else if let Some(dref_val) = dref {
+                    let res_f = b.m.emit(
+                        blk,
+                        Ty::F32,
+                        SsaOp::ImageSampleDref {
+                            slot,
+                            dim: class,
+                            u,
+                            v,
+                            w,
+                            dref: dref_val,
+                            lod,
+                            implicit,
+                            ext,
+                        },
+                    );
+                    let res_u = b.as_u32(res_f);
+                    b.write_vgpr(*dst, res_u);
                 } else {
                     let texel = b.m.emit(
                         blk,
@@ -3474,6 +3744,225 @@ impl Builder {
                     },
                 );
                 b.write_dmask(*dst, *dmask, info);
+            }
+            Inst::ImageGetLod {
+                dst,
+                addr_vgpr,
+                dmask,
+                dim,
+                ..
+            } => {
+                let slot = b.image_slot(di.pc, false)?;
+                let class = ImageDim::from_mimg(*dim);
+                let u_raw = b.read_vgpr(*addr_vgpr);
+                let u = b.as_f32(u_raw);
+                let v = if ImageDim::mimg_is_1d_array(*dim) || (*dim & 7) == 0 {
+                    b.konst_f(0.5)
+                } else {
+                    let v_raw = b.read_vgpr(*addr_vgpr + 1);
+                    b.as_f32(v_raw)
+                };
+                let w = match class {
+                    ImageDim::D3 | ImageDim::Cube | ImageDim::D2Array => {
+                        let idx = if ImageDim::mimg_is_1d_array(*dim) {
+                            *addr_vgpr + 1
+                        } else {
+                            *addr_vgpr + 2
+                        };
+                        let w_raw = b.read_vgpr(idx);
+                        b.as_f32(w_raw)
+                    }
+                    ImageDim::D2 => b.konst_f(0.0),
+                };
+                let blk = b.cur_block;
+                let lod = b.m.emit(
+                    blk,
+                    Ty::U32x4,
+                    SsaOp::ImageQueryLod {
+                        slot,
+                        dim: class,
+                        u,
+                        v,
+                        w,
+                    },
+                );
+                b.write_dmask(*dst, *dmask, lod);
+            }
+            Inst::ImageAtomic {
+                op,
+                vdata,
+                addr_vgpr,
+                dmask,
+                dim,
+                glc,
+                ..
+            } => {
+                let slot = b.image_slot(di.pc, true)?;
+                let (x, y, z, _) = b.int_coords(*addr_vgpr, *dim);
+                let class = ImageDim::from_mimg(*dim).for_storage();
+                let (val, cmp) = if *op == AtomicOp::CmpSwap {
+                    (b.read_vgpr(*vdata), Some(b.read_vgpr(*vdata + 1)))
+                } else {
+                    (b.read_vgpr(*vdata), None)
+                };
+                let blk = b.cur_block;
+                let old = b.m.emit(
+                    blk,
+                    Ty::U32,
+                    SsaOp::ImageAtomic {
+                        op: *op,
+                        slot,
+                        dim: class,
+                        x,
+                        y,
+                        z,
+                        val,
+                        cmp,
+                    },
+                );
+                if *glc && (*dmask & 1) != 0 {
+                    b.write_vgpr(*vdata, old);
+                }
+            }
+            Inst::VMadI24 {
+                dst,
+                src0,
+                src1,
+                src2,
+                signed,
+            } => {
+                let blk = b.cur_block;
+                let a = b.read_op_u32(*src0);
+                let bb = b.read_op_u32(*src1);
+                let c = b.read_op_u32(*src2);
+                let zero = b.konst(0);
+                let w24 = b.konst(24);
+                let (a24, b24) = if *signed {
+                    (
+                        b.m.emit(
+                            blk,
+                            Ty::U32,
+                            SsaOp::BfeI32 {
+                                src: a,
+                                offset: zero,
+                                width: w24,
+                            },
+                        ),
+                        b.m.emit(
+                            blk,
+                            Ty::U32,
+                            SsaOp::BfeI32 {
+                                src: bb,
+                                offset: zero,
+                                width: w24,
+                            },
+                        ),
+                    )
+                } else {
+                    (
+                        b.m.emit(
+                            blk,
+                            Ty::U32,
+                            SsaOp::BfeU32 {
+                                src: a,
+                                offset: zero,
+                                width: w24,
+                            },
+                        ),
+                        b.m.emit(
+                            blk,
+                            Ty::U32,
+                            SsaOp::BfeU32 {
+                                src: bb,
+                                offset: zero,
+                                width: w24,
+                            },
+                        ),
+                    )
+                };
+                let prod = b.m.emit(blk, Ty::U32, SsaOp::MulU32(a24, b24));
+                let sum = b.m.emit(blk, Ty::U32, SsaOp::AddU32(prod, c));
+                b.write_vgpr(*dst, sum);
+            }
+            Inst::VMadU64U32 {
+                dst,
+                src0,
+                src1,
+                src2,
+                signed: _,
+            } => {
+                // 32x32->64 multiply-add: dst[0..2] = u64(src0)*u64(src1) + u64(src2_lo, src2_hi)
+                let blk = b.cur_block;
+                let a = b.read_op_u32(*src0);
+                let bb = b.read_op_u32(*src1);
+                let c_lo = b.read_op_u32(*src2);
+                let c_hi = match src2 {
+                    Operand::Vgpr(v) => b.read_vgpr(v.wrapping_add(1)),
+                    Operand::Sgpr(s) => b.read_sgpr(s.wrapping_add(1)),
+                    _ => b.konst(0),
+                };
+                let zero = b.konst(0);
+                let c64 =
+                    b.m.emit(blk, Ty::U64, SsaOp::PackU64 { lo: c_lo, hi: c_hi });
+                // Split 32-bit multiply into 16-bit halves using U64 addition to avoid needing MulU64
+                let mask16 = b.konst(0xffff);
+                let sh16 = b.konst(16);
+                let a_lo = b.m.emit(blk, Ty::U32, SsaOp::AndU32(a, mask16));
+                let a_hi = b.m.emit(blk, Ty::U32, SsaOp::LshrU32(a, sh16));
+                let b_lo = b.m.emit(blk, Ty::U32, SsaOp::AndU32(bb, mask16));
+                let b_hi = b.m.emit(blk, Ty::U32, SsaOp::LshrU32(bb, sh16));
+                let p_ll = b.m.emit(blk, Ty::U32, SsaOp::MulU32(a_lo, b_lo));
+                let p_lh = b.m.emit(blk, Ty::U32, SsaOp::MulU32(a_lo, b_hi));
+                let p_hl = b.m.emit(blk, Ty::U32, SsaOp::MulU32(a_hi, b_lo));
+                let p_hh = b.m.emit(blk, Ty::U32, SsaOp::MulU32(a_hi, b_hi));
+                let p_ll64 =
+                    b.m.emit(blk, Ty::U64, SsaOp::PackU64 { lo: p_ll, hi: zero });
+                let mid1_lo = b.m.emit(blk, Ty::U32, SsaOp::ShlU32(p_lh, sh16));
+                let mid1_hi = b.m.emit(blk, Ty::U32, SsaOp::LshrU32(p_lh, sh16));
+                let mid1 = b.m.emit(
+                    blk,
+                    Ty::U64,
+                    SsaOp::PackU64 {
+                        lo: mid1_lo,
+                        hi: mid1_hi,
+                    },
+                );
+                let mid2_lo = b.m.emit(blk, Ty::U32, SsaOp::ShlU32(p_hl, sh16));
+                let mid2_hi = b.m.emit(blk, Ty::U32, SsaOp::LshrU32(p_hl, sh16));
+                let mid2 = b.m.emit(
+                    blk,
+                    Ty::U64,
+                    SsaOp::PackU64 {
+                        lo: mid2_lo,
+                        hi: mid2_hi,
+                    },
+                );
+                let hi64 =
+                    b.m.emit(blk, Ty::U64, SsaOp::PackU64 { lo: zero, hi: p_hh });
+                let s1 = b.m.emit(blk, Ty::U64, SsaOp::AddU64(p_ll64, mid1));
+                let s2 = b.m.emit(blk, Ty::U64, SsaOp::AddU64(s1, mid2));
+                let s3 = b.m.emit(blk, Ty::U64, SsaOp::AddU64(s2, hi64));
+                let total = b.m.emit(blk, Ty::U64, SsaOp::AddU64(s3, c64));
+                let r_lo = b.m.emit(blk, Ty::U32, SsaOp::UnpackLoU64(total));
+                let r_hi = b.m.emit(blk, Ty::U32, SsaOp::UnpackHiU64(total));
+                b.write_vgpr(*dst, r_lo);
+                b.write_vgpr(dst.wrapping_add(1), r_hi);
+            }
+            Inst::VAddLshlU32 {
+                dst,
+                src0,
+                src1,
+                shift,
+            } => {
+                let blk = b.cur_block;
+                let a = b.read_op_u32(*src0);
+                let bb = b.read_op_u32(*src1);
+                let sh = b.read_op_u32(*shift);
+                let sum = b.m.emit(blk, Ty::U32, SsaOp::AddU32(a, bb));
+                let m31 = b.konst(31);
+                let sh_m = b.m.emit(blk, Ty::U32, SsaOp::AndU32(sh, m31));
+                let res = b.m.emit(blk, Ty::U32, SsaOp::ShlU32(sum, sh_m));
+                b.write_vgpr(*dst, res);
             }
             Inst::ImageLoad {
                 dst,
@@ -3537,7 +4026,7 @@ impl Builder {
                     );
                 });
             }
-            Inst::SSendMsg { .. } => {}
+            Inst::SSendMsg { msg } => b.lower_sendmsg(*msg, di.pc)?,
             Inst::SBufferLoadDword {
                 dst,
                 count,
@@ -3838,11 +4327,20 @@ impl Builder {
                 let t = match (b.m.stage, *target) {
                     (Stage::Pixel, t @ 0..=7) => Some(ExportTarget::Mrt(t)),
                     (Stage::Pixel, 8) => Some(ExportTarget::Depth),
-                    (Stage::Vertex, 12) => Some(ExportTarget::Position),
-                    (Stage::Vertex, t @ 32..=63) => Some(ExportTarget::Param(t - 32)),
+                    (Stage::Vertex | Stage::Geometry | Stage::TessEval | Stage::Mesh, 12) => {
+                        Some(ExportTarget::Position)
+                    }
+                    (
+                        Stage::Vertex | Stage::Geometry | Stage::TessEval | Stage::Mesh,
+                        t @ 32..=63,
+                    ) => Some(ExportTarget::Param(t - 32)),
+                    (Stage::Mesh, 20) => Some(ExportTarget::Primitive),
                     // null, and pos1..3 (misc vector / clip distances), have no effect here.
-                    (Stage::Pixel, 9) | (Stage::Vertex, 13..=15) => None,
-                    (Stage::Compute, _) => {
+                    (Stage::Pixel, 9)
+                    | (Stage::Vertex | Stage::Geometry | Stage::TessEval | Stage::Mesh, 13..=15) => {
+                        None
+                    }
+                    (Stage::Compute | Stage::Task, _) => {
                         return Err(LowerError::Unsupported {
                             pc: di.pc,
                             desc: "EXP in a compute shader",
@@ -4179,6 +4677,11 @@ fn build_ssa_state_machine(
 
         if newly_discovered.is_empty() {
             b.m.spill_dwords = b.spill_frame.total_dwords();
+            b.m.spill_backing = b.spill_frame.choose_backing();
+            b.m.ray_query_loops = crate::rayquery::find_ray_loops(program)
+                .iter()
+                .filter(|l| l.liftable)
+                .count();
             return Ok(b.m);
         }
         extra_regs.extend(newly_discovered);
